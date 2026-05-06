@@ -54,12 +54,12 @@ BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 class BTC5mConfig:
     # Signal
     momentum_window: int = 20        # BTC price ticks to compute momentum
-    momentum_threshold: float = 0.0002  # min BTC % move to generate signal
+    momentum_threshold: float = 0.00005  # min BTC % move to generate signal (0.005%)
     price_poll_interval: float = 2.0  # seconds between BTC price polls
 
     # Edge
     min_edge: float = 0.03           # min difference vs market odds to trade
-    entry_deadline_seconds: float = 180  # don't enter with < 2 min left
+    entry_deadline_seconds: float = 60  # don't enter with < 1 min left
 
     # Sizing
     kelly_fraction: float = 0.20     # 20% Kelly
@@ -272,22 +272,26 @@ class BTC5mStrategy:
         trend = self.btc.trend_strength(cfg.momentum_window)
         vol = self.btc.volatility(cfg.momentum_window)
 
-        # Base probability: 50% + momentum adjustment
-        # Strong momentum in one direction -> higher probability
-        # Scale: 1% BTC move in 5 minutes is a very strong signal
-        momentum_factor = momentum / 0.005  # normalize so 0.5% move = factor of 1
-        momentum_factor = max(-1.0, min(1.0, momentum_factor))
+        # Momentum factor: normalize so 0.1% BTC move = factor of 1
+        # In 5-minute crypto, even 0.05% moves are meaningful
+        momentum_factor = momentum / 0.001
+        momentum_factor = max(-3.0, min(3.0, momentum_factor))
 
         # Trend adds conviction
-        trend_factor = trend * 0.3  # trend contributes up to 30% of signal
+        trend_factor = trend  # -1 to +1
 
-        # Combined signal
-        signal_strength = momentum_factor * 0.7 + trend_factor * 0.3
-        fair_prob_up = 0.5 + signal_strength * 0.15  # max shift: 50% ± 15%
-        fair_prob_up = max(0.20, min(0.80, fair_prob_up))  # clamp
+        # Combined signal: momentum dominates, trend confirms
+        signal_strength = momentum_factor * 0.6 + trend_factor * 0.4
+        signal_strength = max(-3.0, min(3.0, signal_strength))
+
+        # Convert to probability: sigmoid-like mapping
+        # signal_strength of ±1 -> ~65/35, ±2 -> ~80/20, ±3 -> ~90/10
+        import math
+        fair_prob_up = 1.0 / (1.0 + math.exp(-signal_strength * 0.8))
+        fair_prob_up = max(0.10, min(0.90, fair_prob_up))
 
         # Confidence based on how clear the signal is
-        confidence = min(abs(signal_strength), 1.0)
+        confidence = min(abs(signal_strength) / 2.0, 1.0)
 
         # Direction
         if abs(momentum) < cfg.momentum_threshold:
