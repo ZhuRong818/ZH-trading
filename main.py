@@ -39,6 +39,8 @@ from ems.execution import ExecutionEngine, ClobAuth, SyntheticEqualitySOR
 from strategies.market_making.stoikov_model import StoikovMarketMaker
 from strategies.whale_tracking.whale_tracker import WhaleTracker
 from strategies.arbitrage.arb_detector import ArbitrageDetector
+from strategies.mean_reversion.mean_reversion import MeanReversionStrategy, MeanReversionConfig
+from strategies.resolution_fade.resolution_fade import ResolutionFadeStrategy, ResolutionFadeConfig
 from risk.risk_engine import RiskEngine
 
 logging.basicConfig(
@@ -78,6 +80,8 @@ class TradingSystem:
         self.market_makers: list[StoikovMarketMaker] = []
         self.whale_tracker = None
         self.arb_detector = None
+        self.mean_reversion = None
+        self.resolution_fade = None
 
         # Market info for each MM token
         self.mm_markets: list[dict] = []  # [{token_id, tick_size, neg_risk, end_date, question}]
@@ -245,6 +249,50 @@ class TradingSystem:
         log.info("Arbitrage detector initialized, scanning %d event(s): %s",
                  len(event_slugs), ", ".join(event_slugs))
 
+    def setup_mean_reversion(self):
+        """Initialize mean reversion on all selected MM markets."""
+        if not self.mm_markets:
+            log.warning("Mean reversion needs markets — use --token or --search")
+            return
+        token_ids = [m["token_id"] for m in self.mm_markets]
+        tick_sizes = {m["token_id"]: m["tick_size"] for m in self.mm_markets}
+        neg_risks = {m["token_id"]: m["neg_risk"] for m in self.mm_markets}
+
+        self.mean_reversion = MeanReversionStrategy(
+            config=MeanReversionConfig(bankroll=self.config.risk.max_total_exposure_usdc),
+            data_feed=self.data_feed,
+            ems=self.ems,
+            oms=self.oms,
+            token_ids=token_ids,
+            tick_sizes=tick_sizes,
+            neg_risks=neg_risks,
+        )
+        log.info("Mean Reversion strategy initialized on %d market(s)", len(token_ids))
+
+    def setup_resolution_fade(self):
+        """Initialize resolution fade on all selected MM markets."""
+        if not self.mm_markets:
+            log.warning("Resolution fade needs markets — use --token or --search")
+            return
+        fade_markets = [
+            {
+                "token_id": m["token_id"],
+                "end_date": m["end_date"],
+                "tick_size": m["tick_size"],
+                "neg_risk": m["neg_risk"],
+                "question": m["question"],
+            }
+            for m in self.mm_markets
+        ]
+        self.resolution_fade = ResolutionFadeStrategy(
+            config=ResolutionFadeConfig(bankroll=self.config.risk.max_total_exposure_usdc),
+            data_feed=self.data_feed,
+            ems=self.ems,
+            oms=self.oms,
+            markets=fade_markets,
+        )
+        log.info("Resolution Fade strategy initialized on %d market(s)", len(fade_markets))
+
     # ---- Heartbeat ----
 
     def _heartbeat_loop(self):
@@ -308,6 +356,16 @@ class TradingSystem:
                 log.info("Arb opportunity: %s profit_est=$%.2f", arb.arb_type, arb.profit_estimate)
                 self.arb_detector.execute_arb(arb)
 
+    def _step_mean_reversion(self):
+        """Run mean reversion step."""
+        if self.mean_reversion:
+            self.mean_reversion.step()
+
+    def _step_resolution_fade(self):
+        """Run resolution fade step."""
+        if self.resolution_fade:
+            self.resolution_fade.step()
+
     # ---- Main Loop ----
 
     def run(self, strategies: list[str]):
@@ -321,6 +379,10 @@ class TradingSystem:
             self.setup_whale_tracking()
         if "arb" in strategies and self.arb_event_slugs:
             self.setup_arbitrage(self.arb_event_slugs)
+        if "meanrev" in strategies and self.mm_markets:
+            self.setup_mean_reversion()
+        if "fade" in strategies and self.mm_markets:
+            self.setup_resolution_fade()
 
         # Start heartbeat for live mode
         if not self.config.dry_run and self.auth:
@@ -333,6 +395,10 @@ class TradingSystem:
             active_strats.append("whale")
         if self.arb_detector:
             active_strats.append(f"arb({len(self.arb_event_slugs)} events)")
+        if self.mean_reversion:
+            active_strats.append(f"meanrev({len(self.mean_reversion.token_ids)} markets)")
+        if self.resolution_fade:
+            active_strats.append(f"fade({len(self.resolution_fade.markets)} markets)")
 
         log.info("=" * 60)
         log.info("Trading system started")
@@ -361,6 +427,8 @@ class TradingSystem:
                 self._step_market_making()
                 self._step_whale_tracking()
                 self._step_arbitrage()
+                self._step_mean_reversion()
+                self._step_resolution_fade()
 
                 # Periodic status
                 if iteration % 12 == 0:  # every ~60s at 5s interval
@@ -404,16 +472,22 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Strategies (comma-separated or 'all'):
-  mm      Stoikov market making (requires --token or --search)
-  whale   Whale tracking & copy trading (no token needed)
-  arb     Combinatorial arbitrage (requires --arb-events)
-  all     Run all strategies
+  mm       Stoikov market making (requires --token or --search)
+  whale    Whale tracking & copy trading (no token needed)
+  arb      Combinatorial arbitrage (requires --arb-events)
+  meanrev  Mean reversion — buy dips, sell rips in contested markets
+  fade     Resolution fade — earn time decay premium near resolution
+  all      Run all strategies
+
+Low-drawdown combo:
+  python main.py --strategy meanrev,fade --search "bitcoin" --dry-run
 
 Examples:
   python main.py --strategy mm --search "bitcoin" --dry-run
-  python main.py --strategy mm --token TOKEN1,TOKEN2 --dry-run
+  python main.py --strategy meanrev --token TOKEN1,TOKEN2 --dry-run
+  python main.py --strategy fade --search "election" --dry-run
   python main.py --strategy whale --dry-run
-  python main.py --strategy arb --arb-events "election,bitcoin-price" --dry-run
+  python main.py --strategy arb --arb-events "election" --dry-run
   python main.py --strategy all --search "election" --arb-events "election" --dry-run
         """,
     )
@@ -465,7 +539,7 @@ Examples:
 
     # Parse strategies
     if args.strategy == "all":
-        strategies = ["mm", "whale", "arb"]
+        strategies = ["mm", "whale", "arb", "meanrev", "fade"]
     else:
         strategies = [s.strip() for s in args.strategy.split(",")]
 
@@ -477,8 +551,9 @@ Examples:
     # Handle Ctrl+C
     signal.signal(signal.SIGINT, lambda *_: setattr(system, 'running', False))
 
-    # Market selection for MM
-    if "mm" in strategies:
+    # Market selection for strategies that need tokens
+    needs_market = any(s in strategies for s in ["mm", "meanrev", "fade"])
+    if needs_market:
         if args.token:
             system.set_tokens(args.token)
         else:
