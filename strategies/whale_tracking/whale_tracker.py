@@ -15,7 +15,7 @@ import requests
 
 from config import DATA_API_BASE, GAMMA_BASE, WhaleTrackingConfig
 from data_pipeline.market_data import MarketDataFeed
-from ems.execution import ExecutionEngine
+from ems.execution import ExecutionEngine, SyntheticEqualitySOR
 from oms.position_manager import PositionManager
 
 log = logging.getLogger(__name__)
@@ -176,13 +176,16 @@ class WhaleTracker:
         data_feed: MarketDataFeed,
         ems: ExecutionEngine,
         oms: PositionManager,
+        sor: Optional[SyntheticEqualitySOR] = None,
     ):
         self.config = config
         self.data = data_feed
         self.ems = ems
         self.oms = oms
+        self.sor = sor
         self.registry = WhaleRegistry(config)
         self._known_positions: Dict[str, Dict[str, float]] = {}  # wallet -> {token_id: size}
+        self._market_meta_cache: Dict[str, dict] = {}  # condition_id -> {tick_size, neg_risk, token_ids}
         self._last_refresh = 0.0
         self.signals: List[WhaleSignal] = []
 
@@ -323,10 +326,30 @@ class WhaleTracker:
 
         return signals
 
+    def _get_market_meta(self, condition_id: str) -> dict:
+        """Look up tick_size, neg_risk, and both token IDs for a market."""
+        if condition_id in self._market_meta_cache:
+            return self._market_meta_cache[condition_id]
+
+        meta = {"tick_size": "0.01", "neg_risk": False, "token_ids": []}
+        try:
+            info = self.data.fetch_market(condition_id)
+            if info:
+                meta["tick_size"] = info.tick_size
+                meta["neg_risk"] = info.neg_risk
+                meta["token_ids"] = info.token_ids
+                meta["outcomes"] = info.outcomes
+        except Exception as e:
+            log.warning("Failed to fetch market meta for %s: %s", condition_id[:16], e)
+
+        self._market_meta_cache[condition_id] = meta
+        return meta
+
     def execute_copy_trade(self, signal: WhaleSignal) -> Optional[str]:
         """
         Execute a copy trade based on a whale signal.
         Applies conservative sizing and position limits.
+        Uses SOR for optimal routing and correct tick_size/neg_risk.
         """
         cfg = self.config
 
@@ -354,17 +377,50 @@ class WhaleTracker:
                      existing_notional + copy_size * signal.price)
             return None
 
+        # Look up market metadata for correct tick_size and neg_risk
+        meta = self._get_market_meta(signal.condition_id)
+        tick_size = meta["tick_size"]
+        neg_risk = meta["neg_risk"]
+        token_ids = meta.get("token_ids", [])
+
         log.info(
-            "COPY TRADE: %s %.1f shares @ %.4f from %s (WR=%.0f%%)",
+            "COPY TRADE: %s %.1f shares @ %.4f from %s (WR=%.0f%%) tick=%s neg_risk=%s",
             signal.side, copy_size, signal.price,
             signal.username or signal.wallet[:10],
             signal.win_rate * 100,
+            tick_size, neg_risk,
         )
 
+        source = f"whale_copy_{signal.username or signal.wallet[:8]}"
+
+        # Use SOR if available and we have both token IDs
+        if self.sor and len(token_ids) == 2 and signal.side == "BUY":
+            # Determine which token is YES vs NO
+            if signal.token_id == token_ids[0]:
+                yes_token, no_token = token_ids[0], token_ids[1]
+            else:
+                yes_token, no_token = token_ids[1], token_ids[0]
+
+            # Fetch both books for SOR comparison
+            self.data.fetch_order_book(yes_token)
+            self.data.fetch_order_book(no_token)
+
+            return self.sor.route_buy(
+                yes_token=yes_token,
+                no_token=no_token,
+                size=copy_size,
+                tick_size=tick_size,
+                neg_risk=neg_risk,
+                source=source,
+            )
+
+        # Direct order if no SOR or SELL side
         return self.ems.place_order(
             token_id=signal.token_id,
             side=signal.side,
             price=signal.price,
             size=copy_size,
-            source=f"whale_copy_{signal.username or signal.wallet[:8]}",
+            tick_size=tick_size,
+            neg_risk=neg_risk,
+            source=source,
         )

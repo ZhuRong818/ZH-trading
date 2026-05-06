@@ -11,8 +11,14 @@ Usage:
     # Paper trade whale copy-trading
     python main.py --strategy whale --dry-run
 
+    # Paper trade arbitrage scanning
+    python main.py --strategy arb --arb-events "election,bitcoin" --dry-run
+
     # Run all strategies
     python main.py --strategy all --search "election" --dry-run
+
+    # Multi-market market making
+    python main.py --strategy mm --token TOKEN1,TOKEN2,TOKEN3 --dry-run
 
     # Live trading (requires POLYMARKET_PRIVATE_KEY env var)
     python main.py --strategy mm --token TOKEN_ID
@@ -29,9 +35,10 @@ import time
 from config import SystemConfig, MarketMakingConfig, WhaleTrackingConfig, RiskConfig
 from data_pipeline.market_data import MarketDataFeed, MarketInfo
 from oms.position_manager import PositionManager, Fill
-from ems.execution import ExecutionEngine, ClobAuth
+from ems.execution import ExecutionEngine, ClobAuth, SyntheticEqualitySOR
 from strategies.market_making.stoikov_model import StoikovMarketMaker
 from strategies.whale_tracking.whale_tracker import WhaleTracker
+from strategies.arbitrage.arb_detector import ArbitrageDetector
 from risk.risk_engine import RiskEngine
 
 logging.basicConfig(
@@ -61,18 +68,28 @@ class TradingSystem:
         self.auth = None
         self.ems = ExecutionEngine(dry_run=config.dry_run)
 
+        # Module 4: SOR (Smart Order Router)
+        self.sor = SyntheticEqualitySOR(self.data_feed, self.ems)
+
         # Module 6: Risk Engine
         self.risk = RiskEngine(config.risk, self.data_feed, self.ems, self.oms)
 
-        # Strategies (initialized later based on CLI args)
-        self.market_maker = None
+        # Strategies
+        self.market_makers: list[StoikovMarketMaker] = []
         self.whale_tracker = None
+        self.arb_detector = None
 
-        # Track selected market
-        self.market_info = None
-        self.token_id = ""
-        self.tick_size = "0.01"
-        self.neg_risk = False
+        # Market info for each MM token
+        self.mm_markets: list[dict] = []  # [{token_id, tick_size, neg_risk, end_date, question}]
+
+        # Arb config
+        self.arb_event_slugs: list[str] = []
+        self.arb_scan_interval = 30  # seconds between arb scans
+        self._last_arb_scan = 0.0
+
+        # Live reconciliation
+        self._last_reconcile = 0.0
+        self.reconcile_interval = 30  # seconds
 
         # Wire up fill callbacks
         self.ems.on_fill(self._on_fill)
@@ -103,26 +120,32 @@ class TradingSystem:
         self.auth.derive_api_creds()
         self.ems = ExecutionEngine(auth=self.auth, dry_run=False)
         self.ems.on_fill(self._on_fill)
+        # Rebuild SOR and risk with new EMS
+        self.sor = SyntheticEqualitySOR(self.data_feed, self.ems)
         self.risk.ems = self.ems
         log.info("Authenticated and ready for live trading")
 
     # ---- Market Selection ----
 
-    def select_market_interactive(self, query: str = ""):
-        """Interactive market selection."""
-        markets = self.data_feed.search_markets(query, limit=15) if query else []
-        if not markets:
-            # Fetch top markets by default
-            import requests
-            resp = requests.get(
+    def select_markets_interactive(self, query: str = "", multi: bool = False):
+        """Interactive market selection. Returns list of market dicts."""
+        import requests as req
+        if query:
+            markets = self.data_feed.search_markets(query, limit=20)
+        else:
+            resp = req.get(
                 "https://gamma-api.polymarket.com/markets",
                 params={
-                    "_limit": 15, "active": True, "closed": False,
+                    "_limit": 20, "active": True, "closed": False,
                     "order": "volume24hr", "ascending": False,
                 },
             )
             resp.raise_for_status()
             markets = [self.data_feed._parse_market(m) for m in resp.json()]
+
+        if not markets:
+            log.error("No markets found")
+            sys.exit(1)
 
         print("\nAvailable markets:\n")
         for i, m in enumerate(markets):
@@ -132,59 +155,95 @@ class TradingSystem:
             print(f"  [{i:2d}] {m.question}")
             print(f"       {prices_str}  |  24h vol: ${m.volume_24h:,.0f}")
 
-        idx = int(input("\nSelect market number: "))
-        market = markets[idx]
+        if multi:
+            raw = input("\nSelect market numbers (comma-separated, e.g. 0,2,5): ")
+            indices = [int(x.strip()) for x in raw.split(",")]
+        else:
+            indices = [int(input("\nSelect market number: "))]
 
-        print("\nOutcomes:")
-        for i, (outcome, token_id, price) in enumerate(
-            zip(market.outcomes, market.token_ids, market.prices)
-        ):
-            print(f"  [{i}] {outcome} (price={price:.3f}, token={token_id[:20]}...)")
+        for idx in indices:
+            market = markets[idx]
+            print(f"\n  {market.question}")
+            for i, (outcome, token_id, price) in enumerate(
+                zip(market.outcomes, market.token_ids, market.prices)
+            ):
+                print(f"    [{i}] {outcome} (price={price:.3f}, token={token_id[:20]}...)")
 
-        tidx = int(input("Select outcome: "))
+            tidx = int(input("  Select outcome: "))
 
-        self.market_info = market
-        self.token_id = market.token_ids[tidx]
-        self.tick_size = market.tick_size
-        self.neg_risk = market.neg_risk
+            self.mm_markets.append({
+                "token_id": market.token_ids[tidx],
+                "tick_size": market.tick_size,
+                "neg_risk": market.neg_risk,
+                "end_date": market.end_date,
+                "question": market.question,
+                "outcome": market.outcomes[tidx],
+                "condition_id": market.condition_id,
+                "all_token_ids": market.token_ids,
+            })
 
-        log.info(
-            "Selected: %s [%s] tick=%s neg_risk=%s",
-            market.question, market.outcomes[tidx],
-            market.tick_size, market.neg_risk,
-        )
+            log.info(
+                "Selected: %s [%s] tick=%s neg_risk=%s",
+                market.question, market.outcomes[tidx],
+                market.tick_size, market.neg_risk,
+            )
 
-    def set_token(self, token_id: str, tick_size: str = "0.01", neg_risk: bool = False):
-        self.token_id = token_id
-        self.tick_size = tick_size
-        self.neg_risk = neg_risk
+    def set_tokens(self, token_ids_csv: str, tick_size: str = "0.01", neg_risk: bool = False):
+        """Set tokens from comma-separated CLI arg."""
+        for token_id in token_ids_csv.split(","):
+            token_id = token_id.strip()
+            if token_id:
+                self.mm_markets.append({
+                    "token_id": token_id,
+                    "tick_size": tick_size,
+                    "neg_risk": neg_risk,
+                    "end_date": "",
+                    "question": f"token {token_id[:16]}...",
+                    "outcome": "?",
+                    "condition_id": "",
+                    "all_token_ids": [],
+                })
 
     # ---- Strategy Setup ----
 
     def setup_market_making(self):
-        """Initialize the Stoikov market maker."""
-        self.market_maker = StoikovMarketMaker(
-            config=self.config.market_making,
-            data_feed=self.data_feed,
-            ems=self.ems,
-            oms=self.oms,
-            token_id=self.token_id,
-            tick_size=self.tick_size,
-            neg_risk=self.neg_risk,
-            end_date=self.market_info.end_date if self.market_info else "",
-        )
-        log.info("Market Making (Stoikov) strategy initialized")
+        """Initialize Stoikov market makers for all selected markets."""
+        for mkt in self.mm_markets:
+            mm = StoikovMarketMaker(
+                config=self.config.market_making,
+                data_feed=self.data_feed,
+                ems=self.ems,
+                oms=self.oms,
+                token_id=mkt["token_id"],
+                tick_size=mkt["tick_size"],
+                neg_risk=mkt["neg_risk"],
+                end_date=mkt["end_date"],
+            )
+            self.market_makers.append(mm)
+            log.info("MM initialized: %s [%s]", mkt["question"][:50], mkt["outcome"])
+        log.info("Market Making: %d market(s) active", len(self.market_makers))
 
     def setup_whale_tracking(self):
-        """Initialize the whale tracker."""
+        """Initialize the whale tracker with SOR."""
         self.whale_tracker = WhaleTracker(
             config=self.config.whale_tracking,
             data_feed=self.data_feed,
             ems=self.ems,
             oms=self.oms,
+            sor=self.sor,
         )
         self.whale_tracker.initialize()
-        log.info("Whale Tracking strategy initialized")
+        log.info("Whale Tracking strategy initialized (with SOR)")
+
+    def setup_arbitrage(self, event_slugs: list[str]):
+        """Initialize the arbitrage detector."""
+        self.arb_detector = ArbitrageDetector(
+            data_feed=self.data_feed,
+            ems=self.ems,
+        )
+        self.arb_event_slugs = event_slugs
+        log.info("Arbitrage detector initialized, scanning %d event(s): %s",
+                 len(event_slugs), ", ".join(event_slugs))
 
     # ---- Heartbeat ----
 
@@ -196,28 +255,90 @@ class TradingSystem:
                 pass
             time.sleep(self.config.heartbeat_interval)
 
+    # ---- Live Reconciliation ----
+
+    def _reconcile_positions(self):
+        """Poll Polymarket Data API to sync positions (live mode only)."""
+        if self.config.dry_run or not self.auth:
+            return
+
+        now = time.time()
+        if now - self._last_reconcile < self.reconcile_interval:
+            return
+
+        self._last_reconcile = now
+        funder = self.auth.funder
+        if funder:
+            self.oms.sync_from_api(funder)
+
+    # ---- Strategy Steps ----
+
+    def _step_market_making(self):
+        """Run one step for all market makers."""
+        for mm in self.market_makers:
+            if self.risk.check_circuit_breaker(mm.token_id):
+                mm.step()
+
+    def _step_whale_tracking(self):
+        """Run one whale tracking step, execute copy trades."""
+        if not self.whale_tracker:
+            return
+
+        signals = self.whale_tracker.step()
+        for sig in signals:
+            # Pre-trade risk check
+            if self.risk.check_position_size(
+                sig.token_id, sig.size * sig.price
+            ):
+                self.whale_tracker.execute_copy_trade(sig)
+
+    def _step_arbitrage(self):
+        """Run arbitrage scan at configured interval."""
+        if not self.arb_detector:
+            return
+
+        now = time.time()
+        if now - self._last_arb_scan < self.arb_scan_interval:
+            return
+        self._last_arb_scan = now
+
+        for slug in self.arb_event_slugs:
+            arb = self.arb_detector.scan_sum_to_one(slug)
+            if arb and arb.profit_estimate >= 0.50:
+                log.info("Arb opportunity: %s profit_est=$%.2f", arb.arb_type, arb.profit_estimate)
+                self.arb_detector.execute_arb(arb)
+
     # ---- Main Loop ----
 
-    def run(self, strategies: list):
+    def run(self, strategies: list[str]):
         """Main trading loop."""
         self.running = True
 
         # Setup requested strategies
-        if "mm" in strategies and self.token_id:
+        if "mm" in strategies and self.mm_markets:
             self.setup_market_making()
         if "whale" in strategies:
             self.setup_whale_tracking()
+        if "arb" in strategies and self.arb_event_slugs:
+            self.setup_arbitrage(self.arb_event_slugs)
 
         # Start heartbeat for live mode
         if not self.config.dry_run and self.auth:
             threading.Thread(target=self._heartbeat_loop, daemon=True).start()
 
+        active_strats = []
+        if self.market_makers:
+            active_strats.append(f"mm({len(self.market_makers)} markets)")
+        if self.whale_tracker:
+            active_strats.append("whale")
+        if self.arb_detector:
+            active_strats.append(f"arb({len(self.arb_event_slugs)} events)")
+
         log.info("=" * 60)
         log.info("Trading system started")
-        log.info("  Strategies: %s", ", ".join(strategies))
+        log.info("  Strategies: %s", ", ".join(active_strats) or "none")
         log.info("  Dry run: %s", self.config.dry_run)
-        if self.token_id:
-            log.info("  Token: %s...", self.token_id[:20])
+        log.info("  Reconciliation: every %ds (live only)", self.reconcile_interval)
         log.info("=" * 60)
 
         iteration = 0
@@ -233,31 +354,27 @@ class TradingSystem:
                     time.sleep(10)
                     continue
 
-                # Market Making step
-                if self.market_maker:
-                    if self.risk.check_circuit_breaker(self.token_id):
-                        self.market_maker.step()
+                # Live position reconciliation
+                self._reconcile_positions()
 
-                # Whale Tracking step
-                if self.whale_tracker:
-                    signals = self.whale_tracker.step()
-                    for sig in signals:
-                        # Pre-trade risk check
-                        if self.risk.check_position_size(
-                            sig.token_id, sig.size * sig.price
-                        ):
-                            self.whale_tracker.execute_copy_trade(sig)
+                # Strategy steps
+                self._step_market_making()
+                self._step_whale_tracking()
+                self._step_arbitrage()
 
                 # Periodic status
                 if iteration % 12 == 0:  # every ~60s at 5s interval
                     status = self.risk.status()
                     summary = self.oms.portfolio_summary()
                     log.info(
-                        "STATUS: positions=%d exposure=$%.0f pnl=$%.2f orders=%d",
+                        "STATUS: positions=%d exposure=$%.0f pnl=$%.2f "
+                        "orders=%d mm=%d whale_signals=%d",
                         summary["num_positions"],
                         summary["total_notional_usdc"],
                         summary["total_pnl"],
                         status["open_orders"],
+                        len(self.market_makers),
+                        len(self.whale_tracker.signals) if self.whale_tracker else 0,
                     )
 
                 time.sleep(self.config.market_making.refresh_interval)
@@ -286,23 +403,30 @@ def main():
         description="Polymarket Institutional Trading System",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Strategies:
+Strategies (comma-separated or 'all'):
   mm      Stoikov market making (requires --token or --search)
   whale   Whale tracking & copy trading (no token needed)
+  arb     Combinatorial arbitrage (requires --arb-events)
   all     Run all strategies
 
 Examples:
   python main.py --strategy mm --search "bitcoin" --dry-run
+  python main.py --strategy mm --token TOKEN1,TOKEN2 --dry-run
   python main.py --strategy whale --dry-run
-  python main.py --strategy all --search "election" --dry-run
-  python main.py --strategy mm --token TOKEN_ID --spread 0.06
+  python main.py --strategy arb --arb-events "election,bitcoin-price" --dry-run
+  python main.py --strategy all --search "election" --arb-events "election" --dry-run
         """,
     )
     parser.add_argument("--strategy", type=str, default="mm",
-                        help="Strategy: mm, whale, all")
+                        help="Strategy: mm, whale, arb, all (comma-separated)")
     parser.add_argument("--search", type=str, default="",
-                        help="Search for a market interactively")
-    parser.add_argument("--token", type=str, help="Token ID to trade")
+                        help="Search for market(s) interactively")
+    parser.add_argument("--token", type=str,
+                        help="Token ID(s) to trade (comma-separated for multi-market)")
+    parser.add_argument("--arb-events", type=str, default="",
+                        help="Event slugs for arb scanning (comma-separated)")
+    parser.add_argument("--arb-interval", type=float, default=30.0,
+                        help="Seconds between arb scans (default: 30)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Paper trading mode (no real orders)")
     parser.add_argument("--gamma", type=float, default=0.5,
@@ -319,6 +443,8 @@ Examples:
                         help="Max position per market in USD (default: 10000)")
     parser.add_argument("--max-drawdown", type=float, default=20.0,
                         help="Max drawdown %% before kill switch (default: 20)")
+    parser.add_argument("--reconcile-interval", type=float, default=30.0,
+                        help="Seconds between position reconciliation (default: 30)")
     parser.add_argument("--verbose", action="store_true",
                         help="Debug logging")
     args = parser.parse_args()
@@ -339,22 +465,33 @@ Examples:
 
     # Parse strategies
     if args.strategy == "all":
-        strategies = ["mm", "whale"]
+        strategies = ["mm", "whale", "arb"]
     else:
         strategies = [s.strip() for s in args.strategy.split(",")]
 
     # Initialize system
     system = TradingSystem(config)
+    system.reconcile_interval = args.reconcile_interval
+    system.arb_scan_interval = args.arb_interval
 
     # Handle Ctrl+C
     signal.signal(signal.SIGINT, lambda *_: setattr(system, 'running', False))
 
-    # Market selection for strategies that need it
-    needs_token = any(s in strategies for s in ["mm"])
-    if args.token:
-        system.set_token(args.token)
-    elif needs_token:
-        system.select_market_interactive(args.search)
+    # Market selection for MM
+    if "mm" in strategies:
+        if args.token:
+            system.set_tokens(args.token)
+        else:
+            multi = input("Multi-market mode? (y/N): ").strip().lower() == "y" if not args.search else False
+            system.select_markets_interactive(args.search, multi=multi)
+
+    # Arb event slugs
+    if "arb" in strategies:
+        if args.arb_events:
+            system.arb_event_slugs = [s.strip() for s in args.arb_events.split(",") if s.strip()]
+        else:
+            raw = input("Enter event slugs for arb scanning (comma-separated): ")
+            system.arb_event_slugs = [s.strip() for s in raw.split(",") if s.strip()]
 
     # Connect for live trading
     if not args.dry_run:
