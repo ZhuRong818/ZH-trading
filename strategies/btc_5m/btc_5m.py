@@ -55,7 +55,7 @@ class BTC5mConfig:
     # Signal
     momentum_window: int = 20        # BTC price ticks to compute momentum
     momentum_threshold: float = 0.00005  # min BTC % move to generate signal (0.005%)
-    price_poll_interval: float = 2.0  # seconds between BTC price polls
+    price_poll_interval: float = 0.5  # seconds between BTC price polls (HF mode)
 
     # Edge
     min_edge: float = 0.03           # min difference vs market odds to trade
@@ -169,6 +169,7 @@ class BTC5mStrategy:
         self.current_window: Optional[MarketWindow] = None
         self.current_position: Optional[str] = None  # "UP" or "DOWN" or None
         self.current_order_id: Optional[str] = None
+        self._both_entry: Optional[dict] = None
 
         # Stats
         self.total_trades = 0
@@ -241,16 +242,110 @@ class BTC5mStrategy:
             return None
         try:
             # Get midpoint for Up token
-            resp = self.session.get(
+            resp_up = self.session.get(
                 f"{CLOB_BASE}/midpoint",
                 params={"token_id": self.current_window.up_token},
             )
-            resp.raise_for_status()
-            up_mid = float(resp.json().get("mid", 0.5))
-            return {"up": up_mid, "down": 1.0 - up_mid}
+            resp_up.raise_for_status()
+            up_mid = float(resp_up.json().get("mid", 0.5))
+
+            # Get midpoint for Down token independently (allow sum < 1 in CLOB mispricing)
+            resp_down = self.session.get(
+                f"{CLOB_BASE}/midpoint",
+                params={"token_id": self.current_window.down_token},
+            )
+            if resp_down.status_code == 200:
+                try:
+                    down_mid = float(resp_down.json().get("mid", 1.0 - up_mid))
+                except Exception:
+                    down_mid = 1.0 - up_mid
+            else:
+                down_mid = 1.0 - up_mid
+
+            return {"up": up_mid, "down": down_mid}
         except Exception as e:
             log.warning("Failed to get odds: %s", e)
             return None
+
+    def _try_buy_both(self, odds: dict) -> bool:
+        """If up+down < 1.0, buy equal shares of both legs (pair_shares).
+
+        Returns True if orders placed (or attempted), False otherwise.
+        """
+        cfg = self.config
+        if not self.current_window or self.current_position is not None:
+            return False
+
+        up = odds.get("up", 0.0)
+        down = odds.get("down", 0.0)
+        total = up + down
+
+        # Only act when combined price is meaningfully less than $1.00
+        if total >= 1.0 - 1e-6:
+            return False
+
+        # Respect entry deadline
+        remaining = self._seconds_remaining()
+        if remaining < cfg.entry_deadline_seconds:
+            return False
+
+        # Determine total USD to allocate for the pair (split evenly into pair shares)
+        total_usdc = cfg.bankroll * cfg.max_bet_pct
+        if total_usdc < cfg.min_bet_usdc * 2:
+            # not enough capital to meet minimum per-leg
+            return False
+
+        # pair_shares * (up + down) = total_usdc  => pair_shares = total_usdc / total
+        pair_shares = total_usdc / total if total > 0 else 0
+        if pair_shares <= 0:
+            return False
+
+        # Ensure per-leg cost >= min_bet_usdc
+        up_cost = pair_shares * up
+        down_cost = pair_shares * down
+        if up_cost < cfg.min_bet_usdc or down_cost < cfg.min_bet_usdc:
+            return False
+
+        # Place FOK buy orders for both legs using book price (price=0.0 indicates SOR/book)
+        try:
+            up_oid = self.ems.place_order(
+                token_id=self.current_window.up_token,
+                side="BUY",
+                price=0.0,
+                size=pair_shares,
+                order_type="FOK",
+                source="btc5m_both",
+            )
+
+            down_oid = self.ems.place_order(
+                token_id=self.current_window.down_token,
+                side="BUY",
+                price=0.0,
+                size=pair_shares,
+                order_type="FOK",
+                source="btc5m_both",
+            )
+
+            # Mark as both position (do not re-enter in same window)
+            self.current_position = "BOTH"
+            self._both_entry = {
+                "pair_shares": pair_shares,
+                "up_oid": up_oid,
+                "down_oid": down_oid,
+                "entry_sum": total,
+                "total_usdc": total_usdc,
+            }
+            # Count both legs as trades
+            try:
+                self.total_trades += 2
+            except Exception:
+                pass
+            log.info("BUY BOTH: up=%.4f down=%.4f sum=%.4f pair_shares=%.4f total_usdc=$%.2f",
+                     up, down, total, pair_shares, total_usdc)
+            return True
+        except Exception as e:
+            log.warning("Failed to place both-leg orders: %s", e)
+            return False
 
     # ---- Signal ----
 
@@ -455,6 +550,17 @@ class BTC5mStrategy:
                     time.sleep(cfg.price_poll_interval)
                     continue
 
+                # High-frequency opportunity: try buying both legs when sum < 1.00
+                try:
+                    bought = self._try_buy_both(odds)
+                except Exception as e:
+                    log.debug("Error in _try_buy_both: %s", e)
+                    bought = False
+                if bought:
+                    # successfully placed (or attempted) both-leg orders; skip single-leg flow
+                    time.sleep(cfg.price_poll_interval)
+                    continue
+
                 # Check edge
                 if signal["direction"] == "UP":
                     edge = signal["fair_prob_up"] - odds["up"]
@@ -516,6 +622,30 @@ class BTC5mStrategy:
         if not self.current_window or not self.current_position:
             return
 
+        # Special handling for both-leg arbitrage entries
+        if self.current_position == "BOTH" and self._both_entry:
+            pair_shares = float(self._both_entry.get("pair_shares", 0))
+            entry_sum = float(self._both_entry.get("entry_sum", 0))
+
+            # Profit per pair = 1.0 - (up_price + down_price)
+            profit_per_pair = 1.0 - entry_sum
+            profit_usdc = pair_shares * profit_per_pair
+
+            # Update stats
+            self.daily_pnl += profit_usdc
+            self.wins += 1
+            self.consecutive_losses = 0
+
+            log.info(
+                "BTC5M ARB RESULT: BOTH | entry_sum=%.4f pair_shares=%.4f profit=$%.2f",
+                entry_sum, pair_shares, profit_usdc,
+            )
+
+            # clear both entry
+            self._both_entry = None
+            return
+
+        # Default single-leg result handling (prediction-based)
         start_price = self.current_window.starting_btc_price
         end_price = self.btc.current or start_price
 
