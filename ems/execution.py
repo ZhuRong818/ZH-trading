@@ -166,7 +166,7 @@ class ClobAuth:
 class RateLimitManager:
     """Only requote if price moved enough to justify the API call."""
 
-    def __init__(self, min_delta: float = 0.003, max_per_second: int = 10):
+    def __init__(self, min_delta: float = 0.003, max_per_second: int = 50):
         self.min_delta = min_delta
         self.max_per_second = max_per_second
         self._last_prices: Dict[str, float] = {}

@@ -184,6 +184,7 @@ class TradingSystem:
                 "outcome": market.outcomes[tidx],
                 "condition_id": market.condition_id,
                 "all_token_ids": market.token_ids,
+                "gamma_price": market.prices[tidx],
             })
 
             log.info(
@@ -222,6 +223,7 @@ class TradingSystem:
                 tick_size=mkt["tick_size"],
                 neg_risk=mkt["neg_risk"],
                 end_date=mkt["end_date"],
+                gamma_price=mkt.get("gamma_price"),
             )
             self.market_makers.append(mm)
             log.info("MM initialized: %s [%s]", mkt["question"][:50], mkt["outcome"])

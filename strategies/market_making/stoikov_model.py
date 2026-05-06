@@ -42,6 +42,7 @@ class StoikovMarketMaker:
         tick_size: str = "0.01",
         neg_risk: bool = False,
         end_date: str = "",
+        gamma_price: float = None,
     ):
         self.config = config
         self.data = data_feed
@@ -51,8 +52,10 @@ class StoikovMarketMaker:
         self.tick_size = tick_size
         self.neg_risk = neg_risk
         self.end_date = end_date
+        self.gamma_price = gamma_price  # last traded price from Gamma API
         self._last_bid = 0.0
         self._last_ask = 0.0
+        self.MAX_USABLE_SPREAD = 0.20  # if book spread > 20%, use gamma price
 
     def hours_to_resolution(self) -> float:
         """Time remaining until market resolves, in hours."""
@@ -85,14 +88,26 @@ class StoikovMarketMaker:
         """One iteration of the market making loop."""
         # 1. Fetch fresh order book
         book = self.data.fetch_order_book(self.token_id)
-        if book.mid is None:
+        if book.mid is None and self.gamma_price is None:
             log.warning("No mid price, skipping")
             return
 
-        # 2. Use adjusted midpoint (anti-toxic-flow)
-        mid = self.data.adjusted_midpoint(self.token_id, min_incentive_size=50.0)
-        if mid is None:
-            mid = book.mid
+        # 2. Determine best mid price
+        # Priority: adjusted midpoint > book mid > gamma API price
+        # But if book spread is absurdly wide (>20%), the book mid is
+        # meaningless — fall back to the last traded price from Gamma API.
+        book_spread = book.spread if book.spread is not None else 1.0
+        if book_spread > self.MAX_USABLE_SPREAD and self.gamma_price is not None:
+            mid = self.gamma_price
+            log.debug("Book spread %.2f too wide, using gamma price %.4f", book_spread, mid)
+        else:
+            mid = self.data.adjusted_midpoint(self.token_id, min_incentive_size=50.0)
+            if mid is None:
+                mid = book.mid
+            if mid is None:
+                mid = self.gamma_price
+            if mid is None:
+                return
 
         # 3. Calculate Stoikov parameters
         pos = self.oms.get_position(self.token_id)
@@ -118,6 +133,14 @@ class StoikovMarketMaker:
             raw_spread *= 0.8  # tighten in contested zone (mean-reverting)
 
         half_spread = max(raw_spread / 2, float(self.tick_size))
+
+        # Cap spread — never quote wider than 10% from mid.
+        # Without this, low-volatility markets with long T produce
+        # absurdly wide spreads (90%+) that never get filled.
+        max_half_spread = 0.05  # 5% each side = 10% total max spread
+        if half_spread > max_half_spread:
+            log.debug("Capping spread: raw half=%.4f -> max=%.4f", half_spread, max_half_spread)
+            half_spread = max_half_spread
 
         bid = r - half_spread
         ask = r + half_spread
