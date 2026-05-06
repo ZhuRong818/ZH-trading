@@ -356,7 +356,7 @@ class BTC5mStrategy:
             self.total_trades += 1
             log.info(
                 "BTC5M TRADE: %s %.1f shares @ %.4f | kelly=$%.0f edge=%.4f "
-                "btc=$%,.0f momentum=%.4f%%",
+                "btc=$%.0f momentum=%.4f%%",
                 direction, size_shares, market_price,
                 kelly.size_usdc, kelly.edge,
                 self.btc.current or 0,
@@ -384,7 +384,7 @@ class BTC5mStrategy:
         for _ in range(10):
             self.btc.fetch()
             time.sleep(0.5)
-        log.info("BTC price: $%,.2f", self.btc.current)
+        log.info("BTC price: $%.2f", self.btc.current)
 
         try:
             while self.running:
@@ -426,7 +426,7 @@ class BTC5mStrategy:
                 if self.current_position is not None:
                     if int(remaining) % 30 == 0:
                         log.info(
-                            "BTC5M HOLDING %s | btc=$%,.2f remaining=%.0fs",
+                            "BTC5M HOLDING %s | btc=$%.2f remaining=%.0fs",
                             self.current_position, btc_price, remaining,
                         )
                     time.sleep(cfg.price_poll_interval)
@@ -490,7 +490,7 @@ class BTC5mStrategy:
             window.starting_btc_price = self.btc.current or 0
             self.current_window = window
             log.info(
-                "NEW WINDOW: %s | btc=$%,.2f | ends=%s",
+                "NEW WINDOW: %s | btc=$%.2f | ends=%s",
                 window.slug,
                 window.starting_btc_price,
                 window.end_time.strftime("%H:%M:%S"),
@@ -530,7 +530,7 @@ class BTC5mStrategy:
 
         log.info(
             "BTC5M RESULT: %s | predicted=%s actual=%s | "
-            "btc_start=$%,.2f btc_end=$%,.2f delta=$%,.2f | "
+            "btc_start=$%.2f btc_end=$%.2f delta=$%.2f | "
             "record=%d-%d (%.0f%%)",
             result, self.current_position,
             "UP" if btc_went_up else "DOWN",
