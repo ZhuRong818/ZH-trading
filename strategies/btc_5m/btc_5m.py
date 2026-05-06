@@ -23,6 +23,7 @@ Usage:
 
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import math
 import os
 import signal
@@ -653,6 +654,18 @@ class BTC5mStrategy:
         predicted_up = self.current_position == "UP"
         won = btc_went_up == predicted_up
 
+        profit_usdc = 0.0
+        pos = self.oms.get_position(
+            self.current_window.up_token if self.current_position == "UP" else self.current_window.down_token
+        )
+        if pos and pos.size > 0:
+            if self.current_position == "UP":
+                payout = 1.0 if btc_went_up else 0.0
+            else:
+                payout = 1.0 if not btc_went_up else 0.0
+            profit_usdc = pos.size * (payout - pos.avg_price)
+            self.daily_pnl += profit_usdc
+
         if won:
             self.wins += 1
             self.consecutive_losses = 0
@@ -662,16 +675,29 @@ class BTC5mStrategy:
             self.consecutive_losses += 1
             result = "LOSS"
 
-        log.info(
-            "BTC5M RESULT: %s | predicted=%s actual=%s | "
-            "btc_start=$%.2f btc_end=$%.2f delta=$%.2f | "
-            "record=%d-%d (%.0f%%)",
-            result, self.current_position,
-            "UP" if btc_went_up else "DOWN",
-            start_price, end_price, end_price - start_price,
-            self.wins, self.losses,
-            self.wins / max(self.total_trades, 1) * 100,
-        )
+        if pos and pos.size > 0:
+            log.info(
+                "BTC5M RESULT: %s | predicted=%s actual=%s | "
+                "btc_start=$%.2f btc_end=$%.2f delta=$%.2f | "
+                "profit=$%.2f | record=%d-%d (%.0f%%)",
+                result, self.current_position,
+                "UP" if btc_went_up else "DOWN",
+                start_price, end_price, end_price - start_price,
+                profit_usdc,
+                self.wins, self.losses,
+                self.wins / max(self.total_trades, 1) * 100,
+            )
+        else:
+            log.info(
+                "BTC5M RESULT: %s | predicted=%s actual=%s | "
+                "btc_start=$%.2f btc_end=$%.2f delta=$%.2f | "
+                "record=%d-%d (%.0f%%)",
+                result, self.current_position,
+                "UP" if btc_went_up else "DOWN",
+                start_price, end_price, end_price - start_price,
+                self.wins, self.losses,
+                self.wins / max(self.total_trades, 1) * 100,
+            )
 
     def _print_summary(self):
         log.info("=" * 60)
@@ -704,6 +730,17 @@ def main():
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # When running dry-run with verbose, also write verbose logs to a rotating file
+    if args.dry_run and args.verbose:
+        os.makedirs("logs", exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        logfile = os.path.join("logs", f"btc5m_dryrun_{ts}.log")
+        fh = RotatingFileHandler(logfile, maxBytes=5 * 1024 * 1024, backupCount=3)
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S"))
+        logging.getLogger().addHandler(fh)
+        print(f"Verbose dry-run logging to {logfile}")
 
     config = BTC5mConfig(
         bankroll=args.bankroll,
