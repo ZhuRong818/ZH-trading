@@ -131,16 +131,17 @@ class MarketDataFeed:
     Here: in-memory with REST polling.
     """
 
-    def __init__(self):
+    def __init__(self, timeout: float = 10.0):
         self._books: Dict[str, OrderBookSnapshot] = {}
         self._price_history: Dict[str, List[float]] = defaultdict(list)
         self._market_cache: Dict[str, MarketInfo] = {}
+        self.timeout = timeout
         self.session = requests.Session()
 
     # ---- Order Book ----
 
     def fetch_order_book(self, token_id: str) -> OrderBookSnapshot:
-        resp = self.session.get(f"{CLOB_BASE}/book", params={"token_id": token_id})
+        resp = self.session.get(f"{CLOB_BASE}/book", params={"token_id": token_id}, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
 
@@ -191,7 +192,7 @@ class MarketDataFeed:
     # ---- Market Metadata ----
 
     def fetch_market(self, condition_id: str) -> Optional[MarketInfo]:
-        resp = self.session.get(f"{GAMMA_BASE}/markets", params={"conditionId": condition_id})
+        resp = self.session.get(f"{GAMMA_BASE}/markets", params={"conditionId": condition_id}, timeout=self.timeout)
         resp.raise_for_status()
         markets = resp.json()
         if not markets:
@@ -200,7 +201,7 @@ class MarketDataFeed:
 
     def search_markets(self, query: str = "", limit: int = 20) -> List[MarketInfo]:
         params = {"_limit": limit, "active": True, "closed": False}
-        resp = self.session.get(f"{GAMMA_BASE}/markets", params=params)
+        resp = self.session.get(f"{GAMMA_BASE}/markets", params=params, timeout=self.timeout)
         resp.raise_for_status()
         markets = resp.json()
 
