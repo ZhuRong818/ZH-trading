@@ -1,6 +1,6 @@
 # ZH Trading
 
-Updated: 2026-05-07 (v2)
+Updated: 2026-05-07 (v3 — unified strategy interface)
 
 ZH Trading is a lightweight Python trading pipeline for Polymarket. It discovers markets, polls live order books, runs strategy modules, applies portfolio and capital controls, routes orders through a shared execution layer, and tracks fills, positions, logs, and basic performance in memory.
 
@@ -86,7 +86,8 @@ The pipeline tracks fill rate, rejection breakdown, and per-strategy signal stat
 |-- config/
 |   `-- settings.py                      # API URLs and config dataclasses
 |-- data_pipeline/
-|   `-- market_data.py                   # Gamma/CLOB polling and market state
+|   |-- market_data.py                   # Gamma/CLOB polling and market state
+|   `-- market_provider.py               # MarketContext, StaticProvider, RollingProvider
 |-- ems/
 |   |-- execution.py                     # Auth, live orders, rate limit, SOR
 |   |-- dry_run_sim.py                   # Book-aware dry-run fill simulator
@@ -116,13 +117,23 @@ The pipeline tracks fill rate, rejection breakdown, and per-strategy signal stat
 |       |-- csv_reporter.py              # Per-trade CSV export
 |       `-- log_reporter.py              # Enhanced terminal report
 |-- strategies/
-|   |-- arbitrage/arb_detector.py        # Sum-to-one and monotonic arb checks
-|   |-- btc_5m/btc_5m.py                 # Standalone BTC 5-minute runner
-|   |-- market_making/stoikov_model.py   # Stoikov market maker
-|   |-- mean_reversion/mean_reversion.py # Contested-zone mean reversion
-|   |-- resolution_fade/resolution_fade.py
-|   |-- whale_tracking/whale_tracker.py
-|   `-- kelly.py                         # Fractional Kelly helper
+|   |-- base.py                          # BaseStrategy interface (step → TradingSignal)
+|   |-- kelly.py                         # Fractional Kelly helper
+|   |-- unified_runner.py               # Legacy runner for rolling markets
+|   |-- v2/                              # Unified strategies (all same interface)
+|   |   |-- mm.py                        # Stoikov market making
+|   |   |-- meanrev.py                   # Mean reversion
+|   |   |-- fade.py                      # Resolution fade
+|   |   |-- whale.py                     # Whale copy trading
+|   |   |-- arb.py                       # Combinatorial arbitrage
+|   |   |-- momentum.py                  # BTC/ETH momentum (5m markets)
+|   |   `-- runner.py                    # UnifiedRunnerV2 — runs all strategies
+|   |-- arbitrage/arb_detector.py        # Legacy arb detector
+|   |-- btc_5m/btc_5m.py                 # Legacy BTC 5-minute runner
+|   |-- market_making/stoikov_model.py   # Legacy Stoikov market maker
+|   |-- mean_reversion/mean_reversion.py # Legacy mean reversion
+|   |-- resolution_fade/resolution_fade.py  # Legacy resolution fade
+|   `-- whale_tracking/whale_tracker.py  # Legacy whale tracker
 |-- logs/                                # Runtime JSONL trade logs
 `-- reports/                             # Post-session JSON, CSV, and analysis reports
 ```
@@ -410,17 +421,53 @@ python main.py --strategy mm --token TOKEN_ID
 
 Live mode submits real Polymarket CLOB orders. Validate in dry-run first, confirm token IDs and wallet/proxy configuration, and start with small sizes.
 
+## V2 Strategy Interface
+
+All strategies in `strategies/v2/` implement the same `BaseStrategy` interface:
+
+```python
+class BaseStrategy:
+    def step(self, contexts: List[MarketContext]) -> List[TradingSignal]
+    def on_fill(self, fill: Fill)
+    def snapshot(self) -> dict
+```
+
+Every strategy receives the same input (`MarketContext` with token, price, spread, time remaining, volatility, regime) and returns the same output (`TradingSignal` with token, side, price, size, edge). No strategy touches the EMS directly — all signals go through the pipeline.
+
+This makes strategies flexible across market types:
+- Long-dated markets use `StaticProvider` (fixed tokens)
+- 5-minute rolling markets use `RollingProvider` (auto-rotating tokens)
+- Same strategy code works on both
+
+```bash
+# 5-minute rolling market (all strategies)
+python main.py --strategy rolling,btc5m --dry-run --no-learn
+
+# Long-dated market
+python main.py --strategy mm,meanrev,fade,whale --token TOKEN --dry-run --no-learn
+```
+
+The legacy strategies in `strategies/` (outside `v2/`) still work and are used by `main.py`. The v2 strategies are the new path for unified operation.
+
+## Auto-Learner
+
+On startup, the learner reads past `reports/analysis_*.json` files and adjusts parameters:
+- Widens spreads if spread capture is low
+- Raises whale quality threshold if copy trades are losing
+- Disables strategies with 3+ consecutive negative sessions
+- Adjusts within ±30% of defaults, needs 10+ trades before acting
+
+Disable with `--no-learn`. Clear old data with `rm reports/analysis_*.json`.
+
 ## Current Limitations
 
-- Stoikov MM, mean reversion, resolution fade, and BTC 5m still call EMS directly instead of routing through the pipeline. Whale copy and arbitrage use the pipeline. Follow-up work will migrate all strategies to emit TradingSignals.
+- Legacy strategies in `strategies/` (outside v2/) still call EMS directly. The v2 versions route through the pipeline.
+- Dry-run simulator rejects most passive limit orders (MM quotes) because it can't model queue-based fills. Live mode would work correctly.
 - No persistent database for positions, market state, or performance.
 - No automatic `.env` loader.
 - No `requirements.txt` or automated test suite.
 - Market data is REST-polled instead of streamed over WebSockets.
 - In-memory state is lost on restart except for JSONL trade logs.
-- Dry-run fills are more realistic than instant fills, but still do not model queue priority, network latency, adverse selection, or complete exchange matching behavior.
-- Main-runner arbitrage only exposes sum-to-one event scans.
-- BTC 5-minute strategy is a separate runner.
 - The target architecture document includes Kafka, Redis, TimescaleDB, LLM sentiment, and a signing server, but those are not implemented in this lightweight path.
 
 ## V2 Roadmap
