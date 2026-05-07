@@ -46,6 +46,8 @@ from risk.risk_engine import RiskEngine
 from analytics.trade_log import TradeLog
 from analytics.performance import PerformanceTracker
 from analytics.tuner import ParameterTuner
+from pipeline.signal import TradingSignal
+from pipeline.engine import PipelineEngine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -91,6 +93,16 @@ class TradingSystem:
         self.trade_log = TradeLog()
         self.performance = PerformanceTracker(config.capital.total_capital_usdc)
         self.tuner = ParameterTuner(self.performance)
+
+        # Pipeline — the single entry point for all trading
+        self.pipeline = PipelineEngine(
+            risk_engine=self.risk,
+            capital_allocator=self.capital_allocator,
+            ems=self.ems,
+            oms=self.oms,
+            trade_log=self.trade_log,
+            performance=self.performance,
+        )
 
         # Strategies
         self.market_makers: list[StoikovMarketMaker] = []
@@ -358,20 +370,27 @@ class TradingSystem:
                 mm.step()
 
     def _step_whale_tracking(self):
-        """Run one whale tracking step, execute copy trades."""
+        """Run one whale tracking step. Signals go through pipeline."""
         if not self.whale_tracker:
             return
 
-        signals = self.whale_tracker.step()
-        for sig in signals:
-            # Pre-trade risk check
-            if self.risk.check_position_size(
-                sig.token_id, sig.size * sig.price
-            ):
-                self.whale_tracker.execute_copy_trade(sig)
+        whale_signals = self.whale_tracker.step()
+        for sig in whale_signals:
+            # Convert whale signal to pipeline TradingSignal
+            trading_signal = TradingSignal(
+                token_id=sig.token_id,
+                side=sig.side,
+                price=sig.price,
+                size=min(sig.size * self.config.whale_tracking.copy_fraction,
+                         self.config.whale_tracking.max_copy_size_usdc / sig.price if sig.price > 0 else 0),
+                strategy=f"whale_copy_{sig.username or sig.wallet[:8]}",
+                edge=0.0,
+                confidence=sig.win_rate,
+            )
+            self.pipeline.submit(trading_signal)
 
     def _step_arbitrage(self):
-        """Run arbitrage scan at configured interval."""
+        """Run arbitrage scan. Signals go through pipeline."""
         if not self.arb_detector:
             return
 
@@ -384,7 +403,18 @@ class TradingSystem:
             arb = self.arb_detector.scan_sum_to_one(slug)
             if arb and arb.profit_estimate >= 0.50:
                 log.info("Arb opportunity: %s profit_est=$%.2f", arb.arb_type, arb.profit_estimate)
-                self.arb_detector.execute_arb(arb)
+                # Each arb leg goes through the pipeline
+                for token_id, side, size in arb.trades:
+                    signal = TradingSignal(
+                        token_id=token_id,
+                        side=side,
+                        price=0.0,  # executor will use book price
+                        size=size,
+                        strategy=f"arb_{arb.arb_type}",
+                        edge=arb.profit_estimate / len(arb.trades),
+                        order_type="FOK",
+                    )
+                    self.pipeline.submit(signal)
 
     def _step_mean_reversion(self):
         """Run mean reversion step."""
@@ -466,10 +496,13 @@ class TradingSystem:
                 # Periodic status
                 if iteration % 12 == 0:  # every ~60s at 5s interval
                     cap = self.capital_allocator.summary()
+                    pstats = self.pipeline.stats()
                     log.info(
-                        "STATUS: %s | capital=$%.0f deployed=$%.0f (%.0f%%)",
+                        "STATUS: %s | capital=$%.0f deployed=$%.0f (%.0f%%) | "
+                        "signals=%d executed=%d fill_rate=%s",
                         self.performance.report(),
                         cap["total_capital"], cap["deployed"], cap["utilization_pct"],
+                        pstats["total_signals"], pstats["executed"], pstats["fill_rate"],
                     )
 
                 # Parameter tuning suggestions every ~10 min
@@ -490,6 +523,15 @@ class TradingSystem:
 
         # Performance report
         log.info("\n%s", self.performance.full_report())
+
+        # Pipeline stats
+        pstats = self.pipeline.stats()
+        log.info("Pipeline: signals=%d executed=%d rejected=%d fill_rate=%s",
+                 pstats["total_signals"], pstats["executed"],
+                 pstats["rejected"], pstats["fill_rate"])
+        if pstats.get("top_rejections"):
+            for reason, count in pstats["top_rejections"].items():
+                log.info("  Rejection: %s (%d times)", reason, count)
 
         # Capital summary
         cap = self.capital_allocator.summary()
