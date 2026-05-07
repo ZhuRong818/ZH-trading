@@ -365,8 +365,10 @@ class TradingSystem:
 
     def setup_btc_5m(self):
         """Initialize BTC 5-minute strategy (runs in background daemon thread)."""
+        btc_budget_frac = self.config.capital.strategy_budgets.get("btc5m", 0.10)
+        actual_bankroll = self.config.capital.total_capital_usdc * btc_budget_frac
         self.btc5m = BTC5mStrategy(
-            config=BTC5mConfig(bankroll=self.config.risk.max_total_exposure_usdc),
+            config=BTC5mConfig(bankroll=actual_bankroll),
             ems=self.ems,
             oms=self.oms,
             data_feed=self.data_feed,
