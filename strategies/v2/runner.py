@@ -9,26 +9,40 @@ The runner:
   2. Calls each strategy's step()
   3. Submits all signals through the pipeline (risk → capital → execute → log)
   4. Feeds fill results back to strategies
+  5. On window roll: settles open positions, computes PnL, frees capital
 """
 
 import logging
 import time
 from typing import Dict, List, Optional
+from dataclasses import dataclass, field
 
 from strategies.base import BaseStrategy
-from data_pipeline.market_provider import MarketProvider, MarketContext
+from data_pipeline.market_provider import MarketProvider, MarketContext, RollingProvider
 from pipeline.engine import PipelineEngine
 from pipeline.signal import TradingSignal
 from ems.execution import ExecutionEngine
-from oms.position_manager import Fill
+from oms.position_manager import Fill, PositionManager
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class OpenEntry:
+    """Tracks an open position from a fill for settlement purposes."""
+    token_id: str
+    side: str       # "BUY"
+    size: float
+    price: float
+    strategy: str
+    is_up_token: bool = True  # True if this is the "Up" side
 
 
 class UnifiedRunnerV2:
     """
     Runs any number of BaseStrategy instances on any MarketProvider.
     All signals go through the pipeline. No strategy touches EMS directly.
+    Handles settlement when rolling windows expire.
     """
 
     def __init__(
@@ -36,13 +50,24 @@ class UnifiedRunnerV2:
         provider: MarketProvider,
         pipeline: PipelineEngine,
         ems: ExecutionEngine,
+        oms: PositionManager = None,
     ):
         self.provider = provider
         self.pipeline = pipeline
         self.ems = ems
+        self.oms = oms
         self.strategies: List[BaseStrategy] = []
         self._last_window_key: str = ""
-        self._cancel_on_roll: bool = True  # cancel orders when window changes
+        self._is_rolling = isinstance(provider, RollingProvider)
+
+        # Track open entries for settlement
+        self._open_entries: List[OpenEntry] = []
+
+        # Settlement stats
+        self.total_settlements = 0
+        self.settlement_wins = 0
+        self.settlement_losses = 0
+        self.settlement_pnl = 0.0
 
     def add(self, strategy: BaseStrategy):
         """Register a strategy."""
@@ -50,7 +75,7 @@ class UnifiedRunnerV2:
         log.info("Runner: registered %s", strategy.name)
 
     def step(self):
-        """One iteration: refresh data → run strategies → submit signals."""
+        """One iteration: refresh data → settle if needed → run strategies → submit signals."""
         # 1. Refresh market data
         self.provider.refresh()
         contexts = self.provider.all_contexts()
@@ -61,14 +86,17 @@ class UnifiedRunnerV2:
         # 2. Check for window roll (rolling markets)
         window_key = contexts[0].condition_id if contexts else ""
         if window_key != self._last_window_key and self._last_window_key:
-            if self._cancel_on_roll:
-                self.ems.cancel_all()
-            for s in self.strategies:
-                s.on_cancel()
+            self._on_window_roll()
             log.info("Runner: window rolled to %s", window_key[:30])
         self._last_window_key = window_key
 
-        # 3. Run each strategy
+        # 3. Skip if too little time left
+        if self._is_rolling:
+            remaining = contexts[0].seconds_remaining if contexts else 0
+            if remaining <= 0:
+                return
+
+        # 4. Run each strategy
         all_signals: List[TradingSignal] = []
         for strategy in self.strategies:
             try:
@@ -77,11 +105,11 @@ class UnifiedRunnerV2:
             except Exception as e:
                 log.warning("Runner: %s.step() failed: %s", strategy.name, e)
 
-        # 4. Submit all signals through the pipeline
+        # 5. Submit all signals through the pipeline
         for signal in all_signals:
             result = self.pipeline.submit(signal)
 
-            # 5. Feed fill results back to the strategy
+            # 6. Feed fill results back and track for settlement
             if result.was_executed:
                 fill = Fill(
                     token_id=result.token_id,
@@ -91,11 +119,112 @@ class UnifiedRunnerV2:
                     timestamp=time.time(),
                     source=result.strategy,
                 )
-                # Find the strategy that generated this signal
+                # Notify the originating strategy
                 for s in self.strategies:
                     if result.strategy.startswith(s.name):
                         s.on_fill(fill)
                         break
+
+                # Track BUY fills for settlement
+                if result.side == "BUY" and self._is_rolling:
+                    is_up = self._is_up_token(result.token_id)
+                    self._open_entries.append(OpenEntry(
+                        token_id=result.token_id,
+                        side="BUY",
+                        size=fill.size,
+                        price=fill.price,
+                        strategy=result.strategy,
+                        is_up_token=is_up,
+                    ))
+
+    def _is_up_token(self, token_id: str) -> bool:
+        """Check if token is the 'Up' side of the current window."""
+        if isinstance(self.provider, RollingProvider):
+            return token_id == self.provider.up_token
+        return True
+
+    def _on_window_roll(self):
+        """
+        Window expired. Settle all open positions.
+        For 5m markets: determine if BTC went up or down,
+        then emit settlement SELL fills at $1.00 (won) or $0.00 (lost).
+        """
+        # Cancel any unfilled orders
+        self.ems.cancel_all()
+        for s in self.strategies:
+            s.on_cancel()
+
+        if not self._open_entries:
+            return
+
+        # Determine outcome from the rolling provider
+        if isinstance(self.provider, RollingProvider):
+            current_price = 0.0
+            if self.provider.price_feed:
+                try:
+                    current_price = self.provider.price_feed()
+                except Exception:
+                    pass
+
+            strike = self.provider.strike
+            btc_went_up = current_price >= strike if (current_price > 0 and strike > 0) else None
+
+            if btc_went_up is None:
+                log.warning("Settlement: can't determine outcome (price=%.2f strike=%.2f)",
+                            current_price, strike)
+                self._open_entries.clear()
+                return
+
+            log.info("Settlement: strike=$%.2f end=$%.2f → %s",
+                     strike, current_price, "UP" if btc_went_up else "DOWN")
+
+            # Settle each open position
+            for entry in self._open_entries:
+                # Determine payout
+                if entry.is_up_token:
+                    payout = 1.0 if btc_went_up else 0.0
+                else:
+                    payout = 0.0 if btc_went_up else 1.0
+
+                pnl = (payout - entry.price) * entry.size
+                won = pnl > 0
+
+                self.total_settlements += 1
+                self.settlement_pnl += pnl
+                if won:
+                    self.settlement_wins += 1
+                else:
+                    self.settlement_losses += 1
+
+                # Emit settlement SELL fill through EMS callbacks
+                settlement_fill = Fill(
+                    token_id=entry.token_id,
+                    side="SELL",
+                    size=entry.size,
+                    price=payout,
+                    timestamp=time.time(),
+                    order_id=f"settlement_{int(time.time())}",
+                    source="settlement",
+                )
+                # Fire through EMS callbacks (updates OMS, trade log, performance)
+                self.ems._fire_fill(settlement_fill)
+
+                # Notify the strategy
+                for s in self.strategies:
+                    if entry.strategy.startswith(s.name):
+                        s.on_fill(settlement_fill)
+                        break
+
+                result = "WIN" if won else "LOSS"
+                log.info(
+                    "SETTLED [%s]: %s %s %.1f @ %.4f → $%.2f pnl=$%.2f | "
+                    "record=%d-%d ($%.2f total)",
+                    result, entry.strategy, "UP" if entry.is_up_token else "DOWN",
+                    entry.size, entry.price, payout, pnl,
+                    self.settlement_wins, self.settlement_losses, self.settlement_pnl,
+                )
+
+        self._open_entries.clear()
 
     def status(self) -> dict:
         pstats = self.pipeline.stats()
@@ -106,4 +235,9 @@ class UnifiedRunnerV2:
             "pipeline_signals": pstats["total_signals"],
             "pipeline_executed": pstats["executed"],
             "pipeline_fill_rate": pstats["fill_rate"],
+            "open_entries": len(self._open_entries),
+            "settlements": self.total_settlements,
+            "settlement_wins": self.settlement_wins,
+            "settlement_losses": self.settlement_losses,
+            "settlement_pnl": round(self.settlement_pnl, 2),
         }
