@@ -1,6 +1,6 @@
 # ZH Trading
 
-Updated: 2026-05-07
+Updated: 2026-05-07 (v2)
 
 ZH Trading is a lightweight Python trading pipeline for Polymarket. It discovers markets, polls live order books, runs strategy modules, applies portfolio and capital controls, routes orders through a shared execution layer, and tracks fills, positions, logs, and basic performance in memory.
 
@@ -17,36 +17,62 @@ This README documents the code that exists in this repository today. `POLYMARKET
 - Capital allocation by strategy budget, market concentration, reserve, and locked collateral.
 - Risk checks for exposure, drawdown, stop losses, volatility pauses, and kill switch shutdown.
 - Strategy modules for Stoikov market making, sum-to-one arbitrage, whale copy trading, mean reversion, resolution fade, and BTC 5-minute markets.
+- Modular pipeline with enforced stages: Risk Gate, Capital Gate, Executor, Tracker, Logger.
 - Persistent JSONL trade logs plus runtime performance reports and heuristic tuning suggestions.
 
 ## Pipeline Flow
 
 ```text
-Polymarket Gamma API
-Polymarket CLOB API
-Polymarket Data API
-Binance BTC/USDT feed for btc_5m
-        |
-        v
-data_pipeline/market_data.py
-market search, book snapshots, midpoint history, regime classification
-        |
-        v
-strategies/
-mm, arb, whale, meanrev, fade, btc_5m
-        |
-        v
-risk/risk_engine.py + oms/capital_allocator.py
-drawdown, exposure, stops, circuit breakers, budgets
-        |
-        v
-ems/execution.py
-dry-run simulator or signed live CLOB orders
-        |
-        v
-oms/position_manager.py + analytics/
-fills, positions, reconciliation, trade logs, performance
+┌─────────────────────────────────────────────────────────────┐
+│                     DATA SOURCES                             │
+│  Polymarket CLOB API │ Gamma API │ Data API │ Binance BTC   │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│              DATA PIPELINE  (data_pipeline/)                 │
+│  Book snapshots, VWAP pricing, midpoint history,            │
+│  volatility, staleness checks, regime classification        │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│              STRATEGIES  (strategies/)                        │
+│  Stoikov MM │ Whale Copy │ Arb │ Mean Rev │ Fade │ BTC 5m   │
+│                                                              │
+│  Each strategy emits → TradingSignal                        │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│              PIPELINE ENGINE  (pipeline/)                     │
+│                                                              │
+│  ┌──────────┐  ┌──────────┐  ┌───────────┐                 │
+│  │ 1. RISK  │→ │2. CAPITAL│→ │3. EXECUTOR│                 │
+│  │   GATE   │  │   GATE   │  │           │                 │
+│  │Drawdown? │  │Budget OK?│  │VWAP fill  │                 │
+│  │Stop-loss?│  │Reserve?  │  │Depth check│                 │
+│  │Circuit?  │  │Concentr? │  │Sim / Live │                 │
+│  └──────────┘  └──────────┘  └─────┬─────┘                 │
+│                                    │                        │
+│  ┌──────────┐  ┌──────────┐        │                        │
+│  │5. LOGGER │← │4. TRACKER│← ─────┘                        │
+│  │Trade log │  │OMS update│                                 │
+│  │Perf stats│  │P&L calc  │                                 │
+│  │Fill rate │  │Collateral│                                 │
+│  └──────────┘  └──────────┘                                 │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│              ANALYTICS  (analytics/)                         │
+│  JSONL trade log │ Sharpe/drawdown │ Parameter tuner        │
+└──────────────────────────────────────────────────────────────┘
 ```
+
+Every signal flows through: **Risk Gate → Capital Gate → Executor → Tracker → Logger**. No strategy can bypass a stage. If any stage rejects, the signal stops and the rejection reason is logged.
+
+The pipeline tracks fill rate, rejection breakdown, and per-strategy signal stats. On shutdown it prints a full report including top rejection reasons.
 
 ## Repository Layout
 
@@ -65,6 +91,10 @@ fills, positions, reconciliation, trade logs, performance
 |   |-- execution.py                     # Auth, live orders, rate limit, SOR
 |   |-- dry_run_sim.py                   # Book-aware dry-run fill simulator
 |   `-- leg_handler.py                   # Leg execution helper
+|-- pipeline/
+|   |-- signal.py                        # TradingSignal — universal message
+|   |-- stages.py                        # RiskGate, CapitalGate, Executor, Tracker, Logger
+|   `-- engine.py                        # PipelineEngine — chains all stages
 |-- oms/
 |   |-- position_manager.py              # Fills, positions, PnL, reconciliation
 |   `-- capital_allocator.py             # Cross-strategy capital budgets
@@ -343,6 +373,7 @@ Live mode submits real Polymarket CLOB orders. Validate in dry-run first, confir
 
 ## Current Limitations
 
+- Stoikov MM, mean reversion, resolution fade, and BTC 5m still call EMS directly instead of routing through the pipeline. Whale copy and arbitrage use the pipeline. Follow-up work will migrate all strategies to emit TradingSignals.
 - No persistent database for positions, market state, or performance.
 - No automatic `.env` loader.
 - No `requirements.txt` or automated test suite.
