@@ -35,6 +35,7 @@ import time
 from config import SystemConfig, MarketMakingConfig, WhaleTrackingConfig, RiskConfig
 from data_pipeline.market_data import MarketDataFeed, MarketInfo
 from oms.position_manager import PositionManager, Fill
+from oms.capital_allocator import CapitalAllocator
 from ems.execution import ExecutionEngine, ClobAuth, SyntheticEqualitySOR
 from strategies.market_making.stoikov_model import StoikovMarketMaker
 from strategies.whale_tracking.whale_tracker import WhaleTracker
@@ -42,6 +43,9 @@ from strategies.arbitrage.arb_detector import ArbitrageDetector
 from strategies.mean_reversion.mean_reversion import MeanReversionStrategy, MeanReversionConfig
 from strategies.resolution_fade.resolution_fade import ResolutionFadeStrategy, ResolutionFadeConfig
 from risk.risk_engine import RiskEngine
+from analytics.trade_log import TradeLog
+from analytics.performance import PerformanceTracker
+from analytics.tuner import ParameterTuner
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,15 +70,27 @@ class TradingSystem:
         # Module 3: OMS
         self.oms = PositionManager()
 
-        # Module 4: EMS
+        # Capital Allocator
+        self.capital_allocator = CapitalAllocator(config.capital, self.oms)
+
+        # Module 4: EMS (with data feed for VWAP + simulator, and capital allocator)
         self.auth = None
-        self.ems = ExecutionEngine(dry_run=config.dry_run)
+        self.ems = ExecutionEngine(
+            dry_run=config.dry_run,
+            data_feed=self.data_feed,
+            capital_allocator=self.capital_allocator,
+        )
 
         # Module 4: SOR (Smart Order Router)
         self.sor = SyntheticEqualitySOR(self.data_feed, self.ems)
 
         # Module 6: Risk Engine
         self.risk = RiskEngine(config.risk, self.data_feed, self.ems, self.oms)
+
+        # Analytics
+        self.trade_log = TradeLog()
+        self.performance = PerformanceTracker(config.capital.total_capital_usdc)
+        self.tuner = ParameterTuner(self.performance)
 
         # Strategies
         self.market_makers: list[StoikovMarketMaker] = []
@@ -97,10 +113,17 @@ class TradingSystem:
 
         # Wire up fill callbacks
         self.ems.on_fill(self._on_fill)
+        self.ems.on_fill(self.trade_log.record_fill)
 
     def _on_fill(self, fill: Fill):
-        """Handle fill events — update OMS."""
+        """Handle fill events — update OMS and performance tracker."""
         self.oms.record_fill(fill)
+        # Track realized PnL per trade for performance
+        pos = self.oms.get_position(fill.token_id)
+        if fill.side == "SELL" and pos:
+            pnl = fill.size * (fill.price - pos.avg_price) if pos.avg_price > 0 else 0
+            if pnl != 0:
+                self.performance.record_trade(pnl, fill.source)
 
     # ---- Authentication ----
 
@@ -122,8 +145,13 @@ class TradingSystem:
             funder=self.config.funder,
         )
         self.auth.derive_api_creds()
-        self.ems = ExecutionEngine(auth=self.auth, dry_run=False)
+        self.ems = ExecutionEngine(
+            auth=self.auth, dry_run=False,
+            data_feed=self.data_feed,
+            capital_allocator=self.capital_allocator,
+        )
         self.ems.on_fill(self._on_fill)
+        self.ems.on_fill(self.trade_log.record_fill)
         # Rebuild SOR and risk with new EMS
         self.sor = SyntheticEqualitySOR(self.data_feed, self.ems)
         self.risk.ems = self.ems
@@ -425,6 +453,9 @@ class TradingSystem:
                 # Live position reconciliation
                 self._reconcile_positions()
 
+                # Process pending dry-run orders
+                self.ems.check_pending_dry_run()
+
                 # Strategy steps
                 self._step_market_making()
                 self._step_whale_tracking()
@@ -434,18 +465,16 @@ class TradingSystem:
 
                 # Periodic status
                 if iteration % 12 == 0:  # every ~60s at 5s interval
-                    status = self.risk.status()
-                    summary = self.oms.portfolio_summary()
+                    cap = self.capital_allocator.summary()
                     log.info(
-                        "STATUS: positions=%d exposure=$%.0f pnl=$%.2f "
-                        "orders=%d mm=%d whale_signals=%d",
-                        summary["num_positions"],
-                        summary["total_notional_usdc"],
-                        summary["total_pnl"],
-                        status["open_orders"],
-                        len(self.market_makers),
-                        len(self.whale_tracker.signals) if self.whale_tracker else 0,
+                        "STATUS: %s | capital=$%.0f deployed=$%.0f (%.0f%%)",
+                        self.performance.report(),
+                        cap["total_capital"], cap["deployed"], cap["utilization_pct"],
                     )
+
+                # Parameter tuning suggestions every ~10 min
+                if iteration % 120 == 0 and iteration > 0:
+                    self.tuner.log_suggestions()
 
                 time.sleep(self.config.market_making.refresh_interval)
 
@@ -458,10 +487,21 @@ class TradingSystem:
         self.running = False
         log.info("Shutting down...")
         self.ems.cancel_all()
-        summary = self.oms.portfolio_summary()
-        log.info("Final P&L: $%.2f (realized=$%.2f unrealized=$%.2f)",
-                 summary["total_pnl"], summary["realized_pnl"], summary["unrealized_pnl"])
-        log.info("System stopped.")
+
+        # Performance report
+        log.info("\n%s", self.performance.full_report())
+
+        # Capital summary
+        cap = self.capital_allocator.summary()
+        log.info("Capital: total=$%.0f deployed=$%.0f available=$%.0f",
+                 cap["total_capital"], cap["deployed"], cap["available"])
+
+        # Final tuning suggestions
+        self.tuner.log_suggestions()
+
+        # Close trade log
+        self.trade_log.close()
+        log.info("Trade log saved. System stopped.")
 
 
 # ---------------------------------------------------------------------------

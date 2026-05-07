@@ -16,6 +16,29 @@ NEG_RISK_CTF_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 
 
 @dataclass
+class FeeConfig:
+    maker_fee_bps: float = 0.0       # Polymarket maker fee (currently 0)
+    taker_fee_bps: float = 100.0     # 1% taker fee (100 basis points)
+    crypto_5m_fee_bps: float = 720.0 # 7.2% on 5-min crypto markets
+
+
+@dataclass
+class CapitalConfig:
+    total_capital_usdc: float = 100_000
+    reserve_pct: float = 0.20           # keep 20% as reserve
+    max_per_market_pct: float = 0.10    # max 10% in any single market
+    max_per_strategy_pct: float = 0.40  # max 40% for any one strategy
+    strategy_budgets: dict = field(default_factory=lambda: {
+        "stoikov_mm": 0.30,
+        "whale_copy": 0.15,
+        "arb": 0.20,
+        "mean_rev": 0.15,
+        "fade": 0.10,
+        "btc5m": 0.10,
+    })
+
+
+@dataclass
 class RiskConfig:
     # Portfolio level
     max_total_exposure_usdc: float = 100_000
@@ -70,6 +93,8 @@ class SystemConfig:
     heartbeat_interval: float = 5.0
 
     risk: RiskConfig = field(default_factory=RiskConfig)
+    fees: FeeConfig = field(default_factory=FeeConfig)
+    capital: CapitalConfig = field(default_factory=CapitalConfig)
     market_making: MarketMakingConfig = field(default_factory=MarketMakingConfig)
     whale_tracking: WhaleTrackingConfig = field(default_factory=WhaleTrackingConfig)
 

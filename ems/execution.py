@@ -199,18 +199,38 @@ class ExecutionEngine:
     """
     Central EMS — all strategy modules submit orders through here.
     Handles order building, signing, rate limiting, and fill tracking.
+    Uses DryRunSimulator for realistic paper trading fills.
     """
 
-    def __init__(self, auth: Optional[ClobAuth] = None, dry_run: bool = True):
+    def __init__(self, auth: Optional[ClobAuth] = None, dry_run: bool = True,
+                 data_feed=None, capital_allocator=None):
         self.auth = auth
         self.dry_run = dry_run
+        self.data = data_feed
+        self.capital_allocator = capital_allocator
         self.rate_limiter = RateLimitManager()
         self.open_order_ids: List[str] = []
         self._fill_callbacks = []
+        self._simulator = None
+
+        if dry_run and data_feed:
+            from ems.dry_run_sim import DryRunSimulator
+            self._simulator = DryRunSimulator(data_feed)
 
     def on_fill(self, callback):
         """Register a callback for fill events."""
         self._fill_callbacks.append(callback)
+
+    def _fire_fill(self, fill: Fill):
+        """Notify all fill callbacks."""
+        for cb in self._fill_callbacks:
+            cb(fill)
+
+    def check_pending_dry_run(self):
+        """Process pending GTC orders in dry-run simulator. Call each loop iteration."""
+        if self._simulator:
+            for fill in self._simulator.check_pending():
+                self._fire_fill(fill)
 
     def place_order(
         self,
@@ -232,20 +252,48 @@ class ExecutionEngine:
             log.warning("Rate limited, skipping order")
             return None
 
+        # Capital allocation check
+        if self.capital_allocator:
+            cost = size * price
+            approved = self.capital_allocator.request_capital(source, token_id, cost)
+            if approved <= 0:
+                log.info("Capital rejected for %s %s $%.0f", source, side, cost)
+                return None
+            # Reduce size if capital was reduced
+            if approved < cost:
+                size = approved / price if price > 0 else 0
+
+        # Depth check
+        if self.data:
+            book = self.data.get_book(token_id)
+            if book and not book.has_sufficient_depth(side, size):
+                log.warning("Insufficient depth: %s %s %.1f", side, token_id[:16], size)
+                return None
+
         if self.dry_run:
-            log.info("[DRY] %s %s %.1f @ %.4f [%s]", source or "EMS", side, size, price, order_type)
-            # Simulate fill for paper trading
-            fill = Fill(
-                token_id=token_id,
-                side=side,
-                size=size,
-                price=price,
-                timestamp=time.time(),
-                source=source,
-            )
-            for cb in self._fill_callbacks:
-                cb(fill)
-            return f"dry_{side}_{price}_{time.time()}"
+            if self._simulator:
+                # Realistic simulation — VWAP fill, probabilistic
+                fill = self._simulator.simulate_fill(
+                    token_id, side, price, size, order_type, source,
+                )
+                if fill:
+                    log.info("[SIM] %s %s %.1f @ %.4f [%s]",
+                             source or "EMS", fill.side, fill.size, fill.price, order_type)
+                    self._fire_fill(fill)
+                    return fill.order_id
+                else:
+                    log.debug("[SIM] %s %s %.1f @ %.4f — pending/rejected [%s]",
+                              source or "EMS", side, size, price, order_type)
+                    return None
+            else:
+                # Fallback: instant fill (no data feed available)
+                log.info("[DRY] %s %s %.1f @ %.4f [%s]", source or "EMS", side, size, price, order_type)
+                fill = Fill(
+                    token_id=token_id, side=side, size=size, price=price,
+                    timestamp=time.time(), source=source,
+                )
+                self._fire_fill(fill)
+                return f"dry_{side}_{price}_{time.time()}"
 
         try:
             scale = 10 ** 6

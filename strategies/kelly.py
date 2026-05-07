@@ -50,6 +50,7 @@ def kelly_size(
     kelly_fraction: float = 0.25,
     max_bet_pct: float = 0.05,
     min_edge: float = 0.02,
+    fee_bps: float = 0.0,
 ) -> KellyResult:
     """
     Compute optimal position size using fractional Kelly criterion.
@@ -61,14 +62,18 @@ def kelly_size(
         kelly_fraction: Kelly multiplier (0.25 = quarter Kelly, safest)
         max_bet_pct:    Max fraction of bankroll per single bet (hard cap)
         min_edge:       Minimum edge required to trade (filter noise)
+        fee_bps:        Round-trip fee in basis points (e.g. 100 = 1%)
 
     Returns:
         KellyResult with direction, size, and edge
     """
+    # Deduct fees from edge before evaluating
+    fee_drag = fee_bps / 10_000  # convert bps to decimal
     edge = fair_prob - market_price
 
-    # No edge — don't trade
-    if abs(edge) < min_edge:
+    # Check if edge survives after fees
+    effective_edge = abs(edge) - fee_drag
+    if effective_edge < min_edge:
         return KellyResult(
             fraction=0, size_usdc=0, edge=edge,
             direction="NONE", confidence=0,

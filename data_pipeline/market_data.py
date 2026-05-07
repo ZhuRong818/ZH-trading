@@ -52,6 +52,57 @@ class OrderBookSnapshot:
         data = self.bids if side == "BUY" else self.asks
         return sum(row[1] for row in data[:levels])
 
+    def vwap_price(self, side: str, size: float) -> tuple:
+        """
+        Walk the book to compute the actual fill price for `size` shares.
+        side="BUY" walks asks (you pay the ask); side="SELL" walks bids.
+
+        Returns: (vwap_price, fillable_size)
+        If book can't fill the full size, fillable_size < size.
+        """
+        data = self.asks if side == "BUY" else self.bids
+        if not data:
+            return (None, 0.0)
+
+        filled = 0.0
+        cost = 0.0
+        for price, level_size in data:
+            take = min(level_size, size - filled)
+            cost += take * price
+            filled += take
+            if filled >= size:
+                break
+
+        if filled <= 0:
+            return (None, 0.0)
+        return (cost / filled, filled)
+
+    def slippage(self, side: str, size: float) -> float:
+        """How much worse is the VWAP vs best price for a given size."""
+        best = self.best_ask if side == "BUY" else self.best_bid
+        vwap, _ = self.vwap_price(side, size)
+        if best is None or vwap is None:
+            return 0.0
+        return abs(vwap - best)
+
+    def has_sufficient_depth(self, side: str, required_size: float, max_levels: int = 10) -> bool:
+        """Check if book has enough depth to fill required_size."""
+        available = self.depth(side, levels=max_levels)
+        return available >= required_size * 0.8
+
+    def total_value(self, side: str, levels: int = 10) -> float:
+        """Total USDC value on one side of the book."""
+        data = self.bids if side == "BUY" else self.asks
+        return sum(row[0] * row[1] for row in data[:levels])
+
+    def age_seconds(self) -> float:
+        if self.timestamp <= 0:
+            return 999.0
+        return time.time() - self.timestamp
+
+    def is_stale(self, max_age: float = 10.0) -> bool:
+        return self.age_seconds() > max_age
+
 
 @dataclass
 class MarketInfo:
@@ -109,6 +160,17 @@ class MarketDataFeed:
 
     def get_book(self, token_id: str) -> Optional[OrderBookSnapshot]:
         return self._books.get(token_id)
+
+    def get_fresh_book(self, token_id: str, max_age: float = 10.0) -> Optional[OrderBookSnapshot]:
+        """Return cached book if fresh, otherwise re-fetch."""
+        book = self._books.get(token_id)
+        if book and not book.is_stale(max_age):
+            return book
+        try:
+            return self.fetch_order_book(token_id)
+        except Exception as e:
+            log.warning("Book fetch failed for %s: %s", token_id[:16], e)
+            return None
 
     # ---- Volatility ----
 
