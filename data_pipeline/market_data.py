@@ -28,6 +28,12 @@ class OrderBookSnapshot:
     asks: List[List[float]]
     timestamp: float = 0.0
 
+    def __post_init__(self):
+        # Polymarket documents sorted books, but sorting defensively keeps
+        # top-of-book logic correct if an endpoint or test fixture differs.
+        self.bids.sort(key=lambda row: row[0], reverse=True)
+        self.asks.sort(key=lambda row: row[0])
+
     @property
     def best_bid(self) -> Optional[float]:
         return self.bids[0][0] if self.bids else None
