@@ -143,6 +143,9 @@ class RollingProvider(MarketProvider):
     """
     For 5-minute rolling markets (BTC, ETH).
     Auto-discovers the current window and rotates tokens every 5 minutes.
+
+    Settlement is handled via the system-wide SettlementOracle so that
+    every strategy uses the same ground-truth price at window expiry.
     """
 
     def __init__(
@@ -151,6 +154,7 @@ class RollingProvider(MarketProvider):
         asset: str = "btc",
         interval: str = "5m",
         price_feed=None,  # callable that returns current price (e.g., Binance)
+        oracle=None,      # SettlementOracle instance (lazy-created if None)
     ):
         super().__init__(data_feed)
         self.asset = asset
@@ -158,6 +162,12 @@ class RollingProvider(MarketProvider):
         self.interval_seconds = int(interval.replace("m", "")) * 60
         self.price_feed = price_feed
         self.session = requests.Session()
+
+        # Oracle for ground-truth settlement prices
+        if oracle is None:
+            from data_pipeline.oracle import SettlementOracle
+            oracle = SettlementOracle()
+        self.oracle = oracle
 
         self._current_slug: str = ""
         self._current_window_ts: int = 0
@@ -293,3 +303,35 @@ class RollingProvider(MarketProvider):
         if self._end_time:
             return max((self._end_time - datetime.now(timezone.utc)).total_seconds(), 0)
         return 0
+
+    @property
+    def end_timestamp(self) -> int:
+        """Unix timestamp (int) of the current window's end time."""
+        if self._end_time:
+            return int(self._end_time.timestamp())
+        return 0
+
+    def resolve_outcome(self) -> Optional[str]:
+        """
+        Return the ground-truth settlement outcome for the *previous* window.
+
+        Uses the system-wide SettlementOracle to determine whether the
+        asset finished above (UP) or below (DOWN) the strike price at
+        the window's exact end timestamp.
+
+        Returns 'UP', 'DOWN', or None if the price cannot be determined.
+        """
+        if self._strike_price <= 0:
+            log.warning("RollingProvider.resolve_outcome: no strike price")
+            return None
+
+        end_ts = self.end_timestamp
+        if end_ts <= 0:
+            log.warning("RollingProvider.resolve_outcome: no end timestamp")
+            return None
+
+        return self.oracle.determine_outcome(
+            asset=self.asset,
+            strike=self._strike_price,
+            end_timestamp=end_ts,
+        )

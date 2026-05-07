@@ -65,6 +65,10 @@ class UnifiedRunnerV2:
         # Track open entries for settlement
         self._open_entries: List[OpenEntry] = []
 
+        # Saved previous-window data (captured before refresh overwrites them)
+        self._last_strike: float = 0.0
+        self._last_end_ts: int = 0
+
         # Settlement stats
         self.total_settlements = 0
         self.settlement_wins = 0
@@ -78,6 +82,14 @@ class UnifiedRunnerV2:
 
     def step(self):
         """One iteration: refresh data → settle if needed → run strategies → submit signals."""
+        # 0. Capture previous-window settlement data BEFORE refresh overwrites it
+        if self._is_rolling:
+            prev_strike = self.provider.strike
+            prev_end_ts = self.provider.end_timestamp
+        else:
+            prev_strike = 0.0
+            prev_end_ts = 0
+
         # 1. Refresh market data
         self.provider.refresh()
         contexts = self.provider.all_contexts()
@@ -88,7 +100,7 @@ class UnifiedRunnerV2:
         # 2. Check for window roll (rolling markets)
         window_key = contexts[0].condition_id if contexts else ""
         if window_key != self._last_window_key and self._last_window_key:
-            self._on_window_roll()
+            self._on_window_roll(prev_strike, prev_end_ts)
             log.info("Runner: window rolled to %s", window_key[:30])
         self._last_window_key = window_key
 
@@ -152,11 +164,13 @@ class UnifiedRunnerV2:
             return token_id == self.provider.up_token
         return True
 
-    def _on_window_roll(self):
+    def _on_window_roll(self, prev_strike: float = 0.0, prev_end_ts: int = 0):
         """
         Window expired. Settle all open positions.
-        For 5m markets: determine if BTC went up or down,
-        then emit settlement SELL fills at $1.00 (won) or $0.00 (lost).
+
+        Uses the *previous* window's strike and end timestamp (captured
+        before provider.refresh() overwrote them) to determine the
+        ground-truth outcome via the system-wide SettlementOracle.
         """
         # Cancel any unfilled orders
         self.ems.cancel_all()
@@ -164,12 +178,7 @@ class UnifiedRunnerV2:
             s.on_cancel()
 
         # ── Reconcile untracked positions from OMS ──────────────────
-        # Pending fills that fired via check_pending_dry_run() bypass
-        # the runner's _open_entries tracking.  Catch them here so they
-        # still get settled when the window rolls.
-        #
-        # NOTE: provider.refresh() already switched up/down tokens to
-        # the NEW window, so we use the saved _last_up/down_token.
+        # ... (same as before) ...
         if self._is_rolling and self.oms:
             up_token = self._last_up_token
             down_token = self._last_down_token
@@ -191,26 +200,25 @@ class UnifiedRunnerV2:
         if not self._open_entries:
             return
 
-        # Determine outcome from the rolling provider
+        # Determine outcome via system-wide oracle using *previous* window data
         if isinstance(self.provider, RollingProvider):
-            current_price = 0.0
-            if self.provider.price_feed:
-                try:
-                    current_price = self.provider.price_feed()
-                except Exception:
-                    pass
+            oracle = self.provider.oracle
+            outcome = oracle.determine_outcome(
+                asset=self.provider.asset,
+                strike=prev_strike,
+                end_timestamp=prev_end_ts,
+            )
 
-            strike = self.provider.strike
-            btc_went_up = current_price >= strike if (current_price > 0 and strike > 0) else None
-
-            if btc_went_up is None:
-                log.warning("Settlement: can't determine outcome (price=%.2f strike=%.2f)",
-                            current_price, strike)
+            if outcome is None:
+                log.warning("Settlement: oracle could not determine outcome "
+                            "(prev_strike=$%.2f prev_end_ts=%d)", prev_strike, prev_end_ts)
                 self._open_entries.clear()
                 return
 
-            log.info("Settlement: strike=$%.2f end=$%.2f → %s",
-                     strike, current_price, "UP" if btc_went_up else "DOWN")
+            btc_went_up = (outcome == "UP")
+
+            log.info("Settlement: prev_strike=$%.2f → %s (oracle)",
+                     prev_strike, outcome)
 
             # Settle each open position
             for entry in self._open_entries:

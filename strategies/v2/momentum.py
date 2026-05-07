@@ -73,17 +73,18 @@ class Momentum(BaseStrategy):
         if len(self._prices) < 5:
             return []
 
-        signals = []
+        # One signal per window — only process the first valid context.
+        # RollingProvider inserts the UP-token context first, and _compute()
+        # is designed to work from the UP-token perspective.
         for ctx in contexts:
             if not ctx.is_valid:
                 continue
             if ctx.seconds_remaining < 30:
                 continue  # too late
             s = self._compute(ctx)
-            if s:
-                signals.append(s)
+            return [s] if s else []
 
-        return signals
+        return []
 
     def _poll_price(self):
         try:
