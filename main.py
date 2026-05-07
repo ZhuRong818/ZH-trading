@@ -17,6 +17,9 @@ Usage:
     # Run all strategies
     python main.py --strategy all --search "election" --dry-run
 
+    # BTC 5-minute trading (auto-discovers rolling markets)
+    python main.py --strategy btc5m --dry-run
+
     # Multi-market market making
     python main.py --strategy mm --token TOKEN1,TOKEN2,TOKEN3 --dry-run
 
@@ -42,6 +45,7 @@ from strategies.whale_tracking.whale_tracker import WhaleTracker
 from strategies.arbitrage.arb_detector import ArbitrageDetector
 from strategies.mean_reversion.mean_reversion import MeanReversionStrategy, MeanReversionConfig
 from strategies.resolution_fade.resolution_fade import ResolutionFadeStrategy, ResolutionFadeConfig
+from strategies.btc_5m.btc_5m import BTC5mStrategy, BTC5mConfig
 from risk.risk_engine import RiskEngine
 from analytics.trade_log import TradeLog
 from analytics.performance import PerformanceTracker
@@ -114,6 +118,8 @@ class TradingSystem:
         self.arb_detector = None
         self.mean_reversion = None
         self.resolution_fade = None
+        self.btc5m = None
+        self._btc5m_thread = None
 
         # Market info for each MM token
         self.mm_markets: list[dict] = []  # [{token_id, tick_size, neg_risk, end_date, question}]
@@ -297,6 +303,7 @@ class TradingSystem:
             ems=self.ems,
         )
         self.arb_event_slugs = event_slugs
+        self.post_analyzer.register_strategy(self.arb_detector, "arbitrage")
         log.info("Arbitrage detector initialized, scanning %d event(s): %s",
                  len(event_slugs), ", ".join(event_slugs))
 
@@ -318,6 +325,7 @@ class TradingSystem:
             tick_sizes=tick_sizes,
             neg_risks=neg_risks,
         )
+        self.post_analyzer.register_strategy(self.mean_reversion, "mean_reversion")
         log.info("Mean Reversion strategy initialized on %d market(s)", len(token_ids))
 
     def setup_resolution_fade(self):
@@ -342,7 +350,22 @@ class TradingSystem:
             oms=self.oms,
             markets=fade_markets,
         )
+        self.post_analyzer.register_strategy(self.resolution_fade, "resolution_fade")
         log.info("Resolution Fade strategy initialized on %d market(s)", len(fade_markets))
+
+    def setup_btc_5m(self):
+        """Initialize BTC 5-minute strategy (runs in background daemon thread)."""
+        self.btc5m = BTC5mStrategy(
+            config=BTC5mConfig(bankroll=self.config.risk.max_total_exposure_usdc),
+            ems=self.ems,
+            oms=self.oms,
+            data_feed=self.data_feed,
+        )
+        self.post_analyzer.register_strategy(self.btc5m, "btc_5m")
+        self.btc5m.running = True
+        self._btc5m_thread = threading.Thread(target=self.btc5m.run, daemon=True)
+        self._btc5m_thread.start()
+        log.info("BTC 5-Minute strategy started (background thread)")
 
     # ---- Heartbeat ----
 
@@ -452,6 +475,8 @@ class TradingSystem:
             self.setup_mean_reversion()
         if "fade" in strategies and self.mm_markets:
             self.setup_resolution_fade()
+        if "btc5m" in strategies:
+            self.setup_btc_5m()
 
         # Start heartbeat for live mode
         if not self.config.dry_run and self.auth:
@@ -468,6 +493,8 @@ class TradingSystem:
             active_strats.append(f"meanrev({len(self.mean_reversion.token_ids)} markets)")
         if self.resolution_fade:
             active_strats.append(f"fade({len(self.resolution_fade.markets)} markets)")
+        if self.btc5m:
+            active_strats.append("btc5m")
 
         log.info("=" * 60)
         log.info("Trading system started")
@@ -533,6 +560,12 @@ class TradingSystem:
         log.info("Shutting down...")
         self.ems.cancel_all()
 
+        # Stop BTC 5m background thread
+        if self.btc5m:
+            self.btc5m.running = False
+            if self._btc5m_thread and self._btc5m_thread.is_alive():
+                self._btc5m_thread.join(timeout=5)
+
         # Run post-session analysis (replaces the old simple report)
         self.post_analyzer.run_analysis()
 
@@ -573,6 +606,7 @@ Strategies (comma-separated or 'all'):
   arb      Combinatorial arbitrage (requires --arb-events)
   meanrev  Mean reversion — buy dips, sell rips in contested markets
   fade     Resolution fade — earn time decay premium near resolution
+  btc5m    BTC 5-minute rolling markets — momentum + arbitrage (auto)
   all      Run all strategies
 
 Low-drawdown combo:
@@ -635,7 +669,7 @@ Examples:
 
     # Parse strategies
     if args.strategy == "all":
-        strategies = ["mm", "whale", "arb", "meanrev", "fade"]
+        strategies = ["mm", "whale", "arb", "meanrev", "fade", "btc5m"]
     else:
         strategies = [s.strip() for s in args.strategy.split(",")]
 

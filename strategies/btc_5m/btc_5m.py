@@ -16,17 +16,17 @@ How it works:
 Resolution source: Chainlink BTC/USD data stream
 We use Binance as a proxy (Chainlink tracks major exchange prices).
 
-Usage:
-    python btc5m.py --dry-run
-    python btc5m.py --dry-run --verbose
+Integrated into the main trading system. Run via:
+    python main.py --strategy btc5m --dry-run
+    python main.py --strategy all --dry-run
+
+The strategy runs in a background daemon thread managed by TradingSystem.
 """
 
 import json
 import logging
-from logging.handlers import RotatingFileHandler
 import math
 import os
-import signal
 import sys
 import time
 from collections import deque
@@ -1013,75 +1013,25 @@ class BTC5mStrategy:
         log.info("=" * 60)
 
 
-# ---------------------------------------------------------------------------
-# Standalone CLI
-# ---------------------------------------------------------------------------
+    # ---- Post-Facto Support ----
 
-def main():
-    import argparse
+    def snapshot(self) -> dict:
+        """Return strategy state snapshot for post-session analysis."""
+        return {
+            "running": self.running,
+            "current_window": self.current_window.slug if self.current_window else "none",
+            "current_position": self.current_position or "none",
+            "btc_price": self.btc.current or 0,
+            "btc_volatility": self.btc.volatility(),
+            "btc_momentum": self.btc.momentum(),
+            "btc_trend": self.btc.trend_strength(),
+            "total_trades": self.total_trades,
+            "wins": self.wins,
+            "losses": self.losses,
+            "consecutive_losses": self.consecutive_losses,
+            "daily_pnl": self.daily_pnl,
+        }
 
-    parser = argparse.ArgumentParser(description="BTC 5-Minute Trading Strategy")
-    parser.add_argument("--dry-run", action="store_true", help="Paper trading mode")
-    parser.add_argument("--bankroll", type=float, default=5000, help="Bankroll in USDC")
-    parser.add_argument("--kelly", type=float, default=0.20, help="Kelly fraction (default: 0.20)")
-    parser.add_argument("--min-edge", type=float, default=0.03, help="Min edge to trade (default: 0.03)")
-    parser.add_argument("--deadline", type=float, default=180, help="Entry deadline seconds (default: 180)")
-    parser.add_argument("--min-entry-age", type=float, default=20, help="Seconds after open before entries")
-    parser.add_argument("--max-adverse-bps", type=float, default=2.0, help="Max adverse strike distance in bps")
-    parser.add_argument("--verbose", action="store_true", help="Debug logging")
-    args = parser.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
-
-    # When running dry-run with verbose, also write verbose logs to a rotating file
-    if args.dry_run and args.verbose:
-        os.makedirs("logs", exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        logfile = os.path.join("logs", f"btc5m_dryrun_{ts}.log")
-        fh = RotatingFileHandler(logfile, maxBytes=5 * 1024 * 1024, backupCount=3)
-        fh.setLevel(logging.DEBUG)
-        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S"))
-        logging.getLogger().addHandler(fh)
-        print(f"Verbose dry-run logging to {logfile}")
-
-    config = BTC5mConfig(
-        bankroll=args.bankroll,
-        kelly_fraction=args.kelly,
-        min_edge=args.min_edge,
-        entry_deadline_seconds=args.deadline,
-        min_entry_age_seconds=args.min_entry_age,
-        max_adverse_distance_bps=args.max_adverse_bps,
-    )
-
-    oms = PositionManager()
-    data_feed = MarketDataFeed()
-    ems = ExecutionEngine(dry_run=args.dry_run, data_feed=data_feed)
-    ems.on_fill(lambda f: oms.record_fill(f))
-
-    if not args.dry_run:
-        private_key = os.environ.get("POLYMARKET_PRIVATE_KEY")
-        if not private_key:
-            print("Set POLYMARKET_PRIVATE_KEY env var for live trading")
-            sys.exit(1)
-        auth = ClobAuth(
-            private_key=private_key,
-            chain_id=137,
-            sig_type=int(os.environ.get("POLYMARKET_SIG_TYPE", "1")),
-            funder=os.environ.get("POLYMARKET_FUNDER", ""),
-        )
-        auth.derive_api_creds()
-        ems = ExecutionEngine(auth=auth, dry_run=False, data_feed=data_feed)
-        ems.on_fill(lambda f: oms.record_fill(f))
-
-    strategy = BTC5mStrategy(config=config, ems=ems, oms=oms, data_feed=data_feed)
-    signal.signal(signal.SIGINT, lambda *_: setattr(strategy, 'running', False))
-    strategy.run()
-
-
-if __name__ == "__main__":
-    main()
+    def status(self) -> dict:
+        """Alias for snapshot — used by SnapshotCollector fallback."""
+        return self.snapshot()
