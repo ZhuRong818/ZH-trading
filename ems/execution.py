@@ -243,7 +243,13 @@ class ExecutionEngine:
         order_type: str = "GTC",
         source: str = "",
     ) -> Optional[str]:
-        """Place an order. Returns order ID or None."""
+        """Place an order with automatic size decomposition.
+
+        If the book does not have enough depth for the full size:
+          - FOK: split into smaller FOK chunks, each sized to fit book depth.
+          - GTC/FAK: reduce order size to the fillable portion.
+        Returns the first order ID on success, or None.
+        """
         tick = float(tick_size)
         price = round(round(price / tick) * tick, 4)
         price = max(tick, min(1.0 - tick, price))
@@ -259,20 +265,78 @@ class ExecutionEngine:
             if approved <= 0:
                 log.info("Capital rejected for %s %s $%.0f", source, side, cost)
                 return None
-            # Reduce size if capital was reduced
             if approved < cost:
                 size = approved / price if price > 0 else 0
 
-        # Depth check
+        # ── Adaptive depth handling & order decomposition ──────────────
         if self.data:
             book = self.data.get_book(token_id)
-            if book and not book.has_sufficient_depth(side, size):
-                log.warning("Insufficient depth: %s %s %.1f", side, token_id[:16], size)
-                return None
+            if book:
+                _, fillable = book.vwap_price(side, size)
+                if fillable < 1:
+                    log.warning("Insufficient liquidity: %s %s %.1f", side, token_id[:16], size)
+                    return None
+                if fillable < size:
+                    if order_type == "FOK":
+                        return self._place_fok_chunks(
+                            token_id, side, price, size,
+                            tick_size, neg_risk, source, fillable,
+                        )
+                    # GTC / FAK: reduce to what the book can serve
+                    log.info("Depth-limited %s %s: %.1f → %.1f (depth=%.1f)",
+                             source, side, size, fillable, fillable)
+                    size = fillable
 
+        # ── Execute single order ──────────────────────────────────────
+        return self._execute_single_order(
+            token_id, side, price, size,
+            tick_size, neg_risk, order_type, source,
+        )
+
+    def _place_fok_chunks(
+        self, token_id: str, side: str, price: float, total_size: float,
+        tick_size: str, neg_risk: bool, source: str, chunk_size: float,
+    ) -> Optional[str]:
+        """Split a large FOK order into smaller FOK chunks that fit book depth."""
+        oids: List[str] = []
+        remaining = total_size
+        while remaining > 0:
+            chunk = min(remaining, chunk_size)
+            # Re-check depth for this chunk (depth may have changed)
+            if self.data:
+                book = self.data.get_book(token_id)
+                if book:
+                    _, avail = book.vwap_price(side, chunk)
+                    if avail < chunk:
+                        chunk = max(avail, 1.0)
+            if chunk < 1:
+                log.warning("FOK chunk: no liquidity for remaining %.1f shares", remaining)
+                break
+
+            oid = self._execute_single_order(
+                token_id, side, price, chunk,
+                tick_size, neg_risk, "FOK", source,
+            )
+            if oid:
+                oids.append(oid)
+                remaining -= chunk
+            else:
+                log.warning("FOK chunk failed at %.1f shares (%.1f remaining)", chunk, remaining)
+                break
+
+        if oids:
+            log.info("Placed %d FOK chunks (%.1f / %.1f shares) for %s %s",
+                     len(oids), total_size - remaining, total_size, source, side)
+            return oids[0]
+        return None
+
+    def _execute_single_order(
+        self, token_id: str, side: str, price: float, size: float,
+        tick_size: str, neg_risk: bool, order_type: str, source: str,
+    ) -> Optional[str]:
+        """Execute a single order — no capital/depth checks, just place it."""
         if self.dry_run:
             if self._simulator:
-                # Realistic simulation — VWAP fill, probabilistic
                 fill = self._simulator.simulate_fill(
                     token_id, side, price, size, order_type, source,
                 )
@@ -286,8 +350,9 @@ class ExecutionEngine:
                               source or "EMS", side, size, price, order_type)
                     return None
             else:
-                # Fallback: instant fill (no data feed available)
-                log.info("[DRY] %s %s %.1f @ %.4f [%s]", source or "EMS", side, size, price, order_type)
+                # Fallback: instant fill (no simulator)
+                log.info("[DRY] %s %s %.1f @ %.4f [%s]",
+                         source or "EMS", side, size, price, order_type)
                 fill = Fill(
                     token_id=token_id, side=side, size=size, price=price,
                     timestamp=time.time(), source=source,
@@ -295,6 +360,7 @@ class ExecutionEngine:
                 self._fire_fill(fill)
                 return f"dry_{side}_{price}_{time.time()}"
 
+        # ── Live order via CLOB API ───────────────────────────────────
         try:
             scale = 10 ** 6
             if side == "BUY":
