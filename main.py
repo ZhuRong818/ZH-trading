@@ -40,12 +40,6 @@ from data_pipeline.market_data import MarketDataFeed, MarketInfo
 from oms.position_manager import PositionManager, Fill
 from oms.capital_allocator import CapitalAllocator
 from ems.execution import ExecutionEngine, ClobAuth, SyntheticEqualitySOR
-from strategies.market_making.stoikov_model import StoikovMarketMaker
-from strategies.whale_tracking.whale_tracker import WhaleTracker
-from strategies.arbitrage.arb_detector import ArbitrageDetector
-from strategies.mean_reversion.mean_reversion import MeanReversionStrategy, MeanReversionConfig
-from strategies.resolution_fade.resolution_fade import ResolutionFadeStrategy, ResolutionFadeConfig
-from strategies.btc_5m.btc_5m import BTC5mStrategy, BTC5mConfig
 from risk.risk_engine import RiskEngine
 from analytics.trade_log import TradeLog
 from analytics.performance import PerformanceTracker
@@ -53,7 +47,6 @@ from analytics.tuner import ParameterTuner
 from analytics.post_session import PostSessionAnalyzer
 from analytics.learner import Learner
 from data_pipeline.market_provider import RollingProvider
-from strategies.unified_runner import UnifiedRunner, get_btc_price, get_eth_price
 from pipeline.signal import TradingSignal
 from pipeline.engine import PipelineEngine
 
@@ -118,22 +111,14 @@ class TradingSystem:
             performance=self.performance,
         )
 
-        # Strategies
-        self.market_makers: list[StoikovMarketMaker] = []
-        self.whale_tracker = None
-        self.arb_detector = None
-        self.mean_reversion = None
-        self.resolution_fade = None
-        self.btc5m = None
-        self._btc5m_thread = None
+        # Strategies and Runners (V2)
+        self.static_runner = None
         self.rolling_runner = None
-
-        # Market info for each MM token
-        self.mm_markets: list[dict] = []  # [{token_id, tick_size, neg_risk, end_date, question}]
-
-        # Arb config
+        
+        # For legacy compatibility or general use
+        self.mm_markets: list[dict] = []
         self.arb_event_slugs: list[str] = []
-        self.arb_scan_interval = 30  # seconds between arb scans
+        self.arb_scan_interval = 30
         self._last_arb_scan = 0.0
 
         # Live reconciliation
@@ -274,131 +259,92 @@ class TradingSystem:
                     "all_token_ids": [],
                 })
 
-    # ---- Strategy Setup ----
+    # ---- Strategy Setup (V2) ----
 
-    def setup_market_making(self):
-        """Initialize Stoikov market makers for all selected markets."""
-        for mkt in self.mm_markets:
-            mm = StoikovMarketMaker(
-                config=self.config.market_making,
-                data_feed=self.data_feed,
-                ems=self.ems,
-                oms=self.oms,
-                token_id=mkt["token_id"],
-                tick_size=mkt["tick_size"],
-                neg_risk=mkt["neg_risk"],
-                end_date=mkt["end_date"],
-                gamma_price=mkt.get("gamma_price"),
-            )
-            self.market_makers.append(mm)
-            self.post_analyzer.register_token(mkt["token_id"])
-            self.post_analyzer.register_strategy(mm, f"stoikov_mm_{mkt['outcome']}")
-            log.info("MM initialized: %s [%s]", mkt["question"][:50], mkt["outcome"])
-        log.info("Market Making: %d market(s) active", len(self.market_makers))
+    def setup_v2_strategies(self, strategies: list[str]):
+        """Initialize static runner and requested V2 strategies."""
+        from strategies.v2.runner import UnifiedRunnerV2
+        from strategies.v2.mm import StoikovMM
+        from strategies.v2.whale import WhaleCopy
+        from strategies.v2.arb import Arbitrage
+        from strategies.v2.meanrev import MeanReversion
+        from strategies.v2.fade import ResolutionFade
+        from data_pipeline.market_provider import StaticProvider
+        
+        static_provider = StaticProvider(self.data_feed, self.mm_markets)
+        self.static_runner = UnifiedRunnerV2(static_provider, self.pipeline, self.ems)
+        
+        if "mm" in strategies and self.mm_markets:
+            mm = StoikovMM(self.config.market_making, self.data_feed)
+            self.static_runner.add(mm)
+            self.post_analyzer.register_strategy(mm, "v2_stoikov_mm")
+            log.info("Market Making initialized on %d market(s)", len(self.mm_markets))
+            
+        if "whale" in strategies:
+            whale = WhaleCopy(self.config.whale_tracking)
+            self.static_runner.add(whale)
+            self.post_analyzer.register_strategy(whale, "v2_whale")
+            log.info("Whale Tracker initialized")
+            
+        if "arb" in strategies and getattr(self, "arb_event_slugs", None):
+            arb = Arbitrage(self.arb_event_slugs, scan_interval=getattr(self, "arb_scan_interval", 30))
+            self.static_runner.add(arb)
+            self.post_analyzer.register_strategy(arb, "v2_arb")
+            log.info("Arbitrage scanner initialized for slugs: %s", self.arb_event_slugs)
+            
+        if "meanrev" in strategies and self.mm_markets:
+            meanrev = MeanReversion(bankroll=self.config.risk.max_total_exposure_usdc)
+            self.static_runner.add(meanrev)
+            self.post_analyzer.register_strategy(meanrev, "v2_meanrev")
+            log.info("Mean Reversion initialized")
+            
+        if "fade" in strategies and self.mm_markets:
+            fade = ResolutionFade(bankroll=self.config.risk.max_total_exposure_usdc)
+            self.static_runner.add(fade)
+            self.post_analyzer.register_strategy(fade, "v2_fade")
+            log.info("Resolution Fade initialized")
+            
+        log.info("Static Runner mapped %d strategies", len(self.static_runner.strategies))
 
-    def setup_whale_tracking(self):
-        """Initialize the whale tracker with SOR."""
-        self.whale_tracker = WhaleTracker(
-            config=self.config.whale_tracking,
-            data_feed=self.data_feed,
-            ems=self.ems,
-            oms=self.oms,
-            sor=self.sor,
-        )
-        self.whale_tracker.initialize()
-        self.post_analyzer.register_strategy(self.whale_tracker, "whale_copy")
-        log.info("Whale Tracking strategy initialized (with SOR)")
+    def setup_rolling(self, strategies: list[str], asset: str = "btc", interval: str = "5m"):
+        """Initialize rolling runner and requested V2 strategies for continuous markets."""
+        from strategies.v2.runner import UnifiedRunnerV2
+        from data_pipeline.market_provider import RollingProvider
+        from strategies.unified_runner import get_btc_price, get_eth_price
+        from strategies.v2.momentum import Momentum
+        from strategies.v2.mm import StoikovMM
+        from strategies.v2.meanrev import MeanReversion
+        from strategies.v2.fade import ResolutionFade
 
-    def setup_arbitrage(self, event_slugs: list[str]):
-        """Initialize the arbitrage detector."""
-        self.arb_detector = ArbitrageDetector(
-            data_feed=self.data_feed,
-            ems=self.ems,
-        )
-        self.arb_event_slugs = event_slugs
-        self.post_analyzer.register_strategy(self.arb_detector, "arbitrage")
-        log.info("Arbitrage detector initialized, scanning %d event(s): %s",
-                 len(event_slugs), ", ".join(event_slugs))
-
-    def setup_mean_reversion(self):
-        """Initialize mean reversion on all selected MM markets."""
-        if not self.mm_markets:
-            log.warning("Mean reversion needs markets — use --token or --search")
-            return
-        token_ids = [m["token_id"] for m in self.mm_markets]
-        tick_sizes = {m["token_id"]: m["tick_size"] for m in self.mm_markets}
-        neg_risks = {m["token_id"]: m["neg_risk"] for m in self.mm_markets}
-
-        self.mean_reversion = MeanReversionStrategy(
-            config=MeanReversionConfig(bankroll=self.config.risk.max_total_exposure_usdc),
-            data_feed=self.data_feed,
-            ems=self.ems,
-            oms=self.oms,
-            token_ids=token_ids,
-            tick_sizes=tick_sizes,
-            neg_risks=neg_risks,
-        )
-        self.post_analyzer.register_strategy(self.mean_reversion, "mean_reversion")
-        log.info("Mean Reversion strategy initialized on %d market(s)", len(token_ids))
-
-    def setup_resolution_fade(self):
-        """Initialize resolution fade on all selected MM markets."""
-        if not self.mm_markets:
-            log.warning("Resolution fade needs markets — use --token or --search")
-            return
-        fade_markets = [
-            {
-                "token_id": m["token_id"],
-                "end_date": m["end_date"],
-                "tick_size": m["tick_size"],
-                "neg_risk": m["neg_risk"],
-                "question": m["question"],
-            }
-            for m in self.mm_markets
-        ]
-        self.resolution_fade = ResolutionFadeStrategy(
-            config=ResolutionFadeConfig(bankroll=self.config.risk.max_total_exposure_usdc),
-            data_feed=self.data_feed,
-            ems=self.ems,
-            oms=self.oms,
-            markets=fade_markets,
-        )
-        self.post_analyzer.register_strategy(self.resolution_fade, "resolution_fade")
-        log.info("Resolution Fade strategy initialized on %d market(s)", len(fade_markets))
-
-    def setup_btc_5m(self):
-        """Initialize BTC 5-minute strategy (runs in background daemon thread)."""
-        btc_budget_frac = self.config.capital.strategy_budgets.get("btc5m", 0.10)
-        actual_bankroll = self.config.capital.total_capital_usdc * btc_budget_frac
-        self.btc5m = BTC5mStrategy(
-            config=BTC5mConfig(bankroll=actual_bankroll),
-            ems=self.ems,
-            oms=self.oms,
-            data_feed=self.data_feed,
-        )
-        self.post_analyzer.register_strategy(self.btc5m, "btc_5m")
-        self.btc5m.running = True
-        self._btc5m_thread = threading.Thread(target=self.btc5m.run, daemon=True)
-        self._btc5m_thread.start()
-        log.info("BTC 5-Minute strategy started (background thread)")
-
-    def setup_rolling(self, strategies: list, asset: str = "btc", interval: str = "5m"):
-        """Initialize unified runner on rolling 5m markets."""
         price_feeds = {"btc": get_btc_price, "eth": get_eth_price}
         price_feed = price_feeds.get(asset, get_btc_price)
 
         provider = RollingProvider(self.data_feed, asset=asset, interval=interval, price_feed=price_feed)
-        self.rolling_runner = UnifiedRunner(
-            provider=provider,
-            ems=self.ems,
-            oms=self.oms,
-            config=self.config,
-            pipeline=self.pipeline,
-        )
-        for s in strategies:
-            if s in ("mm", "meanrev", "fade"):
-                self.rolling_runner.add_strategy(s)
-        log.info("Rolling runner initialized: %s on %s %s", strategies, asset.upper(), interval)
+        self.rolling_runner = UnifiedRunnerV2(provider, self.pipeline, self.ems)
+        
+        if "btc5m" in strategies or "momentum" in strategies:
+            btc_budget_frac = self.config.capital.strategy_budgets.get("btc5m", 0.10)
+            actual_bankroll = self.config.capital.total_capital_usdc * btc_budget_frac
+            mom = Momentum(bankroll=actual_bankroll)
+            self.rolling_runner.add(mom)
+            self.post_analyzer.register_strategy(mom, "v2_momentum")
+
+        if "mm" in strategies:
+            mm = StoikovMM(self.config.market_making, self.data_feed)
+            self.rolling_runner.add(mm)
+            self.post_analyzer.register_strategy(mm, "v2_rolling_mm")
+
+        if "meanrev" in strategies:
+            mr = MeanReversion(bankroll=self.config.risk.max_total_exposure_usdc)
+            self.rolling_runner.add(mr)
+            self.post_analyzer.register_strategy(mr, "v2_rolling_meanrev")
+
+        if "fade" in strategies:
+            fd = ResolutionFade(bankroll=self.config.risk.max_total_exposure_usdc)
+            self.rolling_runner.add(fd)
+            self.post_analyzer.register_strategy(fd, "v2_rolling_fade")
+            
+        log.info("Rolling runner initialized on %s %s with %d strategies", asset.upper(), interval, len(self.rolling_runner.strategies))
 
     # ---- Heartbeat ----
 
@@ -426,70 +372,12 @@ class TradingSystem:
         if funder:
             self.oms.sync_from_api(funder)
 
-    # ---- Strategy Steps ----
+    # ---- Strategy Steps (V2) ----
 
-    def _step_market_making(self):
-        """Run one step for all market makers."""
-        for mm in self.market_makers:
-            if self.risk.check_circuit_breaker(mm.token_id):
-                mm.step()
-
-    def _step_whale_tracking(self):
-        """Run one whale tracking step. Signals go through pipeline."""
-        if not self.whale_tracker:
-            return
-
-        whale_signals = self.whale_tracker.step()
-        for sig in whale_signals:
-            # Convert whale signal to pipeline TradingSignal
-            trading_signal = TradingSignal(
-                token_id=sig.token_id,
-                side=sig.side,
-                price=sig.price,
-                size=min(sig.size * self.config.whale_tracking.copy_fraction,
-                         self.config.whale_tracking.max_copy_size_usdc / sig.price if sig.price > 0 else 0),
-                strategy=f"whale_copy_{sig.username or sig.wallet[:8]}",
-                edge=0.0,
-                confidence=sig.win_rate,
-            )
-            self.pipeline.submit(trading_signal)
-
-    def _step_arbitrage(self):
-        """Run arbitrage scan. Signals go through pipeline."""
-        if not self.arb_detector:
-            return
-
-        now = time.time()
-        if now - self._last_arb_scan < self.arb_scan_interval:
-            return
-        self._last_arb_scan = now
-
-        for slug in self.arb_event_slugs:
-            arb = self.arb_detector.scan_sum_to_one(slug)
-            if arb and arb.profit_estimate >= 0.50:
-                log.info("Arb opportunity: %s profit_est=$%.2f", arb.arb_type, arb.profit_estimate)
-                # Each arb leg goes through the pipeline
-                for token_id, side, size in arb.trades:
-                    signal = TradingSignal(
-                        token_id=token_id,
-                        side=side,
-                        price=0.0,  # executor will use book price
-                        size=size,
-                        strategy=f"arb_{arb.arb_type}",
-                        edge=arb.profit_estimate / len(arb.trades),
-                        order_type="FOK",
-                    )
-                    self.pipeline.submit(signal)
-
-    def _step_mean_reversion(self):
-        """Run mean reversion step."""
-        if self.mean_reversion:
-            self.mean_reversion.step()
-
-    def _step_resolution_fade(self):
-        """Run resolution fade step."""
-        if self.resolution_fade:
-            self.resolution_fade.step()
+    def _step_static(self):
+        """Run all static market strategies."""
+        if self.static_runner:
+            self.static_runner.step()
 
     def _step_rolling(self):
         """Run unified rolling runner."""
@@ -518,48 +406,37 @@ class TradingSystem:
                         strategies.remove("whale")
                         log.warning("Learner disabled strategy: whale")
 
-        # Setup requested strategies
-        if "mm" in strategies and self.mm_markets:
-            self.setup_market_making()
-        if "whale" in strategies:
-            self.setup_whale_tracking()
-        if "arb" in strategies and self.arb_event_slugs:
-            self.setup_arbitrage(self.arb_event_slugs)
-        if "meanrev" in strategies and self.mm_markets:
-            self.setup_mean_reversion()
-        if "fade" in strategies and self.mm_markets:
-            self.setup_resolution_fade()
-        if "btc5m" in strategies:
-            self.setup_btc_5m()
+        # Automatically add rolling strategy wrapper if only "btc5m" is specified
+        if "btc5m" in strategies and "rolling" not in strategies:
+            strategies.append("rolling")
+
+        asset = getattr(self.config, '_rolling_asset', 'btc')
+
+        # Setup V2 Static Strategies
+        static_strats = [s for s in strategies if s in ("mm", "whale", "arb", "meanrev", "fade")]
+        if static_strats and not ("rolling" in strategies and set(static_strats).issubset({"mm", "meanrev", "fade", "btc5m", "momentum"})):
+            self.setup_v2_strategies(strategies)
+            
+        # Setup V2 Rolling Strategies
         if "rolling" in strategies:
-            rolling_strats = [s for s in strategies if s in ("mm", "meanrev", "fade")]
-            asset = getattr(self.config, '_rolling_asset', 'btc')
-            self.setup_rolling(rolling_strats, asset=asset)
+            roll_strats = [s for s in strategies if s in ("mm", "meanrev", "fade", "btc5m", "momentum")]
+            self.setup_rolling(roll_strats, asset=asset)
 
         # Start heartbeat for live mode
         if not self.config.dry_run and self.auth:
             threading.Thread(target=self._heartbeat_loop, daemon=True).start()
 
         active_strats = []
-        if self.market_makers:
-            active_strats.append(f"mm({len(self.market_makers)} markets)")
-        if self.whale_tracker:
-            active_strats.append("whale")
-        if self.arb_detector:
-            active_strats.append(f"arb({len(self.arb_event_slugs)} events)")
-        if self.mean_reversion:
-            active_strats.append(f"meanrev({len(self.mean_reversion.token_ids)} markets)")
-        if self.resolution_fade:
-            active_strats.append(f"fade({len(self.resolution_fade.markets)} markets)")
-        if self.btc5m:
-            active_strats.append("btc5m")
+        if self.static_runner:
+            s_stat = self.static_runner.status()
+            active_strats.append(f"static({','.join(s_stat['strategies'])})")
         if self.rolling_runner:
-            rs = self.rolling_runner.status()
-            active_strats.append(f"rolling({','.join(rs['strategies'])})")
+            r_stat = self.rolling_runner.status()
+            active_strats.append(f"rolling({','.join(r_stat['strategies'])})")
 
         log.info("=" * 60)
-        log.info("Trading system started")
-        log.info("  Strategies: %s", ", ".join(active_strats) or "none")
+        log.info("Trading system started (V2 Engine)")
+        log.info("  Strategies: %s", " | ".join(active_strats) or "none")
         log.info("  Dry run: %s", self.config.dry_run)
         log.info("  Reconciliation: every %ds (live only)", self.reconcile_interval)
         log.info("=" * 60)
@@ -588,11 +465,7 @@ class TradingSystem:
 
                 # Strategy steps (each wrapped so one failure doesn't crash the loop)
                 for step_fn in [
-                    self._step_market_making,
-                    self._step_whale_tracking,
-                    self._step_arbitrage,
-                    self._step_mean_reversion,
-                    self._step_resolution_fade,
+                    self._step_static,
                     self._step_rolling,
                 ]:
                     try:
@@ -627,12 +500,6 @@ class TradingSystem:
         self.running = False
         log.info("Shutting down...")
         self.ems.cancel_all()
-
-        # Stop BTC 5m background thread
-        if self.btc5m:
-            self.btc5m.running = False
-            if self._btc5m_thread and self._btc5m_thread.is_alive():
-                self._btc5m_thread.join(timeout=5)
 
         # Run post-session analysis (replaces the old simple report)
         self.post_analyzer.run_analysis()
