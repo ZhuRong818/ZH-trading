@@ -37,12 +37,12 @@ class MeanReversion(BaseStrategy):
 
     def __init__(
         self,
-        lookback: int = 30,
-        entry_threshold: float = 0.03,
-        exit_threshold: float = 0.005,
+        lookback: int = 20,
+        entry_threshold: float = 0.01,
+        exit_threshold: float = 0.003,
         stop_multiple: float = 2.0,
-        min_price: float = 0.30,
-        max_price: float = 0.70,
+        min_price: float = 0.20,
+        max_price: float = 0.80,
         kelly_frac: float = 0.25,
         max_bet_pct: float = 0.03,
         bankroll: float = 10_000,

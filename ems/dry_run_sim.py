@@ -39,7 +39,7 @@ class DryRunSimulator:
     Simulates order fills using real book depth instead of instant fills.
     """
 
-    def __init__(self, data_feed: MarketDataFeed, base_fill_prob: float = 0.6):
+    def __init__(self, data_feed: MarketDataFeed, base_fill_prob: float = 0.85):
         self.data = data_feed
         self.base_fill_prob = base_fill_prob  # base probability a GTC order fills
         self.pending: List[PendingOrder] = []
@@ -81,9 +81,14 @@ class DryRunSimulator:
             log.debug("[SIM] No best price for %s %s", side, token_id[:16])
             return None
 
-        price_ok = (side == "BUY" and price >= best) or (side == "SELL" and price <= best)
+        # Allow orders within 10% of best price (simulates crossing the spread or near-market orders)
+        tolerance = 0.10
+        price_ok = (
+            (side == "BUY" and price >= best * (1 - tolerance))
+            or (side == "SELL" and price <= best * (1 + tolerance))
+        )
         if not price_ok:
-            log.debug("[SIM] Price not competitive: %s %.4f vs best %.4f", side, price, best)
+            log.debug("[SIM] Price not competitive: %s %.4f vs best %.4f (tol=%.0f%%)", side, price, best, tolerance * 100)
             if order_type == "GTC":
                 self._add_pending(token_id, side, price, size, order_type, source)
             return None

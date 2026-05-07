@@ -96,13 +96,13 @@ class WhaleCopy(BaseStrategy):
                 delta = size - old.get(tid, 0)
                 cur_price = float(pos.get("curPrice", 0.5))
 
-                # New conviction move: delta > 0 and notional > $100
-                if delta > 0 and delta * cur_price >= 100:
-                    if cur_price > 0.90 or cur_price < 0.10:
-                        continue  # tail zone, skip
+                # New conviction move: delta > 0 and notional > $20
+                if delta > 0 and delta * cur_price >= 20:
+                    if cur_price > 0.95 or cur_price < 0.05:
+                        continue  # extreme tail only
 
-                    if whale.get("win_rate", 0) < self.config.high_confidence_win_rate:
-                        continue
+                    if whale.get("win_rate", 0) < 0.60:
+                        continue  # lowered from 0.80
 
                     copy_size = min(
                         delta * self.config.copy_fraction,
