@@ -76,8 +76,8 @@ class PositionManager:
     def total_exposure_usdc(self) -> float:
         return sum(abs(p.notional) for p in self.positions.values())
 
-    def record_fill(self, fill: Fill):
-        """Update position state from a fill event."""
+    def record_fill(self, fill: Fill) -> float:
+        """Update position state from a fill event. Returns realized PnL."""
         self.fills.append(fill)
         pos = self.positions.get(fill.token_id)
 
@@ -89,11 +89,15 @@ class PositionManager:
             )
             self.positions[fill.token_id] = pos
 
+        realized = 0.0
+
         if fill.side == "BUY":
             # Increase position
             total_cost = pos.avg_price * pos.size + fill.price * fill.size
             pos.size += fill.size
-            pos.avg_price = total_cost / pos.size if pos.size > 0 else 0
+            pos.avg_price = total_cost / pos.size if pos.size > 0 else 0.0
+            # Seed mark price so risk checks don't see a zero price on new positions
+            pos.cur_price = fill.price
         elif fill.side == "SELL":
             if pos.size > 0:
                 # Realize PnL on the sold portion
@@ -110,6 +114,8 @@ class PositionManager:
             fill.side, fill.token_id[:12] + "...", fill.size, fill.price,
             pos.size, pos.avg_price, pos.total_pnl,
         )
+
+        return realized
 
     def update_mark_prices(self, token_prices: Dict[str, float]):
         """Update current market prices for all positions."""

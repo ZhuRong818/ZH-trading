@@ -140,13 +140,19 @@ class TradingSystem:
 
     def _on_fill(self, fill: Fill):
         """Handle fill events — update OMS and performance tracker."""
-        self.oms.record_fill(fill)
+        release_amount = 0.0
+        if fill.side == "SELL":
+            pos = self.oms.get_position(fill.token_id)
+            if pos and pos.size > 0:
+                release_amount = min(pos.size, fill.size) * pos.avg_price
+
+        realized = self.oms.record_fill(fill)
+
+        if release_amount > 0:
+            self.capital_allocator.release_capital(fill.source, fill.token_id, release_amount)
         # Track realized PnL per trade for performance
-        pos = self.oms.get_position(fill.token_id)
-        if fill.side == "SELL" and pos:
-            pnl = fill.size * (fill.price - pos.avg_price) if pos.avg_price > 0 else 0
-            if pnl != 0:
-                self.performance.record_trade(pnl, fill.source)
+        if fill.side == "SELL" and realized != 0.0:
+            self.performance.record_trade(realized, fill.source)
 
     # ---- Authentication ----
 

@@ -969,6 +969,16 @@ class BTC5mStrategy:
                 payout = 1.0 if not btc_went_up else 0.0
             profit_usdc = pos.size * (payout - pos.avg_price)
             self.daily_pnl += profit_usdc
+            # Emit a synthetic settlement fill so OMS/performance close the position.
+            self.ems._fire_fill(Fill(
+                token_id=pos.token_id,
+                side="SELL",
+                size=pos.size,
+                price=payout,
+                timestamp=time.time(),
+                order_id=f"settlement_{int(time.time())}",
+                source="settlement",
+            ))
 
         if won:
             self.wins += 1

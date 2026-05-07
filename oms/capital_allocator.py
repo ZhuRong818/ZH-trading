@@ -27,6 +27,7 @@ class CapitalAllocator:
         self.oms = oms
         self._strategy_deployed: dict[str, float] = defaultdict(float)
         self._market_deployed: dict[str, float] = defaultdict(float)
+        self._market_strategy: dict[str, str] = {}
         self._locked_collateral: float = 0.0
 
     @property
@@ -76,6 +77,7 @@ class CapitalAllocator:
         # Book it
         self._strategy_deployed[budget_key] += approved
         self._market_deployed[market_token] += approved
+        self._market_strategy[market_token] = budget_key
 
         if approved < amount_usdc:
             log.info(
@@ -89,7 +91,7 @@ class CapitalAllocator:
 
     def release_capital(self, strategy: str, market_token: str, amount_usdc: float):
         """Called when a position is closed."""
-        budget_key = self._strategy_key(strategy)
+        budget_key = self._market_strategy.get(market_token, self._strategy_key(strategy))
         self._strategy_deployed[budget_key] = max(0, self._strategy_deployed.get(budget_key, 0) - amount_usdc)
         self._market_deployed[market_token] = max(0, self._market_deployed.get(market_token, 0) - amount_usdc)
 

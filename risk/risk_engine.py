@@ -64,7 +64,7 @@ class RiskEngine:
     def check_drawdown(self) -> bool:
         """Check if portfolio drawdown exceeds max allowed."""
         summary = self.oms.portfolio_summary()
-        total_value = summary["total_notional_usdc"] + summary["total_pnl"]
+        total_value = summary["total_pnl"]
 
         if total_value > self._peak_portfolio_value:
             self._peak_portfolio_value = total_value
