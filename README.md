@@ -55,6 +55,7 @@ fills, positions, reconciliation, trade logs, performance
 |-- main.py                              # Main multi-strategy runner
 |-- search.py                            # Market search and MM candidate ranking
 |-- POLYMARKET_TRADING_SYSTEM.md         # Aspirational architecture/spec
+|-- .gitignore                           # Git ignore rules
 |-- .env.example                         # Live-trading env var reference
 |-- config/
 |   `-- settings.py                      # API URLs and config dataclasses
@@ -213,7 +214,21 @@ BTC 5-minute flags:
 | `--kelly` | Kelly fraction; default `0.20` |
 | `--min-edge` | Minimum edge required to trade; default `0.03` |
 | `--deadline` | Entry cutoff in seconds before market end; default `180` |
+| `--min-entry-age` | Seconds after market open before allowing entries; default `20` |
+| `--max-adverse-bps` | Max adverse strike distance in bps; default `2.0` |
 | `--verbose` | Debug logging |
+
+## Fee Configuration
+
+The system applies different fees based on market type, configured via `FeeConfig` in `config/settings.py`:
+
+| Market Type | Fee |
+|---|---|
+| Standard markets (maker) | 0% |
+| Standard markets (taker) | 1% (100 bps) |
+| Crypto 5-minute markets | 7.2% (720 bps) |
+
+The BTC 5-minute strategy fee of 7.2% is **not yet deducted** from dry-run PnL calculations — keep this in mind when evaluating simulated results.
 
 ## Strategies
 
