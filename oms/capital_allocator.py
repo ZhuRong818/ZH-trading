@@ -49,6 +49,7 @@ class CapitalAllocator:
         Zero means rejected.
         """
         if amount_usdc <= 0:
+            log.debug("Capital request <= 0 for %s", strategy)
             return 0.0
 
         # Map strategy source name to budget key
@@ -72,6 +73,7 @@ class CapitalAllocator:
         approved = min(amount_usdc, limit_system, limit_strategy, limit_market)
 
         if approved < 1.0:  # below minimum useful amount
+            log.debug("Capital approved < $1 for %s (requested=$%.0f), rejected", strategy, amount_usdc)
             return 0.0
 
         # Book it

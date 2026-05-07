@@ -159,6 +159,7 @@ class RiskEngine:
         # Check if currently paused
         resume_time = self._volatility_paused_until.get(token_id, 0)
         if time.time() < resume_time:
+            log.debug("Circuit breaker active for %s, %.0fs remaining", token_id[:16], resume_time - time.time())
             return False
 
         sigma = self.data.rolling_volatility(token_id, window=30)

@@ -90,6 +90,7 @@ class SystemConfig:
     funder: str = ""
     sig_type: int = 1
     dry_run: bool = True
+    no_learn: bool = False
     heartbeat_interval: float = 5.0
 
     risk: RiskConfig = field(default_factory=RiskConfig)

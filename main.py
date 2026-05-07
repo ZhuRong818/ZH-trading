@@ -51,6 +51,7 @@ from analytics.trade_log import TradeLog
 from analytics.performance import PerformanceTracker
 from analytics.tuner import ParameterTuner
 from analytics.post_session import PostSessionAnalyzer
+from analytics.learner import Learner
 from pipeline.signal import TradingSignal
 from pipeline.engine import PipelineEngine
 
@@ -101,6 +102,9 @@ class TradingSystem:
 
         # Post-session analysis
         self.post_analyzer = PostSessionAnalyzer(self.data_feed)
+
+        # Learner — reads past reports and adjusts parameters
+        self.learner = Learner()
 
         # Pipeline — the single entry point for all trading
         self.pipeline = PipelineEngine(
@@ -470,6 +474,22 @@ class TradingSystem:
         """Main trading loop."""
         self.running = True
 
+        # Learn from past sessions (adjust parameters before strategy setup)
+        if not self.config.no_learn:
+            sessions = self.learner.load_history()
+            if sessions > 0:
+                self.learner.apply_learning(self.config)
+                disabled = self.learner.get_disabled_strategies()
+                for d in disabled:
+                    # Remove disabled strategies
+                    for key in ["market_making", "stoikov_mm", "mm"]:
+                        if d == key and "mm" in strategies:
+                            strategies.remove("mm")
+                            log.warning("Learner disabled strategy: mm")
+                    if d in ("whale_copy", "whale") and "whale" in strategies:
+                        strategies.remove("whale")
+                        log.warning("Learner disabled strategy: whale")
+
         # Setup requested strategies
         if "mm" in strategies and self.mm_markets:
             self.setup_market_making()
@@ -655,6 +675,8 @@ Examples:
                         help="Max drawdown %% before kill switch (default: 20)")
     parser.add_argument("--reconcile-interval", type=float, default=30.0,
                         help="Seconds between position reconciliation (default: 30)")
+    parser.add_argument("--no-learn", action="store_true",
+                        help="Disable learning from past sessions")
     parser.add_argument("--verbose", action="store_true",
                         help="Debug logging")
     args = parser.parse_args()
@@ -665,6 +687,7 @@ Examples:
     # Build config
     config = SystemConfig.from_env()
     config.dry_run = args.dry_run
+    config.no_learn = args.no_learn
     config.market_making.gamma = args.gamma
     config.market_making.spread_k = args.spread_k
     config.market_making.order_size = args.size

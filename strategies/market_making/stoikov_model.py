@@ -107,6 +107,7 @@ class StoikovMarketMaker:
             if mid is None:
                 mid = self.gamma_price
             if mid is None:
+                log.warning("No usable mid price for %s, skipping", self.token_id[:16])
                 return
 
         # 3. Calculate Stoikov parameters
@@ -152,6 +153,7 @@ class StoikovMarketMaker:
         )
 
         if not should_update:
+            log.debug("No price change for %s, skipping requote", self.token_id[:16])
             return
 
         # 8. Cancel existing quotes

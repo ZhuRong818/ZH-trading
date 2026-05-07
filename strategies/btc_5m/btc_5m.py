@@ -236,8 +236,13 @@ class BTC5mStrategy:
             start_str = event.get("startDate", m.get("startDate", ""))
             end_str = m.get("endDate", "")
 
-            start_time = datetime.fromisoformat(start_str.replace("Z", "+00:00")) if start_str else datetime.now(timezone.utc)
-            end_time = datetime.fromisoformat(end_str.replace("Z", "+00:00")) if end_str else start_time
+            try:
+                start_time = datetime.fromisoformat(start_str.replace("Z", "+00:00")) if start_str else datetime.now(timezone.utc)
+                end_time = datetime.fromisoformat(end_str.replace("Z", "+00:00")) if end_str else start_time
+            except (ValueError, TypeError):
+                # Fallback: compute from window_ts
+                start_time = datetime.fromtimestamp(window_ts, tz=timezone.utc)
+                end_time = datetime.fromtimestamp(window_ts + 300, tz=timezone.utc)
 
             window = MarketWindow(
                 slug=slug,
