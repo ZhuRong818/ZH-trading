@@ -272,7 +272,7 @@ class TradingSystem:
         from data_pipeline.market_provider import StaticProvider
         
         static_provider = StaticProvider(self.data_feed, self.mm_markets)
-        self.static_runner = UnifiedRunnerV2(static_provider, self.pipeline, self.ems)
+        self.static_runner = UnifiedRunnerV2(static_provider, self.pipeline, self.ems, oms=self.oms)
         
         if "mm" in strategies and self.mm_markets:
             mm = StoikovMM(self.config.market_making, self.data_feed)
@@ -320,7 +320,7 @@ class TradingSystem:
         price_feed = price_feeds.get(asset, get_btc_price)
 
         provider = RollingProvider(self.data_feed, asset=asset, interval=interval, price_feed=price_feed)
-        self.rolling_runner = UnifiedRunnerV2(provider, self.pipeline, self.ems)
+        self.rolling_runner = UnifiedRunnerV2(provider, self.pipeline, self.ems, oms=self.oms)
         
         if "btc5m" in strategies or "momentum" in strategies:
             btc_budget_frac = self.config.capital.strategy_budgets.get("btc5m", 0.10)

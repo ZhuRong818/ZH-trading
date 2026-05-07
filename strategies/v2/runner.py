@@ -154,6 +154,28 @@ class UnifiedRunnerV2:
         for s in self.strategies:
             s.on_cancel()
 
+        # ── Reconcile untracked positions from OMS ──────────────────
+        # Pending fills that fired via check_pending_dry_run() bypass
+        # the runner's _open_entries tracking.  Catch them here so they
+        # still get settled when the window rolls.
+        if self._is_rolling and self.oms:
+            up_token = self.provider.up_token
+            down_token = self.provider.down_token
+            tracked_tokens = {e.token_id for e in self._open_entries}
+            for pos in self.oms.get_all_open():
+                if pos.token_id in (up_token, down_token) and pos.token_id not in tracked_tokens:
+                    is_up = pos.token_id == up_token
+                    self._open_entries.append(OpenEntry(
+                        token_id=pos.token_id,
+                        side="BUY",
+                        size=pos.size,
+                        price=pos.avg_price,
+                        strategy="settlement",
+                        is_up_token=is_up,
+                    ))
+                    log.info("Reconciled untracked rolling position: %s %.1f @ %.4f",
+                             "UP" if is_up else "DOWN", pos.size, pos.avg_price)
+
         if not self._open_entries:
             return
 
