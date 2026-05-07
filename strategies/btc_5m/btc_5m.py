@@ -108,12 +108,32 @@ class BTCPriceFeed:
         self._last_fetch = 0.0
 
     def fetch(self) -> float:
-        resp = self.session.get(BINANCE_TICKER, params={"symbol": "BTCUSDT"})
-        resp.raise_for_status()
-        price = float(resp.json()["price"])
-        self.prices.append(price)
-        self._last_fetch = time.time()
-        return price
+        max_attempts = 3
+        timeout = 5.0
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = self.session.get(BINANCE_TICKER, params={"symbol": "BTCUSDT"}, timeout=timeout)
+                resp.raise_for_status()
+                price = float(resp.json().get("price", 0.0))
+                if price <= 0:
+                    raise ValueError("invalid price")
+                self.prices.append(price)
+                self._last_fetch = time.time()
+                return price
+            except requests.RequestException as e:
+                log.debug("BTCPriceFeed.fetch network error %d/%d: %s", attempt, max_attempts, e)
+                if attempt < max_attempts:
+                    time.sleep(0.5 * (2 ** (attempt - 1)))
+            except Exception as e:
+                log.warning("BTCPriceFeed.fetch unexpected error: %s", e)
+                break
+
+        cached = self.current
+        if cached is not None:
+            log.warning("BTCPriceFeed.fetch using cached price $%.2f after failures", cached)
+            return cached
+
+        raise RuntimeError("BTCPriceFeed.fetch failed and no cached price available")
 
     @property
     def current(self) -> Optional[float]:
