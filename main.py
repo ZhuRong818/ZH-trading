@@ -310,7 +310,7 @@ class TradingSystem:
         """Initialize rolling runner and requested V2 strategies for continuous markets."""
         from strategies.v2.runner import UnifiedRunnerV2
         from data_pipeline.market_provider import RollingProvider
-        from strategies.unified_runner import get_btc_price, get_eth_price
+        from data_pipeline.price_feeds import get_btc_price, get_eth_price
         from strategies.v2.momentum import Momentum
         from strategies.v2.mm import StoikovMM
         from strategies.v2.meanrev import MeanReversion
