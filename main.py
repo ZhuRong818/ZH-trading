@@ -52,6 +52,8 @@ from analytics.performance import PerformanceTracker
 from analytics.tuner import ParameterTuner
 from analytics.post_session import PostSessionAnalyzer
 from analytics.learner import Learner
+from data_pipeline.market_provider import RollingProvider
+from strategies.unified_runner import UnifiedRunner, get_btc_price, get_eth_price
 from pipeline.signal import TradingSignal
 from pipeline.engine import PipelineEngine
 
@@ -124,6 +126,7 @@ class TradingSystem:
         self.resolution_fade = None
         self.btc5m = None
         self._btc5m_thread = None
+        self.rolling_runner = None
 
         # Market info for each MM token
         self.mm_markets: list[dict] = []  # [{token_id, tick_size, neg_risk, end_date, question}]
@@ -379,6 +382,24 @@ class TradingSystem:
         self._btc5m_thread.start()
         log.info("BTC 5-Minute strategy started (background thread)")
 
+    def setup_rolling(self, strategies: list, asset: str = "btc", interval: str = "5m"):
+        """Initialize unified runner on rolling 5m markets."""
+        price_feeds = {"btc": get_btc_price, "eth": get_eth_price}
+        price_feed = price_feeds.get(asset, get_btc_price)
+
+        provider = RollingProvider(self.data_feed, asset=asset, interval=interval, price_feed=price_feed)
+        self.rolling_runner = UnifiedRunner(
+            provider=provider,
+            ems=self.ems,
+            oms=self.oms,
+            config=self.config,
+            pipeline=self.pipeline,
+        )
+        for s in strategies:
+            if s in ("mm", "meanrev", "fade"):
+                self.rolling_runner.add_strategy(s)
+        log.info("Rolling runner initialized: %s on %s %s", strategies, asset.upper(), interval)
+
     # ---- Heartbeat ----
 
     def _heartbeat_loop(self):
@@ -470,6 +491,11 @@ class TradingSystem:
         if self.resolution_fade:
             self.resolution_fade.step()
 
+    def _step_rolling(self):
+        """Run unified rolling runner."""
+        if self.rolling_runner:
+            self.rolling_runner.step()
+
     # ---- Main Loop ----
 
     def run(self, strategies: list[str]):
@@ -505,6 +531,10 @@ class TradingSystem:
             self.setup_resolution_fade()
         if "btc5m" in strategies:
             self.setup_btc_5m()
+        if "rolling" in strategies:
+            rolling_strats = [s for s in strategies if s in ("mm", "meanrev", "fade")]
+            asset = getattr(self.config, '_rolling_asset', 'btc')
+            self.setup_rolling(rolling_strats, asset=asset)
 
         # Start heartbeat for live mode
         if not self.config.dry_run and self.auth:
@@ -523,6 +553,9 @@ class TradingSystem:
             active_strats.append(f"fade({len(self.resolution_fade.markets)} markets)")
         if self.btc5m:
             active_strats.append("btc5m")
+        if self.rolling_runner:
+            rs = self.rolling_runner.status()
+            active_strats.append(f"rolling({','.join(rs['strategies'])})")
 
         log.info("=" * 60)
         log.info("Trading system started")
@@ -560,6 +593,7 @@ class TradingSystem:
                     self._step_arbitrage,
                     self._step_mean_reversion,
                     self._step_resolution_fade,
+                    self._step_rolling,
                 ]:
                     try:
                         step_fn()
@@ -641,7 +675,11 @@ Strategies (comma-separated or 'all'):
   meanrev  Mean reversion — buy dips, sell rips in contested markets
   fade     Resolution fade — earn time decay premium near resolution
   btc5m    BTC 5-minute rolling markets — momentum + arbitrage (auto)
+  rolling  Run mm/meanrev/fade on 5-minute rolling markets (auto token rotation)
   all      Run all strategies
+
+5-minute rolling market (all strategies on BTC 5m):
+  python main.py --strategy rolling --rolling-asset btc --dry-run --no-learn
 
 Low-drawdown combo:
   python main.py --strategy meanrev,fade --search "bitcoin" --dry-run
@@ -651,6 +689,8 @@ Examples:
   python main.py --strategy meanrev --token TOKEN1,TOKEN2 --dry-run
   python main.py --strategy fade --search "election" --dry-run
   python main.py --strategy whale --dry-run
+  python main.py --strategy rolling --rolling-asset btc --dry-run --no-learn
+  python main.py --strategy rolling,btc5m --rolling-asset btc --dry-run --no-learn
   python main.py --strategy arb --arb-events "election" --dry-run
   python main.py --strategy all --search "election" --arb-events "election" --dry-run
         """,
@@ -683,6 +723,8 @@ Examples:
                         help="Max drawdown %% before kill switch (default: 20)")
     parser.add_argument("--reconcile-interval", type=float, default=30.0,
                         help="Seconds between position reconciliation (default: 30)")
+    parser.add_argument("--rolling-asset", type=str, default="btc",
+                        help="Asset for rolling 5m markets: btc or eth (default: btc)")
     parser.add_argument("--no-learn", action="store_true",
                         help="Disable learning from past sessions")
     parser.add_argument("--verbose", action="store_true",
@@ -696,6 +738,7 @@ Examples:
     config = SystemConfig.from_env()
     config.dry_run = args.dry_run
     config.no_learn = args.no_learn
+    config._rolling_asset = args.rolling_asset
     config.market_making.gamma = args.gamma
     config.market_making.spread_k = args.spread_k
     config.market_making.order_size = args.size
@@ -706,7 +749,7 @@ Examples:
 
     # Parse strategies
     if args.strategy == "all":
-        strategies = ["mm", "whale", "arb", "meanrev", "fade", "btc5m"]
+        strategies = ["mm", "whale", "arb", "meanrev", "fade", "btc5m", "rolling"]
     else:
         strategies = [s.strip() for s in args.strategy.split(",")]
 
