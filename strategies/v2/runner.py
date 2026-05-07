@@ -58,6 +58,8 @@ class UnifiedRunnerV2:
         self.oms = oms
         self.strategies: List[BaseStrategy] = []
         self._last_window_key: str = ""
+        self._last_up_token: str = ""
+        self._last_down_token: str = ""
         self._is_rolling = isinstance(provider, RollingProvider)
 
         # Track open entries for settlement
@@ -89,6 +91,13 @@ class UnifiedRunnerV2:
             self._on_window_roll()
             log.info("Runner: window rolled to %s", window_key[:30])
         self._last_window_key = window_key
+
+        # Save current provider tokens so they're available for OMS
+        # reconciliation on the NEXT window roll (refresh() already
+        # overwrites provider.up_token / provider.down_token).
+        if self._is_rolling:
+            self._last_up_token = self.provider.up_token
+            self._last_down_token = self.provider.down_token
 
         # 3. Skip if too little time left
         if self._is_rolling:
@@ -158,9 +167,12 @@ class UnifiedRunnerV2:
         # Pending fills that fired via check_pending_dry_run() bypass
         # the runner's _open_entries tracking.  Catch them here so they
         # still get settled when the window rolls.
+        #
+        # NOTE: provider.refresh() already switched up/down tokens to
+        # the NEW window, so we use the saved _last_up/down_token.
         if self._is_rolling and self.oms:
-            up_token = self.provider.up_token
-            down_token = self.provider.down_token
+            up_token = self._last_up_token
+            down_token = self._last_down_token
             tracked_tokens = {e.token_id for e in self._open_entries}
             for pos in self.oms.get_all_open():
                 if pos.token_id in (up_token, down_token) and pos.token_id not in tracked_tokens:
