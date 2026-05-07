@@ -101,9 +101,20 @@ The pipeline tracks fill rate, rejection breakdown, and per-strategy signal stat
 |-- risk/
 |   `-- risk_engine.py                   # Limits, stops, kill switch
 |-- analytics/
+|   |-- models.py                        # TradeRecord, MarketSnapshot, StrategySnapshot
 |   |-- trade_log.py                     # Daily JSONL fill logs
+|   |-- trade_recorder.py               # Round-trip trade builder from fills
+|   |-- snapshot_collector.py            # Periodic market/strategy state capture
 |   |-- performance.py                   # PnL, drawdown, Sharpe, win rate
-|   `-- tuner.py                         # Human-review tuning suggestions
+|   |-- tuner.py                         # Human-review tuning suggestions
+|   |-- post_session.py                  # PostSessionAnalyzer orchestrator
+|   |-- strategy_analyzers/
+|   |   |-- base.py                      # Universal trade metrics
+|   |   `-- analyzers.py                 # 6 per-strategy analyzers (MM, arb, whale, etc.)
+|   `-- reporters/
+|       |-- json_reporter.py             # Full structured JSON dump
+|       |-- csv_reporter.py              # Per-trade CSV export
+|       `-- log_reporter.py              # Enhanced terminal report
 |-- strategies/
 |   |-- arbitrage/arb_detector.py        # Sum-to-one and monotonic arb checks
 |   |-- btc_5m/btc_5m.py                 # Standalone BTC 5-minute runner
@@ -112,7 +123,8 @@ The pipeline tracks fill rate, rejection breakdown, and per-strategy signal stat
 |   |-- resolution_fade/resolution_fade.py
 |   |-- whale_tracking/whale_tracker.py
 |   `-- kelly.py                         # Fractional Kelly helper
-`-- logs/                                # Runtime logs and trade JSONL files
+|-- logs/                                # Runtime JSONL trade logs
+`-- reports/                             # Post-session JSON, CSV, and analysis reports
 ```
 
 ## Setup
@@ -353,13 +365,40 @@ When the kill switch fires, the EMS cancels known orders and attempts to close o
 
 ## Logs And Analytics
 
-`analytics/trade_log.py` writes daily JSONL files:
+### Runtime Logging
+
+`analytics/trade_log.py` writes daily JSONL files during the session:
 
 ```text
 logs/trades_YYYY-MM-DD.jsonl
 ```
 
-`analytics/performance.py` reports total PnL, equity, trade count, drawdown, Sharpe ratio, and per-strategy win/PnL stats. `analytics/tuner.py` logs human-review parameter suggestions periodically; it does not auto-change strategy settings.
+`analytics/performance.py` tracks total PnL, equity, trade count, drawdown, Sharpe ratio, and per-strategy win/PnL stats in memory. `analytics/tuner.py` logs human-review parameter suggestions every 10 minutes; it does not auto-change strategy settings.
+
+### Post-Session Analysis
+
+On shutdown, `PostSessionAnalyzer` runs a full diagnostic across all strategies and generates reports:
+
+```text
+reports/analysis_YYYY-MM-DD_HH-MM-SS.json    # Full structured analysis
+reports/trades_YYYY-MM-DD_HH-MM-SS.csv       # Per-trade CSV for spreadsheets
+```
+
+The analysis includes:
+
+- **Session summary**: duration, total trades, PnL, Sharpe, max drawdown, win rate.
+- **Per-strategy breakdown** with strategy-specific KPIs:
+  - Market Making: spread captured, round-trip fill rate, inventory accumulation.
+  - Arbitrage: expected vs actual profit, multi-leg unwind rate.
+  - Whale Copy: per-whale win rate, best/worst whale identified.
+  - Mean Reversion: reversion accuracy, stop-loss trigger rate, hold time distribution.
+  - Resolution Fade: per-sub-strategy PnL, days-to-resolution vs outcome.
+  - BTC 5m: up/down direction accuracy, edge magnitude vs win rate.
+- **Regime analysis**: PnL per market regime (tail/contested/trending).
+- **Top and worst trades** ranked by PnL with full context.
+- **Market snapshots** captured during the session for replay analysis.
+
+The terminal log also prints an enhanced report on shutdown with all of the above.
 
 ## Live Trading
 
@@ -383,3 +422,10 @@ Live mode submits real Polymarket CLOB orders. Validate in dry-run first, confir
 - Main-runner arbitrage only exposes sum-to-one event scans.
 - BTC 5-minute strategy is a separate runner.
 - The target architecture document includes Kafka, Redis, TimescaleDB, LLM sentiment, and a signing server, but those are not implemented in this lightweight path.
+
+## V2 Roadmap
+
+1. **Risk-adjusted threshold**: Replace static edge threshold with a signal scoring system that weighs edge, confidence, downside risk, liquidity, and portfolio correlation. Take high-Sharpe signals even if raw edge is small; skip low-Sharpe signals even if edge looks big.
+2. **Arb scoring and capital allocation**: When multiple arb opportunities exist, rank by edge magnitude, duration, depth, capital efficiency, and competition. Allocate capital top-down by score instead of first-come-first-served.
+3. **Regime-based strategy analysis**: Use post-session trade data tagged with market regime to determine when each strategy works best. Analyze P&L by volatility regime, volume regime, time-of-day, and news events.
+4. **Queue position model**: Estimate queue depth at each price level, expected time-to-fill from historical flow, and auto-cancel orders when expected fill time exceeds estimated arb duration. Requires WebSocket data for real-time queue tracking.

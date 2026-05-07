@@ -46,6 +46,7 @@ from risk.risk_engine import RiskEngine
 from analytics.trade_log import TradeLog
 from analytics.performance import PerformanceTracker
 from analytics.tuner import ParameterTuner
+from analytics.post_session import PostSessionAnalyzer
 from pipeline.signal import TradingSignal
 from pipeline.engine import PipelineEngine
 
@@ -94,6 +95,9 @@ class TradingSystem:
         self.performance = PerformanceTracker(config.capital.total_capital_usdc)
         self.tuner = ParameterTuner(self.performance)
 
+        # Post-session analysis
+        self.post_analyzer = PostSessionAnalyzer(self.data_feed)
+
         # Pipeline — the single entry point for all trading
         self.pipeline = PipelineEngine(
             risk_engine=self.risk,
@@ -126,6 +130,7 @@ class TradingSystem:
         # Wire up fill callbacks
         self.ems.on_fill(self._on_fill)
         self.ems.on_fill(self.trade_log.record_fill)
+        self.ems.on_fill(self.post_analyzer.on_fill)
 
     def _on_fill(self, fill: Fill):
         """Handle fill events — update OMS and performance tracker."""
@@ -164,6 +169,7 @@ class TradingSystem:
         )
         self.ems.on_fill(self._on_fill)
         self.ems.on_fill(self.trade_log.record_fill)
+        self.ems.on_fill(self.post_analyzer.on_fill)
         # Rebuild SOR and risk with new EMS
         self.sor = SyntheticEqualitySOR(self.data_feed, self.ems)
         self.risk.ems = self.ems
@@ -266,6 +272,8 @@ class TradingSystem:
                 gamma_price=mkt.get("gamma_price"),
             )
             self.market_makers.append(mm)
+            self.post_analyzer.register_token(mkt["token_id"])
+            self.post_analyzer.register_strategy(mm, f"stoikov_mm_{mkt['outcome']}")
             log.info("MM initialized: %s [%s]", mkt["question"][:50], mkt["outcome"])
         log.info("Market Making: %d market(s) active", len(self.market_makers))
 
@@ -279,6 +287,7 @@ class TradingSystem:
             sor=self.sor,
         )
         self.whale_tracker.initialize()
+        self.post_analyzer.register_strategy(self.whale_tracker, "whale_copy")
         log.info("Whale Tracking strategy initialized (with SOR)")
 
     def setup_arbitrage(self, event_slugs: list[str]):
@@ -486,6 +495,9 @@ class TradingSystem:
                 # Process pending dry-run orders
                 self.ems.check_pending_dry_run()
 
+                # Collect market/strategy snapshots for post-session analysis
+                self.post_analyzer.collect_snapshots()
+
                 # Strategy steps
                 self._step_market_making()
                 self._step_whale_tracking()
@@ -521,8 +533,8 @@ class TradingSystem:
         log.info("Shutting down...")
         self.ems.cancel_all()
 
-        # Performance report
-        log.info("\n%s", self.performance.full_report())
+        # Run post-session analysis (replaces the old simple report)
+        self.post_analyzer.run_analysis()
 
         # Pipeline stats
         pstats = self.pipeline.stats()
@@ -543,7 +555,7 @@ class TradingSystem:
 
         # Close trade log
         self.trade_log.close()
-        log.info("Trade log saved. System stopped.")
+        log.info("Reports saved to reports/. System stopped.")
 
 
 # ---------------------------------------------------------------------------
