@@ -551,12 +551,18 @@ class TradingSystem:
                 # Collect market/strategy snapshots for post-session analysis
                 self.post_analyzer.collect_snapshots()
 
-                # Strategy steps
-                self._step_market_making()
-                self._step_whale_tracking()
-                self._step_arbitrage()
-                self._step_mean_reversion()
-                self._step_resolution_fade()
+                # Strategy steps (each wrapped so one failure doesn't crash the loop)
+                for step_fn in [
+                    self._step_market_making,
+                    self._step_whale_tracking,
+                    self._step_arbitrage,
+                    self._step_mean_reversion,
+                    self._step_resolution_fade,
+                ]:
+                    try:
+                        step_fn()
+                    except Exception as e:
+                        log.warning("Strategy step %s failed: %s", step_fn.__name__, e)
 
                 # Periodic status
                 if iteration % 12 == 0:  # every ~60s at 5s interval
