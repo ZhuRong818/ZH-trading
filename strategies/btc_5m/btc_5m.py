@@ -41,6 +41,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from config import SystemConfig, CLOB_BASE, GAMMA_BASE
+from data_pipeline.market_data import MarketDataFeed, OrderBookSnapshot
 from ems.execution import ExecutionEngine, ClobAuth
 from oms.position_manager import PositionManager, Fill
 from strategies.kelly import kelly_size
@@ -61,6 +62,9 @@ class BTC5mConfig:
     # Edge
     min_edge: float = 0.03           # min difference vs market odds to trade
     entry_deadline_seconds: float = 60  # don't enter with < 1 min left
+    book_cache_ttl: float = 0.35     # seconds to reuse CLOB books inside the HF loop
+    gamma_retry_seconds: float = 5.0 # backoff after a missing Gamma 5m market
+    both_leg_min_edge: float = 0.005 # required buy-both discount after executable prices
 
     # Sizing
     kelly_fraction: float = 0.20     # 20% Kelly
@@ -159,10 +163,17 @@ class BTC5mStrategy:
     Trades rolling 5-minute BTC Up/Down markets on Polymarket.
     """
 
-    def __init__(self, config: BTC5mConfig, ems: ExecutionEngine, oms: PositionManager):
+    def __init__(
+        self,
+        config: BTC5mConfig,
+        ems: ExecutionEngine,
+        oms: PositionManager,
+        data_feed: Optional[MarketDataFeed] = None,
+    ):
         self.config = config
         self.ems = ems
         self.oms = oms
+        self.data_feed = data_feed or MarketDataFeed()
         self.btc = BTCPriceFeed()
         self.session = requests.Session()
 
@@ -171,6 +182,8 @@ class BTC5mStrategy:
         self.current_position: Optional[str] = None  # "UP" or "DOWN" or None
         self.current_order_id: Optional[str] = None
         self._both_entry: Optional[dict] = None
+        self._market_cache: dict[int, MarketWindow] = {}
+        self._market_retry_after: dict[int, float] = {}
 
         # Stats
         self.total_trades = 0
@@ -184,20 +197,31 @@ class BTC5mStrategy:
 
     def _discover_market(self, window_ts: int) -> Optional[MarketWindow]:
         """Find the 5m market for a given timestamp window."""
+        cached = self._market_cache.get(window_ts)
+        if cached:
+            return cached
+
+        retry_after = self._market_retry_after.get(window_ts, 0.0)
+        if time.time() < retry_after:
+            return None
+
         slug = f"btc-updown-5m-{window_ts}"
         try:
             resp = self.session.get(f"{GAMMA_BASE}/events/slug/{slug}")
             if resp.status_code != 200:
+                self._market_retry_after[window_ts] = time.time() + self.config.gamma_retry_seconds
                 return None
             event = resp.json()
             markets = event.get("markets", [])
             if not markets:
+                self._market_retry_after[window_ts] = time.time() + self.config.gamma_retry_seconds
                 return None
 
             m = markets[0]
             clob_raw = m.get("clobTokenIds", "[]")
             clob = json.loads(clob_raw) if isinstance(clob_raw, str) else (clob_raw or [])
             if len(clob) < 2:
+                self._market_retry_after[window_ts] = time.time() + self.config.gamma_retry_seconds
                 return None
 
             start_str = event.get("startDate", m.get("startDate", ""))
@@ -206,7 +230,7 @@ class BTC5mStrategy:
             start_time = datetime.fromisoformat(start_str.replace("Z", "+00:00")) if start_str else datetime.now(timezone.utc)
             end_time = datetime.fromisoformat(end_str.replace("Z", "+00:00")) if end_str else start_time
 
-            return MarketWindow(
+            window = MarketWindow(
                 slug=slug,
                 event_id=str(event.get("id", "")),
                 market_id=str(m.get("id", "")),
@@ -218,8 +242,12 @@ class BTC5mStrategy:
                 tick_size=str(m.get("orderPriceMinTickSize", "0.01")),
                 neg_risk=m.get("negRisk", False),
             )
+            self._market_cache[window_ts] = window
+            self._market_retry_after.pop(window_ts, None)
+            return window
         except Exception as e:
             log.warning("Failed to discover market %s: %s", slug, e)
+            self._market_retry_after[window_ts] = time.time() + self.config.gamma_retry_seconds
             return None
 
     def _get_current_window_ts(self) -> int:
@@ -237,33 +265,32 @@ class BTC5mStrategy:
 
     # ---- Market Data ----
 
+    def _get_book(self, token_id: str) -> Optional[OrderBookSnapshot]:
+        """Get a fresh enough CLOB book and keep the shared data feed warm."""
+        return self.data_feed.get_fresh_book(token_id, max_age=self.config.book_cache_ttl)
+
     def _get_market_odds(self) -> Optional[dict]:
-        """Get current Up/Down odds from the CLOB."""
+        """Get executable Up/Down buy prices from the CLOB book."""
         if not self.current_window:
             return None
         try:
-            # Get midpoint for Up token
-            resp_up = self.session.get(
-                f"{CLOB_BASE}/midpoint",
-                params={"token_id": self.current_window.up_token},
-            )
-            resp_up.raise_for_status()
-            up_mid = float(resp_up.json().get("mid", 0.5))
+            up_book = self._get_book(self.current_window.up_token)
+            down_book = self._get_book(self.current_window.down_token)
+            if not up_book or not down_book:
+                return None
+            if up_book.best_ask is None or down_book.best_ask is None:
+                return None
 
-            # Get midpoint for Down token independently (allow sum < 1 in CLOB mispricing)
-            resp_down = self.session.get(
-                f"{CLOB_BASE}/midpoint",
-                params={"token_id": self.current_window.down_token},
-            )
-            if resp_down.status_code == 200:
-                try:
-                    down_mid = float(resp_down.json().get("mid", 1.0 - up_mid))
-                except Exception:
-                    down_mid = 1.0 - up_mid
-            else:
-                down_mid = 1.0 - up_mid
-
-            return {"up": up_mid, "down": down_mid}
+            return {
+                "up": up_book.best_ask,
+                "down": down_book.best_ask,
+                "up_bid": up_book.best_bid,
+                "down_bid": down_book.best_bid,
+                "up_mid": up_book.mid,
+                "down_mid": down_book.mid,
+                "up_spread": up_book.spread,
+                "down_spread": down_book.spread,
+            }
         except Exception as e:
             log.warning("Failed to get odds: %s", e)
             return None
@@ -281,8 +308,8 @@ class BTC5mStrategy:
         down = odds.get("down", 0.0)
         total = up + down
 
-        # Only act when combined price is meaningfully less than $1.00
-        if total >= 1.0 - 1e-6:
+        # Only act when the executable combined ask is meaningfully less than $1.00.
+        if total >= 1.0 - cfg.both_leg_min_edge:
             return False
 
         # Respect entry deadline
@@ -307,13 +334,18 @@ class BTC5mStrategy:
         if up_cost < cfg.min_bet_usdc or down_cost < cfg.min_bet_usdc:
             return False
 
-        # Place FOK buy orders for both legs using book price (price=0.0 indicates SOR/book)
+        up_oid = None
+        down_oid = None
+
+        # Place FOK buy orders for both legs at executable ask prices.
         try:
             up_oid = self.ems.place_order(
                 token_id=self.current_window.up_token,
                 side="BUY",
-                price=0.0,
+                price=up,
                 size=pair_shares,
+                tick_size=self.current_window.tick_size,
+                neg_risk=self.current_window.neg_risk,
                 order_type="FOK",
                 source="btc5m_both",
             )
@@ -321,11 +353,46 @@ class BTC5mStrategy:
             down_oid = self.ems.place_order(
                 token_id=self.current_window.down_token,
                 side="BUY",
-                price=0.0,
+                price=down,
                 size=pair_shares,
+                tick_size=self.current_window.tick_size,
+                neg_risk=self.current_window.neg_risk,
                 order_type="FOK",
                 source="btc5m_both",
             )
+
+            if not up_oid or not down_oid:
+                if up_oid:
+                    bid = odds.get("up_bid")
+                    if bid:
+                        self.ems.place_order(
+                            token_id=self.current_window.up_token,
+                            side="SELL",
+                            price=bid,
+                            size=pair_shares,
+                            tick_size=self.current_window.tick_size,
+                            neg_risk=self.current_window.neg_risk,
+                            order_type="FAK",
+                            source="btc5m_both_unwind",
+                        )
+                if down_oid:
+                    bid = odds.get("down_bid")
+                    if bid:
+                        self.ems.place_order(
+                            token_id=self.current_window.down_token,
+                            side="SELL",
+                            price=bid,
+                            size=pair_shares,
+                            tick_size=self.current_window.tick_size,
+                            neg_risk=self.current_window.neg_risk,
+                            order_type="FAK",
+                            source="btc5m_both_unwind",
+                        )
+                log.info(
+                    "BUY BOTH skipped: one leg failed up_oid=%s down_oid=%s",
+                    bool(up_oid), bool(down_oid),
+                )
+                return False
 
             # Mark as both position (do not re-enter in same window)
             self.current_position = "BOTH"
@@ -341,7 +408,7 @@ class BTC5mStrategy:
                 self.total_trades += 2
             except Exception:
                 pass
-            log.info("BUY BOTH: up=%.4f down=%.4f sum=%.4f pair_shares=%.4f total_usdc=$%.2f",
+            log.info("BUY BOTH: up_ask=%.4f down_ask=%.4f sum=%.4f pair_shares=%.4f total_usdc=$%.2f",
                      up, down, total, pair_shares, total_usdc)
             return True
         except Exception as e:
@@ -447,6 +514,7 @@ class BTC5mStrategy:
             size=size_shares,
             tick_size=window.tick_size,
             neg_risk=window.neg_risk,
+            order_type="FAK",
             source=f"btc5m_{direction.lower()}",
         )
 
@@ -455,7 +523,7 @@ class BTC5mStrategy:
             self.current_order_id = order_id
             self.total_trades += 1
             log.info(
-                "BTC5M TRADE: %s %.1f shares @ %.4f | kelly=$%.0f edge=%.4f "
+                "BTC5M TRADE: %s %.1f shares @ ask %.4f | kelly=$%.0f edge=%.4f "
                 "btc=$%.0f momentum=%.4f%%",
                 direction, size_shares, market_price,
                 kelly.size_usdc, kelly.edge,
@@ -503,12 +571,25 @@ class BTC5mStrategy:
 
                 # Discover or roll to current market window
                 window_ts = self._get_current_window_ts()
-                if (self.current_window is None
-                        or self.current_window.slug != f"btc-updown-5m-{window_ts}"):
+                valid_slugs = {
+                    f"btc-updown-5m-{window_ts}",
+                    f"btc-updown-5m-{window_ts + 300}",
+                }
+                if self.current_window is None or self.current_window.slug not in valid_slugs:
                     self._roll_to_new_window(window_ts)
 
                 if not self.current_window:
                     log.debug("No active market window, waiting...")
+                    time.sleep(cfg.price_poll_interval)
+                    continue
+
+                now_dt = datetime.now(timezone.utc)
+                if now_dt < self.current_window.start_time:
+                    log.debug(
+                        "Next BTC5M window %s starts in %.1fs",
+                        self.current_window.slug,
+                        (self.current_window.start_time - now_dt).total_seconds(),
+                    )
                     time.sleep(cfg.price_poll_interval)
                     continue
 
@@ -750,7 +831,8 @@ def main():
     )
 
     oms = PositionManager()
-    ems = ExecutionEngine(dry_run=args.dry_run)
+    data_feed = MarketDataFeed()
+    ems = ExecutionEngine(dry_run=args.dry_run, data_feed=data_feed)
     ems.on_fill(lambda f: oms.record_fill(f))
 
     if not args.dry_run:
@@ -765,10 +847,10 @@ def main():
             funder=os.environ.get("POLYMARKET_FUNDER", ""),
         )
         auth.derive_api_creds()
-        ems = ExecutionEngine(auth=auth, dry_run=False)
+        ems = ExecutionEngine(auth=auth, dry_run=False, data_feed=data_feed)
         ems.on_fill(lambda f: oms.record_fill(f))
 
-    strategy = BTC5mStrategy(config=config, ems=ems, oms=oms)
+    strategy = BTC5mStrategy(config=config, ems=ems, oms=oms, data_feed=data_feed)
     signal.signal(signal.SIGINT, lambda *_: setattr(strategy, 'running', False))
     strategy.run()
 

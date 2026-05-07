@@ -49,7 +49,7 @@ class OrderBookSnapshot:
         return None
 
     def depth(self, side: str, levels: int = 5) -> float:
-        data = self.bids if side == "BUY" else self.asks
+        data = self.asks if side == "BUY" else self.bids
         return sum(row[1] for row in data[:levels])
 
     def vwap_price(self, side: str, size: float) -> tuple:
@@ -92,7 +92,7 @@ class OrderBookSnapshot:
 
     def total_value(self, side: str, levels: int = 10) -> float:
         """Total USDC value on one side of the book."""
-        data = self.bids if side == "BUY" else self.asks
+        data = self.asks if side == "BUY" else self.bids
         return sum(row[0] * row[1] for row in data[:levels])
 
     def age_seconds(self) -> float:
