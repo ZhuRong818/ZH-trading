@@ -1,0 +1,4 @@
+interface:
+  display_name: "Oracle Frontrun Strategy"
+  short_description: "Maintain and evaluate the ZH-trading oracle frontrun strategy."
+  default_prompt: "Use $oracle-frontrun-strategy to evaluate or modify the ZH-trading oracle_frontrun strategy."
