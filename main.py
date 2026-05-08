@@ -343,7 +343,13 @@ class TradingSystem:
             fd = ResolutionFade(bankroll=self.config.risk.max_total_exposure_usdc)
             self.rolling_runner.add(fd)
             self.post_analyzer.register_strategy(fd, "v2_rolling_fade")
-            
+
+        if "oracle" in strategies:
+            from strategies.v2.oracle_frontrun import OracleFrontrun
+            oracle = OracleFrontrun(asset=asset, bankroll=actual_bankroll if "btc5m" in strategies or "momentum" in strategies else 10_000)
+            self.rolling_runner.add(oracle)
+            self.post_analyzer.register_strategy(oracle, "v2_oracle_frontrun")
+
         log.info("Rolling runner initialized on %s %s with %d strategies", asset.upper(), interval, len(self.rolling_runner.strategies))
 
     # ---- Heartbeat ----
@@ -414,9 +420,9 @@ class TradingSystem:
 
         # Setup V2 Rolling Strategies (auto-discovers 5m tokens)
         if "rolling" in strategies:
-            roll_strats = [s for s in strategies if s in ("mm", "meanrev", "fade", "btc5m", "momentum")]
+            roll_strats = [s for s in strategies if s in ("mm", "meanrev", "fade", "btc5m", "momentum", "oracle")]
             if not roll_strats:
-                roll_strats = ["mm", "meanrev", "fade", "momentum"]
+                roll_strats = ["momentum", "oracle"]
             self.setup_rolling(roll_strats, asset=asset)
 
         # Setup V2 Static Strategies (only if NOT using rolling for these)
