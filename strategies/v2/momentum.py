@@ -64,6 +64,8 @@ class Momentum(BaseStrategy):
             self._has_position = False
 
     def step(self, contexts: List[MarketContext]) -> List[TradingSignal]:
+        up_ctx, down_ctx = self._resolve_up_down_contexts(contexts)
+
         # Poll price
         self._poll_price()
 
@@ -73,19 +75,16 @@ class Momentum(BaseStrategy):
         if len(self._prices) < 5:
             return []
 
-        # One signal per window — only process the first valid context.
-        # RollingProvider inserts the UP-token context first, and _compute()
-        # is designed to work from the UP-token perspective.
-        for ctx in contexts:
-            if not ctx.is_valid:
-                continue
-            if ctx.seconds_remaining < 30:
-                continue  # too late
-            s = self._compute(ctx)
-            if s:
-                self._has_position = True  # lock immediately
-                return [s]
-            return []
+        # One signal per window — only process once using resolved UP/DOWN contexts.
+        # We use executable book prices (best ask) instead of mid to reduce
+        # paper-trade vs fill price divergence.
+        if up_ctx and down_ctx:
+            if up_ctx.seconds_remaining >= 30:
+                s = self._compute(up_ctx, down_ctx)
+                if s:
+                    self._has_position = True  # lock immediately
+                    return [s]
+        return []
 
         return []
 
@@ -112,13 +111,13 @@ class Momentum(BaseStrategy):
         returns = [(recent[i] - recent[i-1]) / recent[i-1] for i in range(1, len(recent))]
         return float(np.std(returns)) if returns else 0.001
 
-    def _compute(self, ctx: MarketContext) -> Optional[TradingSignal]:
+    def _compute(self, up_ctx: MarketContext, down_ctx: MarketContext) -> Optional[TradingSignal]:
         momentum = self._momentum(self.momentum_window)
         vol = max(self._volatility(self.momentum_window), 0.00002)
 
         current = self._prices[-1] if self._prices else 0
-        strike = ctx.strike_price
-        remaining = ctx.seconds_remaining
+        strike = up_ctx.strike_price
+        remaining = up_ctx.seconds_remaining
 
         if current <= 0 or strike <= 0:
             return None
@@ -146,13 +145,15 @@ class Momentum(BaseStrategy):
         if fair_prob_up > 0.52:
             direction = "UP"
             fair = fair_prob_up
-            market_price = ctx.mid_price  # Up token mid
+            market_price = up_ctx.best_ask or 0.0
         elif fair_prob_up < 0.48:
             direction = "DOWN"
             fair = 1 - fair_prob_up
-            # Need the other token's price
-            market_price = 1 - ctx.mid_price
+            market_price = down_ctx.best_ask or 0.0
         else:
+            return None
+
+        if market_price <= 0:
             return None
 
         # Risk/reward gate
@@ -179,9 +180,9 @@ class Momentum(BaseStrategy):
 
         # Use the correct token
         if direction == "UP":
-            token_id = ctx.token_id
+            token_id = up_ctx.token_id
         else:
-            token_id = ctx.token_id_other
+            token_id = down_ctx.token_id
 
         self.total_trades += 1
         log.info("MOMENTUM: %s %.1f @ %.4f edge=%.4f z=%.2f mom=%.4f%% btc=$%.0f",
@@ -191,8 +192,33 @@ class Momentum(BaseStrategy):
             token_id=token_id, side="BUY", price=market_price, size=size,
             strategy=self.name, edge=edge,
             fair_value=fair, confidence=min(abs(adjusted_z) / 2, 1.0),
-            tick_size=ctx.tick_size,
+            tick_size=up_ctx.tick_size,
         )
+
+    def _resolve_up_down_contexts(
+        self, contexts: List[MarketContext]
+    ) -> tuple[Optional[MarketContext], Optional[MarketContext]]:
+        ctx_map = {c.token_id: c for c in contexts if c and c.is_valid}
+
+        up_ctx = None
+        down_ctx = None
+        for ctx in ctx_map.values():
+            q = (ctx.question or "").upper()
+            if q.endswith(" UP"):
+                up_ctx = ctx
+            elif q.endswith(" DOWN"):
+                down_ctx = ctx
+
+        if not up_ctx or not down_ctx:
+            for ctx in ctx_map.values():
+                other = ctx_map.get(ctx.token_id_other)
+                if other:
+                    up_ctx = up_ctx or ctx
+                    down_ctx = down_ctx or other
+                    if up_ctx and down_ctx:
+                        break
+
+        return up_ctx, down_ctx
 
     def snapshot(self) -> dict:
         return {

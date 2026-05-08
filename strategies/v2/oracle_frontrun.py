@@ -88,6 +88,8 @@ class OracleFrontrun(BaseStrategy):
         self._has_position = False
 
     def step(self, contexts: List[MarketContext]) -> List[TradingSignal]:
+        ctx_map = {c.token_id: c for c in contexts if c and c.is_valid}
+
         # Poll BTC price
         self._poll_price()
 
@@ -109,12 +111,10 @@ class OracleFrontrun(BaseStrategy):
         direction, move_bps, fair_prob_up = move
 
         # Check each context for staleness — emit at most ONE signal
-        for ctx in contexts:
-            if not ctx.is_valid:
-                continue
+        for ctx in ctx_map.values():
             if ctx.seconds_remaining < self.min_remaining:
                 continue
-            s = self._check_staleness(ctx, direction, fair_prob_up, move_bps)
+            s = self._check_staleness(ctx, ctx_map, direction, fair_prob_up, move_bps)
             if s:
                 # Lock immediately — don't wait for fill callback
                 self._has_position = True
@@ -171,26 +171,38 @@ class OracleFrontrun(BaseStrategy):
         return direction, move_bps, fair_prob_up
 
     def _check_staleness(
-        self, ctx: MarketContext, direction: str, fair_prob_up: float, move_bps: float,
+        self,
+        ctx: MarketContext,
+        ctx_map: dict[str, MarketContext],
+        direction: str,
+        fair_prob_up: float,
+        move_bps: float,
     ) -> Optional[TradingSignal]:
         """
         Check if Polymarket odds are stale (haven't adjusted to the BTC move).
         If stale, buy the underpriced side.
         """
-        market_up = ctx.mid_price  # Up token mid
+        up_ctx, down_ctx = self._resolve_up_down_contexts(ctx, ctx_map)
+        if not up_ctx or not down_ctx:
+            return None
+
+        market_up = up_ctx.best_ask or 0.0
+        market_down = down_ctx.best_ask or 0.0
+        if market_up <= 0 or market_down <= 0:
+            return None
 
         if direction == "UP":
             # BTC went up → fair UP probability is high → is UP token still cheap?
             fair = fair_prob_up
             market_price = market_up
-            token_id = ctx.token_id
+            token_id = up_ctx.token_id
 
             staleness = fair - market_price
         else:
             # BTC went down → fair DOWN probability is high → is DOWN token still cheap?
             fair = 1.0 - fair_prob_up
-            market_price = 1.0 - market_up  # DOWN token price
-            token_id = ctx.token_id_other
+            market_price = market_down
+            token_id = down_ctx.token_id
 
             staleness = fair - market_price
 
@@ -252,6 +264,28 @@ class OracleFrontrun(BaseStrategy):
             confidence=min(staleness / 0.20, 1.0),
             tick_size=ctx.tick_size,
         )
+
+    def _resolve_up_down_contexts(
+        self, ctx: MarketContext, ctx_map: dict[str, MarketContext]
+    ) -> tuple[Optional[MarketContext], Optional[MarketContext]]:
+        up_ctx = None
+        down_ctx = None
+
+        q = (ctx.question or "").upper()
+        if q.endswith(" UP"):
+            up_ctx = ctx
+            down_ctx = ctx_map.get(ctx.token_id_other)
+        elif q.endswith(" DOWN"):
+            down_ctx = ctx
+            up_ctx = ctx_map.get(ctx.token_id_other)
+
+        if not up_ctx or not down_ctx:
+            other = ctx_map.get(ctx.token_id_other)
+            if other:
+                up_ctx = up_ctx or ctx
+                down_ctx = down_ctx or other
+
+        return up_ctx, down_ctx
 
     def snapshot(self) -> dict:
         return {
