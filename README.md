@@ -114,7 +114,7 @@ The pipeline tracks fill rate, rejection breakdown, and per-strategy signal stat
 |   |-- post_session.py                  # PostSessionAnalyzer orchestrator
 |   |-- strategy_analyzers/
 |   |   |-- base.py                      # Universal trade metrics
-|   |   `-- analyzers.py                 # 6 per-strategy analyzers (MM, arb, whale, etc.)
+|   |   `-- analyzers.py                 # Per-strategy analyzers (MM, whale, etc.)
 |   `-- reporters/
 |       |-- json_reporter.py             # Full structured JSON dump
 |       |-- csv_reporter.py              # Per-trade CSV export
@@ -130,7 +130,7 @@ The pipeline tracks fill rate, rejection breakdown, and per-strategy signal stat
 |   |   |-- momentum.py                  # BTC/ETH momentum (5m markets)
 |   |   |-- oracle_frontrun.py           # Oracle front-run (5m markets)
 |   |   `-- runner.py                    # UnifiedRunnerV2 — runs all strategies
-|   |-- arbitrage/arb_detector.py        # Legacy arb detector
+|   |-- arbitrage/                       # Legacy (removed from active use)
 |   |-- btc_5m/btc_5m.py                 # Legacy BTC 5-minute runner
 |   |-- market_making/stoikov_model.py   # Legacy Stoikov market maker
 |   |-- mean_reversion/mean_reversion.py # Legacy mean reversion
@@ -215,30 +215,25 @@ python main.py --strategy mm --token TOKEN_ID --dry-run
 # Multi-market market making
 python main.py --strategy mm --token TOKEN1,TOKEN2,TOKEN3 --dry-run
 
-# Lower-drawdown strategy combo on selected markets
-python main.py --strategy meanrev,fade --search bitcoin --dry-run
+# Mean reversion on selected markets
+python main.py --strategy meanrev --search bitcoin --dry-run
 
 # Whale copy-trading dry-run
 python main.py --strategy whale --dry-run
 
-# Arbitrage scan by Gamma event slug
-python main.py --strategy arb --arb-events "event-slug" --dry-run
-
-# Run all shared-runner strategies
-python main.py --strategy all --search election --arb-events "event-slug" --dry-run
+# Run all strategies
+python main.py --strategy all --search election --dry-run
 ```
 
 Important flags:
 
 | Flag | Purpose |
 | --- | --- |
-| `--strategy` | `mm`, `whale`, `arb`, `meanrev`, `fade`, `btc5m`, `rolling`, `all`, or comma-separated |
+| `--strategy` | `mm`, `whale`, `meanrev`, `btc5m`, `rolling`, `oracle`, `all`, or comma-separated |
 | `--rolling-asset` | Asset for rolling 5m markets: `btc` or `eth` (default: `btc`) |
 | `--no-learn` | Disable auto-learner (skip loading past reports) |
 | `--search` | Search markets interactively by keyword |
 | `--token` | Comma-separated CLOB token IDs; skips market search |
-| `--arb-events` | Comma-separated Gamma event slugs for arbitrage scans |
-| `--arb-interval` | Seconds between arbitrage scans; default `30` |
 | `--dry-run` | Paper mode; no real orders |
 | `--gamma` | Stoikov risk aversion |
 | `--spread-k` | Stoikov spread scaling |
@@ -308,12 +303,6 @@ All v2 strategies (`strategies/v2/`) share the same interface and work on both l
 - Stop-loss at 2x entry deviation, 120s cooldown after stop.
 - Sizes with fractional Kelly (0.25x).
 - On 5m markets: uses shorter lookback (20 vs 30) and tighter threshold.
-
-### Resolution Fade (`strategies/v2/fade.py`)
-
-- Three sub-strategies: certainty fade, last-minute liquidity, convergence.
-- Earns time decay premium as markets approach resolution.
-- Max 5 concurrent positions, 0.15x Kelly sizing.
 
 ### Whale Copy (`strategies/v2/whale.py`)
 
@@ -499,7 +488,7 @@ On Ctrl+C, the system:
 
 ## V2 Roadmap
 
-1. **Risk-adjusted threshold**: Replace static edge threshold with a signal scoring system that weighs edge, confidence, downside risk, liquidity, and portfolio correlation. Take high-Sharpe signals even if raw edge is small; skip low-Sharpe signals even if edge looks big.
-2. **Arb scoring and capital allocation**: When multiple arb opportunities exist, rank by edge magnitude, duration, depth, capital efficiency, and competition. Allocate capital top-down by score instead of first-come-first-served.
-3. **Regime-based strategy analysis**: Use post-session trade data tagged with market regime to determine when each strategy works best. Analyze P&L by volatility regime, volume regime, time-of-day, and news events.
-4. **Queue position model**: Estimate queue depth at each price level, expected time-to-fill from historical flow, and auto-cancel orders when expected fill time exceeds estimated arb duration. Requires WebSocket data for real-time queue tracking.
+1. **Risk-adjusted threshold**: Replace static edge threshold with a signal scoring system that weighs edge, confidence, downside risk, liquidity, and portfolio correlation.
+2. **Regime-based strategy analysis**: Use post-session trade data tagged with market regime to determine when each strategy works best.
+3. **Queue position model**: Estimate queue depth at each price level, expected time-to-fill from historical flow. Requires WebSocket data.
+4. **WebSocket data feed**: Replace REST polling with persistent WebSocket connections for real-time order book updates.
