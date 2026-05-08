@@ -420,6 +420,9 @@ class TradingSystem:
         # Setup V2 Rolling Strategies
         if "rolling" in strategies:
             roll_strats = [s for s in strategies if s in ("mm", "meanrev", "fade", "btc5m", "momentum")]
+            # If rolling is the only strategy specified, add all rolling-compatible strategies
+            if not roll_strats:
+                roll_strats = ["mm", "meanrev", "fade", "momentum"]
             self.setup_rolling(roll_strats, asset=asset)
 
         # Start heartbeat for live mode
