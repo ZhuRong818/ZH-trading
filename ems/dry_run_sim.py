@@ -197,6 +197,24 @@ class DryRunSimulator:
             created_at=time.time(), order_id=self._next_id(),
         ))
 
+    def cancel_pending_for_source(self, source: str) -> int:
+        """Cancel all pending orders from a specific strategy source."""
+        before = len(self.pending)
+        self.pending = [o for o in self.pending if not o.source.startswith(source)]
+        cancelled = before - len(self.pending)
+        if cancelled > 0:
+            log.info("[SIM] Cancelled %d pending orders for %s", cancelled, source)
+        return cancelled
+
+    def cancel_pending_for_token(self, token_id: str) -> int:
+        """Cancel all pending orders for a specific token."""
+        before = len(self.pending)
+        self.pending = [o for o in self.pending if o.token_id != token_id]
+        cancelled = before - len(self.pending)
+        if cancelled > 0:
+            log.info("[SIM] Cancelled %d pending orders for token %s", cancelled, token_id[:16])
+        return cancelled
+
     def cancel_all_pending(self):
         count = len(self.pending)
         self.pending.clear()

@@ -413,6 +413,16 @@ class ExecutionEngine:
                 log.error("Cancel failed: %s", e)
         self.open_order_ids.clear()
 
+    def cancel_pending_for_source(self, source: str):
+        """Cancel pending dry-run orders for a specific strategy."""
+        if self._simulator:
+            self._simulator.cancel_pending_for_source(source)
+
+    def cancel_pending_for_token(self, token_id: str):
+        """Cancel pending dry-run orders for a specific token."""
+        if self._simulator:
+            self._simulator.cancel_pending_for_token(token_id)
+
     def cancel_order(self, order_id: str):
         if self.dry_run:
             log.info("[DRY] Cancel %s", order_id[:16])

@@ -152,6 +152,10 @@ class UnifiedRunnerV2:
                         s.on_fill(fill)
                         break
 
+                # Cancel any pending orders from this strategy
+                # Prevents old pending orders from piling up after a fill
+                self.ems.cancel_pending_for_source(result.strategy)
+
                 # Track BUY fills for settlement
                 if result.side == "BUY" and self._is_rolling:
                     is_up = self._is_up_token(result.token_id)
@@ -193,8 +197,10 @@ class UnifiedRunnerV2:
         before provider.refresh() overwrote them) to determine the
         ground-truth outcome via the system-wide SettlementOracle.
         """
-        # Cancel any unfilled orders
+        # Cancel any unfilled orders AND pending simulator orders
         self.ems.cancel_all()
+        if self.ems._simulator:
+            self.ems._simulator.cancel_all_pending()
         for s in self.strategies:
             s.on_cancel()
 
