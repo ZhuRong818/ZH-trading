@@ -130,6 +130,7 @@ The pipeline tracks fill rate, rejection breakdown, and per-strategy signal stat
 |   |   |-- whale.py                     # Whale copy trading
 |   |   |-- arb.py                       # Combinatorial arbitrage
 |   |   |-- momentum.py                  # BTC/ETH momentum (5m markets)
+|   |   |-- oracle_frontrun.py           # Oracle front-run (5m markets)
 |   |   `-- runner.py                    # UnifiedRunnerV2 — runs all strategies
 |   |-- arbitrage/arb_detector.py        # Legacy arb detector
 |   |-- btc_5m/btc_5m.py                 # Legacy BTC 5-minute runner
@@ -259,11 +260,14 @@ BTC 5-minute is now integrated into `main.py` via the `rolling` strategy and `Ro
 # BTC 5m momentum only
 python main.py --strategy btc5m --dry-run --no-learn
 
-# All strategies on BTC 5m rolling market (MM + meanrev + fade + momentum)
+# Default rolling (momentum + oracle front-run)
 python main.py --strategy rolling --dry-run --no-learn
 
-# Combined: rolling + momentum
-python main.py --strategy rolling,btc5m --dry-run --no-learn
+# Oracle front-run only
+python main.py --strategy rolling,oracle --dry-run --no-learn
+
+# Oracle + momentum
+python main.py --strategy rolling,oracle,momentum --dry-run --no-learn
 
 # ETH 5m instead of BTC
 python main.py --strategy rolling --rolling-asset eth --dry-run --no-learn
@@ -332,6 +336,27 @@ All v2 strategies (`strategies/v2/`) share the same interface and work on both l
 - Z-score model: distance-to-strike + momentum drift + volatility.
 - Risk/reward gate: won't buy above $0.65.
 - Positive edge required before trading.
+
+### Oracle Front-Run (`strategies/v2/oracle_frontrun.py`)
+
+- Exploits the 1-3 second lag between Binance BTC price and Polymarket 5m odds.
+- Detects sharp BTC moves (>3 bps) on Binance, checks if Polymarket is stale.
+- If Polymarket hasn't adjusted: buys the underpriced side before it catches up.
+- Not a prediction — trades on something that already happened but isn't priced in yet.
+- Risk/reward gate: won't buy above $0.60, 10-second cooldown between trades.
+- Tracks stale vs already-priced signal ratio in snapshot.
+
+### Strategy Suitability by Market Type
+
+| Strategy | Long-dated markets | 5-minute rolling |
+|---|---|---|
+| **MM** | Best fit — passive quoting, spread collection | Poor — token price trends, not oscillates |
+| **Mean Reversion** | Good — price oscillates around fair value | Poor — price trends toward 0 or 1 |
+| **Resolution Fade** | Good — time decay near resolution | Marginal — very short window |
+| **Whale Copy** | Good — follows conviction bets | Poor — detection lag vs 5m window |
+| **Arbitrage** | Good — scans across events | N/A — single market per window |
+| **Momentum** | N/A | Good — follows BTC direction |
+| **Oracle Front-Run** | N/A | Best — exploits price lag, highest expected win rate |
 
 ## Execution Model
 
