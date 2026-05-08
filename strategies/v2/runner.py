@@ -147,6 +147,7 @@ class UnifiedRunnerV2:
                     source=result.strategy,
                     edge=result.edge,
                     fair_value=result.fair_value,
+                    direction=result.direction,
                 )
                 # Notify the originating strategy
                 for s in self.strategies:

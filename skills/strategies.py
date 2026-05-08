@@ -150,7 +150,7 @@ class MomentumStrategy(BaseStrategy, _PriceFeedMixin):
         return [TradingSignal(
             token_id=edge.token_id, side="BUY", price=edge.market_price,
             size=size_shares, strategy=self.name, edge=edge.edge,
-            fair_value=edge.fair, tick_size="0.01",
+            fair_value=edge.fair, direction=edge.direction, tick_size="0.01",
         )]
 
     def snapshot(self) -> dict:
@@ -250,7 +250,7 @@ class OracleFrontrunStrategy(BaseStrategy, _PriceFeedMixin):
         return [TradingSignal(
             token_id=edge.token_id, side="BUY", price=edge.market_price,
             size=size_shares, strategy=self.name, edge=edge.edge,
-            fair_value=edge.fair, tick_size="0.01",
+            fair_value=edge.fair, direction=edge.direction, tick_size="0.01",
         )]
 
     def snapshot(self) -> dict:

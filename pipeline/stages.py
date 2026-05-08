@@ -114,10 +114,17 @@ class Executor:
             neg_risk=signal.neg_risk,
             order_type=signal.order_type,
             source=signal.strategy,
+            edge=signal.edge,
+            fair_value=signal.fair_value,
+            direction=signal.direction,
         )
 
         if order_id:
             signal.order_id = order_id
+            fill = getattr(self.ems, "_fills_by_order_id", {}).get(order_id)
+            if fill:
+                signal.fill_price = fill.price
+                signal.fill_size = fill.size
         else:
             signal.rejected_by = "executor"
             signal.reject_reason = "order placement failed"

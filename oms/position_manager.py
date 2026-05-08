@@ -53,6 +53,7 @@ class Fill:
     source: str = ""  # which strategy generated this
     edge: float = 0.0       # estimated edge at time of signal
     fair_value: float = 0.0  # model's fair value at time of signal
+    direction: str = ""      # model direction, e.g. UP or DOWN
 
 
 class PositionManager:

@@ -32,6 +32,9 @@ class PendingOrder:
     source: str
     created_at: float
     order_id: str
+    edge: float = 0.0
+    fair_value: float = 0.0
+    direction: str = ""
 
 
 class DryRunSimulator:
@@ -52,6 +55,7 @@ class DryRunSimulator:
     def simulate_fill(
         self, token_id: str, side: str, price: float, size: float,
         order_type: str = "GTC", source: str = "",
+        edge: float = 0.0, fair_value: float = 0.0, direction: str = "",
     ) -> Optional[Fill]:
         """
         Simulate a fill based on current book depth.
@@ -96,6 +100,7 @@ class DryRunSimulator:
                 token_id=token_id, side=side, size=size,
                 price=vwap, timestamp=time.time(),
                 order_id=self._next_id(), source=source,
+                edge=edge, fair_value=fair_value, direction=direction,
             )
 
         # FAK: fill what's available, kill the rest
@@ -107,6 +112,7 @@ class DryRunSimulator:
                 token_id=token_id, side=side, size=fill_size,
                 price=vwap, timestamp=time.time(),
                 order_id=self._next_id(), source=source,
+                edge=edge, fair_value=fair_value, direction=direction,
             )
 
         # GTC: probabilistic fill based on depth ratio
@@ -124,6 +130,7 @@ class DryRunSimulator:
             token_id=token_id, side=side, size=fill_size,
             price=vwap, timestamp=time.time(),
             order_id=self._next_id(), source=source,
+            edge=edge, fair_value=fair_value, direction=direction,
         )
 
     def check_pending(self) -> List[Fill]:
@@ -176,6 +183,8 @@ class DryRunSimulator:
                 token_id=order.token_id, side=order.side, size=fill_size,
                 price=vwap, timestamp=time.time(),
                 order_id=order.order_id, source=order.source,
+                edge=order.edge, fair_value=order.fair_value,
+                direction=order.direction,
             )
             fills.append(fill)
             log.info("[SIM] Pending fill: %s %s %.1f @ %.4f", order.source, order.side, fill_size, vwap)
@@ -183,11 +192,15 @@ class DryRunSimulator:
         self.pending = still_pending
         return fills
 
-    def _add_pending(self, token_id, side, price, size, order_type, source):
+    def _add_pending(
+        self, token_id, side, price, size, order_type, source,
+        edge: float = 0.0, fair_value: float = 0.0, direction: str = "",
+    ):
         self.pending.append(PendingOrder(
             token_id=token_id, side=side, price=price, size=size,
             order_type=order_type, source=source,
             created_at=time.time(), order_id=self._next_id(),
+            edge=edge, fair_value=fair_value, direction=direction,
         ))
 
     def cancel_pending_for_source(self, source: str) -> int:

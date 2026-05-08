@@ -36,6 +36,7 @@ class TradingSignal:
     edge: float = 0.0       # estimated edge (fair - market)
     confidence: float = 0.0  # 0-1 how confident the strategy is
     fair_value: float = 0.0  # strategy's fair value estimate
+    direction: str = ""      # market outcome direction, e.g. UP or DOWN
 
     # Lifecycle
     timestamp: float = field(default_factory=time.time)
