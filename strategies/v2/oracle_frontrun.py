@@ -266,6 +266,7 @@ class OracleFrontrun(BaseStrategy):
             edge=edge,
             fair_value=fair,
             confidence=min(staleness / 0.20, 1.0),
+            direction=direction,
             tick_size=ctx.tick_size,
         )
 

@@ -36,7 +36,7 @@ class Momentum(BaseStrategy):
         max_bet_pct: float = 0.05,
         bankroll: float = 5_000,
         max_price: float = 0.65,
-        min_price: float = 0.05,
+        min_price: float = 0.30,
         momentum_window: int = 20,
         min_mom_vol_ratio: float = 0.5,
     ):
@@ -189,6 +189,7 @@ class Momentum(BaseStrategy):
             token_id=token_id, side="BUY", price=market_price, size=size,
             strategy=self.name, edge=edge,
             fair_value=fair, confidence=min(abs(adjusted_z) / 2, 1.0),
+            direction=direction,
             tick_size=up_ctx.tick_size,
         )
 

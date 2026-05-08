@@ -21,7 +21,7 @@ class CsvReporter:
             return path
 
         fields = [
-            "trade_id", "strategy", "token_id", "side",
+            "trade_id", "strategy", "token_id", "side", "direction",
             "entry_price", "exit_price", "size",
             "pnl", "pnl_pct", "hold_time_s",
             "exit_reason", "slippage", "entry_edge",

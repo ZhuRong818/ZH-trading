@@ -212,6 +212,8 @@ class ExecutionEngine:
         self.open_order_ids: List[str] = []
         self._fill_callbacks = []
         self._simulator = None
+        self._fills_by_order_id: Dict[str, Fill] = {}
+        self.max_adverse_slippage = 0.02
 
         if dry_run and data_feed:
             from ems.dry_run_sim import DryRunSimulator
@@ -242,6 +244,9 @@ class ExecutionEngine:
         neg_risk: bool = False,
         order_type: str = "GTC",
         source: str = "",
+        edge: float = 0.0,
+        fair_value: float = 0.0,
+        direction: str = "",
     ) -> Optional[str]:
         """Place an order with automatic size decomposition.
 
@@ -265,10 +270,28 @@ class ExecutionEngine:
         if self.data:
             book = self.data.get_book(token_id)
             if book:
-                _, fillable = book.vwap_price(side, size)
+                vwap, fillable = book.vwap_price(side, size)
                 if fillable < 1:
                     log.warning("Insufficient liquidity: %s %s %.1f", side, token_id[:16], size)
                     return None
+                if vwap is not None:
+                    adverse_slippage = (vwap - price) if side == "BUY" else (price - vwap)
+                    if adverse_slippage > self.max_adverse_slippage:
+                        log.warning(
+                            "Slippage rejected: %s %s %.1f @ %.4f vwap=%.4f slip=%.4f > %.4f",
+                            source, side, size, price, vwap, adverse_slippage,
+                            self.max_adverse_slippage,
+                        )
+                        return None
+                    if side == "BUY" and vwap > 0:
+                        max_cost = size * price
+                        resized = max_cost / vwap
+                        if resized < size:
+                            log.info(
+                                "VWAP-resized %s %s: %.1f -> %.1f @ %.4f to keep cost=$%.0f",
+                                source, side, size, resized, vwap, max_cost,
+                            )
+                            size = resized
                 if fillable < size:
                     if order_type == "FOK":
                         return self._place_fok_chunks(
@@ -284,6 +307,7 @@ class ExecutionEngine:
         return self._execute_single_order(
             token_id, side, price, size,
             tick_size, neg_risk, order_type, source,
+            edge=edge, fair_value=fair_value, direction=direction,
         )
 
     def _place_fok_chunks(
@@ -326,16 +350,19 @@ class ExecutionEngine:
     def _execute_single_order(
         self, token_id: str, side: str, price: float, size: float,
         tick_size: str, neg_risk: bool, order_type: str, source: str,
+        edge: float = 0.0, fair_value: float = 0.0, direction: str = "",
     ) -> Optional[str]:
         """Execute a single order — no capital/depth checks, just place it."""
         if self.dry_run:
             if self._simulator:
                 fill = self._simulator.simulate_fill(
                     token_id, side, price, size, order_type, source,
+                    edge=edge, fair_value=fair_value, direction=direction,
                 )
                 if fill:
                     log.info("[SIM] %s %s %.1f @ %.4f [%s]",
                              source or "EMS", fill.side, fill.size, fill.price, order_type)
+                    self._fills_by_order_id[fill.order_id] = fill
                     self._fire_fill(fill)
                     return fill.order_id
                 else:
@@ -349,7 +376,10 @@ class ExecutionEngine:
                 fill = Fill(
                     token_id=token_id, side=side, size=size, price=price,
                     timestamp=time.time(), source=source,
+                    edge=edge, fair_value=fair_value, direction=direction,
                 )
+                if fill.order_id:
+                    self._fills_by_order_id[fill.order_id] = fill
                 self._fire_fill(fill)
                 return f"dry_{side}_{price}_{time.time()}"
 

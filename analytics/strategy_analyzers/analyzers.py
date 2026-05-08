@@ -192,9 +192,9 @@ class BTC5mAnalyzer(BaseAnalyzer):
         if not completed:
             return {}
 
-        # Direction accuracy
-        up_trades = [t for t in completed if t.entry_side == "BUY"]
-        down_trades = [t for t in completed if t.entry_side == "SELL"]
+        # Direction accuracy. Direction is the selected UP/DOWN token; side is usually BUY.
+        up_trades = [t for t in completed if t.entry_direction == "UP"]
+        down_trades = [t for t in completed if t.entry_direction == "DOWN"]
         up_wins = sum(1 for t in up_trades if t.pnl > 0)
         down_wins = sum(1 for t in down_trades if t.pnl > 0)
 

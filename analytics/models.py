@@ -27,6 +27,7 @@ class TradeRecord:
     entry_price: float = 0.0
     entry_size: float = 0.0
     entry_side: str = ""           # BUY or SELL
+    entry_direction: str = ""      # UP or DOWN token selected by the model
     entry_edge: float = 0.0        # estimated edge at entry
     entry_fair_value: float = 0.0  # model's fair value at entry
 
@@ -87,6 +88,7 @@ class TradeRecord:
             "token_id": self.token_id[:20],
             "strategy": self.strategy,
             "side": self.entry_side,
+            "direction": self.entry_direction,
             "entry_time": self.entry_time,
             "entry_price": round(self.entry_price, 6),
             "exit_price": round(self.exit_price, 6),
