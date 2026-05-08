@@ -167,19 +167,21 @@ class OracleFrontrunStrategy(BaseStrategy, _PriceFeedMixin):
     def __init__(self, asset: str = "btc", bankroll: float = 10_000,
                  kelly_frac: float = 0.25, max_bet_pct: float = 0.05,
                  move_threshold_bps: float = 2.0, staleness_threshold: float = 0.01,
-                 max_price: float = 0.75, cooldown: float = 10.0,
-                 min_remaining: float = 60.0):
+                 max_price: float = 0.55, min_price: float = 0.20,
+                 cooldown: float = 10.0, min_remaining: float = 60.0,
+                 max_notional_usdc: float = 500.0):
         self._init_feed(asset)
         self.features = PriceFeatureSkill(lookback_ticks=5, momentum_ticks=20)
         self.fair_value = OracleFairValueSkill()
         self.edge_skill = EdgeSkill()
         self.risk_gate = RiskGateSkill()
-        self.risk_config = RiskGateConfig(min_edge=staleness_threshold, max_price=max_price, min_seconds_remaining=min_remaining)
+        self.risk_config = RiskGateConfig(min_edge=staleness_threshold, max_price=max_price, min_price=min_price, min_seconds_remaining=min_remaining)
         self.sizer = PositionSizerSkill()
         self.sizing_config = SizingConfig(kelly_fraction=kelly_frac, max_bet_pct=max_bet_pct, bankroll=bankroll)
         self.lock = EntryLock(cooldown)
         self.move_threshold_bps = move_threshold_bps
         self.staleness_threshold = staleness_threshold
+        self.max_notional_usdc = max_notional_usdc
         self.total_trades = 0
         self.signals_detected = 0
         self.signals_stale = 0
@@ -234,13 +236,15 @@ class OracleFrontrunStrategy(BaseStrategy, _PriceFeedMixin):
         if size_usdc <= 0:
             return []
 
-        size_shares = size_usdc / edge.market_price
+        # Cap notional to prevent oversized positions on low-price tokens
+        capped_usdc = min(size_usdc, self.max_notional_usdc)
+        size_shares = capped_usdc / edge.market_price
 
         self.lock.on_signal()
         self.total_trades += 1
 
-        log.info("ORACLE FRONTRUN: %s %.1f @ %.4f | move=%.1fbps stale=%.4f edge=%.4f | %s",
-                 edge.direction, size_shares, edge.market_price,
+        log.info("ORACLE FRONTRUN: %s %.1f @ %.4f ($%.0f) | move=%.1fbps stale=%.4f edge=%.4f | %s",
+                 edge.direction, size_shares, edge.market_price, capped_usdc,
                  pf.move_bps, edge.edge, edge.edge, edge.reason)
 
         return [TradingSignal(
