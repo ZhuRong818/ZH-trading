@@ -441,9 +441,6 @@ class TradingSystem:
                 # Live position reconciliation
                 self._reconcile_positions()
 
-                # Process pending dry-run orders
-                self.ems.check_pending_dry_run()
-
                 # Collect market/strategy snapshots for post-session analysis
                 self.post_analyzer.collect_snapshots()
 

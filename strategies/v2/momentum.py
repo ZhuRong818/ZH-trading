@@ -82,7 +82,10 @@ class Momentum(BaseStrategy):
             if ctx.seconds_remaining < 30:
                 continue  # too late
             s = self._compute(ctx)
-            return [s] if s else []
+            if s:
+                self._has_position = True  # lock immediately
+                return [s]
+            return []
 
         return []
 

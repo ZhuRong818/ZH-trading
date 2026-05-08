@@ -108,8 +108,7 @@ class OracleFrontrun(BaseStrategy):
 
         direction, move_bps, fair_prob_up = move
 
-        # Check each context for staleness
-        signals = []
+        # Check each context for staleness — emit at most ONE signal
         for ctx in contexts:
             if not ctx.is_valid:
                 continue
@@ -117,10 +116,12 @@ class OracleFrontrun(BaseStrategy):
                 continue
             s = self._check_staleness(ctx, direction, fair_prob_up, move_bps)
             if s:
-                signals.append(s)
-                break  # one trade per detection
+                # Lock immediately — don't wait for fill callback
+                self._has_position = True
+                self._last_trade_time = time.time()
+                return [s]
 
-        return signals
+        return []
 
     def _poll_price(self):
         try:

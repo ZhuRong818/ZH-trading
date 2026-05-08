@@ -61,9 +61,7 @@ class DryRunSimulator:
         """
         book = self.data.get_book(token_id)
         if not book:
-            log.debug("[SIM] No book for %s, %s pending", token_id[:16], "queued as" if order_type == "GTC" else "rejected")
-            if order_type == "GTC":
-                self._add_pending(token_id, side, price, size, order_type, source)
+            log.debug("[SIM] No book for %s, rejected", token_id[:16])
             return None
 
         # Walk the book to find what's available
@@ -71,8 +69,6 @@ class DryRunSimulator:
 
         if vwap is None or fillable <= 0:
             log.debug("[SIM] No depth for %s %s %.1f", side, token_id[:16], size)
-            if order_type == "GTC":
-                self._add_pending(token_id, side, price, size, order_type, source)
             return None
 
         # Check if our price is competitive
@@ -81,16 +77,14 @@ class DryRunSimulator:
             log.debug("[SIM] No best price for %s %s", side, token_id[:16])
             return None
 
-        # Allow orders within 10% of best price (simulates crossing the spread or near-market orders)
+        # Allow orders within 10% of best price
         tolerance = 0.10
         price_ok = (
             (side == "BUY" and price >= best * (1 - tolerance))
             or (side == "SELL" and price <= best * (1 + tolerance))
         )
         if not price_ok:
-            log.debug("[SIM] Price not competitive: %s %.4f vs best %.4f (tol=%.0f%%)", side, price, best, tolerance * 100)
-            if order_type == "GTC":
-                self._add_pending(token_id, side, price, size, order_type, source)
+            log.debug("[SIM] Price not competitive: %s %.4f vs best %.4f", side, price, best)
             return None
 
         # FOK: must fill completely
