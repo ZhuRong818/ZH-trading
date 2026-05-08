@@ -11,9 +11,6 @@ Usage:
     # Paper trade whale copy-trading
     python main.py --strategy whale --dry-run
 
-    # Paper trade arbitrage scanning
-    python main.py --strategy arb --arb-events "election,bitcoin" --dry-run
-
     # Run all strategies
     python main.py --strategy all --search "election" --dry-run
 
@@ -117,9 +114,6 @@ class TradingSystem:
         
         # For legacy compatibility or general use
         self.mm_markets: list[dict] = []
-        self.arb_event_slugs: list[str] = []
-        self.arb_scan_interval = 30
-        self._last_arb_scan = 0.0
 
         # Live reconciliation
         self._last_reconcile = 0.0
@@ -266,44 +260,30 @@ class TradingSystem:
         from strategies.v2.runner import UnifiedRunnerV2
         from strategies.v2.mm import StoikovMM
         from strategies.v2.whale import WhaleCopy
-        from strategies.v2.arb import Arbitrage
         from strategies.v2.meanrev import MeanReversion
-        from strategies.v2.fade import ResolutionFade
         from data_pipeline.market_provider import StaticProvider
-        
+
         static_provider = StaticProvider(self.data_feed, self.mm_markets)
         self.static_runner = UnifiedRunnerV2(static_provider, self.pipeline, self.ems, oms=self.oms)
-        
+
         if "mm" in strategies and self.mm_markets:
             mm = StoikovMM(self.config.market_making, self.data_feed)
             self.static_runner.add(mm)
             self.post_analyzer.register_strategy(mm, "v2_stoikov_mm")
             log.info("Market Making initialized on %d market(s)", len(self.mm_markets))
-            
+
         if "whale" in strategies:
             whale = WhaleCopy(self.config.whale_tracking)
             self.static_runner.add(whale)
             self.post_analyzer.register_strategy(whale, "v2_whale")
             log.info("Whale Tracker initialized")
-            
-        if "arb" in strategies and getattr(self, "arb_event_slugs", None):
-            arb = Arbitrage(self.arb_event_slugs, scan_interval=getattr(self, "arb_scan_interval", 30))
-            self.static_runner.add(arb)
-            self.post_analyzer.register_strategy(arb, "v2_arb")
-            log.info("Arbitrage scanner initialized for slugs: %s", self.arb_event_slugs)
-            
+
         if "meanrev" in strategies and self.mm_markets:
             meanrev = MeanReversion(bankroll=self.config.risk.max_total_exposure_usdc)
             self.static_runner.add(meanrev)
             self.post_analyzer.register_strategy(meanrev, "v2_meanrev")
             log.info("Mean Reversion initialized")
-            
-        if "fade" in strategies and self.mm_markets:
-            fade = ResolutionFade(bankroll=self.config.risk.max_total_exposure_usdc)
-            self.static_runner.add(fade)
-            self.post_analyzer.register_strategy(fade, "v2_fade")
-            log.info("Resolution Fade initialized")
-            
+
         log.info("Static Runner mapped %d strategies", len(self.static_runner.strategies))
 
     def setup_rolling(self, strategies: list[str], asset: str = "btc", interval: str = "5m"):
@@ -314,7 +294,6 @@ class TradingSystem:
         from strategies.v2.momentum import Momentum
         from strategies.v2.mm import StoikovMM
         from strategies.v2.meanrev import MeanReversion
-        from strategies.v2.fade import ResolutionFade
 
         price_feeds = {"btc": get_btc_price, "eth": get_eth_price}
         price_feed = price_feeds.get(asset, get_btc_price)
@@ -338,11 +317,6 @@ class TradingSystem:
             mr = MeanReversion(bankroll=self.config.risk.max_total_exposure_usdc)
             self.rolling_runner.add(mr)
             self.post_analyzer.register_strategy(mr, "v2_rolling_meanrev")
-
-        if "fade" in strategies:
-            fd = ResolutionFade(bankroll=self.config.risk.max_total_exposure_usdc)
-            self.rolling_runner.add(fd)
-            self.post_analyzer.register_strategy(fd, "v2_rolling_fade")
 
         if "oracle" in strategies:
             from strategies.v2.oracle_frontrun import OracleFrontrun
@@ -420,7 +394,7 @@ class TradingSystem:
 
         # Setup V2 Rolling Strategies (auto-discovers 5m tokens)
         if "rolling" in strategies:
-            roll_strats = [s for s in strategies if s in ("mm", "meanrev", "fade", "btc5m", "momentum", "oracle")]
+            roll_strats = [s for s in strategies if s in ("mm", "meanrev", "btc5m", "momentum", "oracle")]
             if not roll_strats:
                 roll_strats = ["momentum", "oracle"]
             self.setup_rolling(roll_strats, asset=asset)
@@ -428,7 +402,7 @@ class TradingSystem:
         # Setup V2 Static Strategies (only if NOT using rolling for these)
         # Avoids double-setup when running rolling,meanrev
         rolling_handles = set(roll_strats) if "rolling" in strategies else set()
-        static_strats = [s for s in strategies if s in ("mm", "whale", "arb", "meanrev", "fade") and s not in rolling_handles]
+        static_strats = [s for s in strategies if s in ("mm", "whale", "meanrev") and s not in rolling_handles]
         if static_strats:
             self.setup_v2_strategies(static_strats)
 
@@ -590,40 +564,30 @@ def main():
 Strategies (comma-separated or 'all'):
   mm       Stoikov market making (requires --token or --search)
   whale    Whale tracking & copy trading (no token needed)
-  arb      Combinatorial arbitrage (requires --arb-events)
   meanrev  Mean reversion — buy dips, sell rips in contested markets
-  fade     Resolution fade — earn time decay premium near resolution
-  btc5m    BTC 5-minute rolling markets — momentum + arbitrage (auto)
-  rolling  Run mm/meanrev/fade on 5-minute rolling markets (auto token rotation)
+  btc5m    BTC 5-minute rolling markets — momentum (auto)
+  rolling  Run strategies on 5-minute rolling markets (momentum + oracle by default)
+  oracle   Oracle front-run — exploit Binance-Polymarket price lag
   all      Run all strategies
 
 5-minute rolling market (all strategies on BTC 5m):
   python main.py --strategy rolling --rolling-asset btc --dry-run --no-learn
 
-Low-drawdown combo:
-  python main.py --strategy meanrev,fade --search "bitcoin" --dry-run
-
 Examples:
   python main.py --strategy mm --search "bitcoin" --dry-run
-  python main.py --strategy meanrev --token TOKEN1,TOKEN2 --dry-run
-  python main.py --strategy fade --search "election" --dry-run
+  python main.py --strategy mm,meanrev --token TOKEN --dry-run
   python main.py --strategy whale --dry-run
-  python main.py --strategy rolling --rolling-asset btc --dry-run --no-learn
-  python main.py --strategy rolling,btc5m --rolling-asset btc --dry-run --no-learn
-  python main.py --strategy arb --arb-events "election" --dry-run
-  python main.py --strategy all --search "election" --arb-events "election" --dry-run
+  python main.py --strategy rolling --dry-run --no-learn
+  python main.py --strategy rolling,oracle --dry-run --no-learn
+  python main.py --strategy all --search "election" --dry-run
         """,
     )
     parser.add_argument("--strategy", type=str, default="mm",
-                        help="Strategy: mm, whale, arb, all (comma-separated)")
+                        help="Strategy: mm, whale, meanrev, btc5m, rolling, oracle, all (comma-separated)")
     parser.add_argument("--search", type=str, default="",
                         help="Search for market(s) interactively")
     parser.add_argument("--token", type=str,
                         help="Token ID(s) to trade (comma-separated for multi-market)")
-    parser.add_argument("--arb-events", type=str, default="",
-                        help="Event slugs for arb scanning (comma-separated)")
-    parser.add_argument("--arb-interval", type=float, default=30.0,
-                        help="Seconds between arb scans (default: 30)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Paper trading mode (no real orders)")
     parser.add_argument("--gamma", type=float, default=0.5,
@@ -668,35 +632,26 @@ Examples:
 
     # Parse strategies
     if args.strategy == "all":
-        strategies = ["mm", "whale", "arb", "meanrev", "fade", "btc5m", "rolling"]
+        strategies = ["mm", "whale", "meanrev", "btc5m", "rolling"]
     else:
         strategies = [s.strip() for s in args.strategy.split(",")]
 
     # Initialize system
     system = TradingSystem(config)
     system.reconcile_interval = args.reconcile_interval
-    system.arb_scan_interval = args.arb_interval
 
     # Handle Ctrl+C
     signal.signal(signal.SIGINT, lambda *_: setattr(system, 'running', False))
 
     # Market selection for strategies that need tokens
     # Skip if only rolling strategies — rolling auto-discovers its own tokens
-    needs_market = any(s in strategies for s in ["mm", "meanrev", "fade"]) and "rolling" not in strategies
+    needs_market = any(s in strategies for s in ["mm", "meanrev"]) and "rolling" not in strategies
     if needs_market:
         if args.token:
             system.set_tokens(args.token)
         else:
             multi = input("Multi-market mode? (y/N): ").strip().lower() == "y" if not args.search else False
             system.select_markets_interactive(args.search, multi=multi)
-
-    # Arb event slugs
-    if "arb" in strategies:
-        if args.arb_events:
-            system.arb_event_slugs = [s.strip() for s in args.arb_events.split(",") if s.strip()]
-        else:
-            raw = input("Enter event slugs for arb scanning (comma-separated): ")
-            system.arb_event_slugs = [s.strip() for s in raw.split(",") if s.strip()]
 
     # Connect for live trading
     if not args.dry_run:
