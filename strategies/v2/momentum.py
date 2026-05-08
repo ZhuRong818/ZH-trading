@@ -82,10 +82,7 @@ class Momentum(BaseStrategy):
             if up_ctx.seconds_remaining >= 30:
                 s = self._compute(up_ctx, down_ctx)
                 if s:
-                    self._has_position = True  # lock immediately
                     return [s]
-        return []
-
         return []
 
     def _poll_price(self):
