@@ -31,13 +31,15 @@ class RiskEngine:
         data_feed: MarketDataFeed,
         ems: ExecutionEngine,
         oms: PositionManager,
+        initial_capital: float = 0.0,
     ):
         self.config = config
         self.data = data_feed
         self.ems = ems
         self.oms = oms
+        self.initial_capital = initial_capital
         self.halted = False
-        self._peak_portfolio_value = 0.0
+        self._peak_portfolio_value = initial_capital
         self._volatility_paused_until: dict = {}  # token_id -> resume_time
 
     def check_all(self) -> bool:
@@ -64,20 +66,21 @@ class RiskEngine:
     def check_drawdown(self) -> bool:
         """Check if portfolio drawdown exceeds max allowed."""
         summary = self.oms.portfolio_summary()
-        total_value = summary["total_pnl"]
+        total_pnl = summary["total_pnl"]
+        equity = self.initial_capital + total_pnl
 
-        if total_value > self._peak_portfolio_value:
-            self._peak_portfolio_value = total_value
+        if equity > self._peak_portfolio_value:
+            self._peak_portfolio_value = equity
 
         if self._peak_portfolio_value > 0:
             drawdown_pct = (
-                (self._peak_portfolio_value - total_value) / self._peak_portfolio_value * 100
+                (self._peak_portfolio_value - equity) / self._peak_portfolio_value * 100
             )
             if drawdown_pct > self.config.max_drawdown_pct:
                 log.critical(
-                    "DRAWDOWN BREACH: %.1f%% > %.1f%% max | peak=$%.0f current=$%.0f",
+                    "DRAWDOWN BREACH: %.2f%% > %.2f%% max | peak_eq=$%.0f current_eq=$%.0f pnl=$%.2f",
                     drawdown_pct, self.config.max_drawdown_pct,
-                    self._peak_portfolio_value, total_value,
+                    self._peak_portfolio_value, equity, total_pnl,
                 )
                 self.kill_switch("Max drawdown exceeded")
                 return False

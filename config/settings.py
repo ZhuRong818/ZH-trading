@@ -42,7 +42,7 @@ class CapitalConfig:
 class RiskConfig:
     # Portfolio level
     max_total_exposure_usdc: float = 100_000
-    max_drawdown_pct: float = 20.0
+    max_drawdown_pct: float = 1.0
 
     # Per market
     max_position_size_usdc: float = 10_000

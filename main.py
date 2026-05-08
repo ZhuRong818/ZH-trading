@@ -85,7 +85,13 @@ class TradingSystem:
         self.sor = SyntheticEqualitySOR(self.data_feed, self.ems)
 
         # Module 6: Risk Engine
-        self.risk = RiskEngine(config.risk, self.data_feed, self.ems, self.oms)
+        self.risk = RiskEngine(
+            config.risk,
+            self.data_feed,
+            self.ems,
+            self.oms,
+            initial_capital=config.capital.total_capital_usdc,
+        )
 
         # Analytics
         self.trade_log = TradeLog()
