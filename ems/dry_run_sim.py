@@ -114,9 +114,8 @@ class DryRunSimulator:
         fill_prob = self.base_fill_prob * depth_ratio
 
         if random.random() > fill_prob:
-            # Didn't fill this time — add to pending
-            self._add_pending(token_id, side, price, size, order_type, source)
-            log.debug("GTC pending: %s %s %.1f @ %.4f (prob=%.2f)", source, side, size, price, fill_prob)
+            # Didn't fill — reject (no pending queue to avoid pile-up)
+            log.debug("[SIM] GTC not filled: %s %s %.1f @ %.4f (prob=%.2f)", source, side, size, price, fill_prob)
             return None
 
         # Fill at VWAP (not the requested price — more realistic)

@@ -145,6 +145,8 @@ class UnifiedRunnerV2:
                     price=result.fill_price or result.price,
                     timestamp=time.time(),
                     source=result.strategy,
+                    edge=result.edge,
+                    fair_value=result.fair_value,
                 )
                 # Notify the originating strategy
                 for s in self.strategies:

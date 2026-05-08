@@ -49,6 +49,8 @@ class TradeLog:
             "price": round(fill.price, 6),
             "source": fill.source,
             "order_id": fill.order_id[:20] if fill.order_id else "",
+            "edge": round(fill.edge, 6),
+            "fair_value": round(fill.fair_value, 6),
         }
         self._file.write(json.dumps(entry) + "\n")
         self._file.flush()

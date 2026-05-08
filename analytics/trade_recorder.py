@@ -64,6 +64,8 @@ class TradeRecorder:
             entry_size=fill.size,
             entry_side=fill.side,
             actual_fill_price=fill.price,
+            entry_edge=fill.edge,
+            entry_fair_value=fill.fair_value,
         )
 
         # Capture market context at entry

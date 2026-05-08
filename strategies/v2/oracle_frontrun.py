@@ -47,13 +47,14 @@ class OracleFrontrun(BaseStrategy):
         move_threshold_bps: float = 2.0,    # min BTC move to act (0.02%)
         staleness_threshold: float = 0.01,   # min gap between fair and market (1%)
         lookback_ticks: int = 5,             # compare price over last N ticks
-        max_price: float = 0.75,             # don't buy above this
-        min_price: float = 0.05,             # don't buy below this
+        max_price: float = 0.55,             # don't buy above this (contested zone only)
+        min_price: float = 0.20,             # don't buy below this (avoid tail zone)
         min_remaining_seconds: float = 60,   # need at least 1 min left
         kelly_frac: float = 0.25,
         max_bet_pct: float = 0.05,
         bankroll: float = 10_000,
         cooldown_seconds: float = 10.0,      # wait between trades
+        max_notional_usdc: float = 500.0,    # hard cap on trade size regardless of Kelly
     ):
         self.asset = asset
         self.move_threshold_bps = move_threshold_bps
@@ -66,6 +67,7 @@ class OracleFrontrun(BaseStrategy):
         self.max_bet_pct = max_bet_pct
         self.bankroll = bankroll
         self.cooldown_seconds = cooldown_seconds
+        self.max_notional_usdc = max_notional_usdc
 
         self._prices: deque = deque(maxlen=200)
         self._session = requests.Session()
@@ -241,7 +243,9 @@ class OracleFrontrun(BaseStrategy):
         if kelly.direction == "NONE" or kelly.size_usdc < 5:
             return None
 
-        size = kelly.size_usdc / market_price if market_price > 0 else 0
+        # Cap notional to prevent oversized positions on low-price tokens
+        capped_usdc = min(kelly.size_usdc, self.max_notional_usdc)
+        size = capped_usdc / market_price if market_price > 0 else 0
 
         self.total_trades += 1
         self._last_trade_time = time.time()
