@@ -3,6 +3,11 @@ Whale Copy Trading — unified interface (v2).
 
 Input:  List[MarketContext] (ignored — whale watches leaderboard globally)
 Output: List[TradingSignal] (copy trades from top traders)
+
+Fixes:
+- First poll snapshots only (no false signals from empty baseline)
+- Max 3 signals per whale per cycle (prevents signal flood)
+- Max 10 signals total per cycle (prevents rate limit starvation)
 """
 
 import logging
@@ -18,6 +23,9 @@ from config import DATA_API_BASE, WhaleTrackingConfig
 
 log = logging.getLogger(__name__)
 
+MAX_SIGNALS_PER_WHALE = 3
+MAX_SIGNALS_PER_CYCLE = 10
+
 
 class WhaleCopy(BaseStrategy):
     name = "whale_copy"
@@ -25,9 +33,10 @@ class WhaleCopy(BaseStrategy):
     def __init__(self, config: WhaleTrackingConfig):
         self.config = config
         self.session = requests.Session()
-        self._whales: Dict[str, dict] = {}  # wallet -> {username, pnl, win_rate, trust}
-        self._known_positions: Dict[str, Dict[str, float]] = {}  # wallet -> {token: size}
+        self._whales: Dict[str, dict] = {}
+        self._known_positions: Dict[str, Dict[str, float]] = {}
         self._last_refresh = 0.0
+        self._initialized = False  # first poll = snapshot only
         self.total_signals = 0
 
     def step(self, contexts: List[MarketContext]) -> List[TradingSignal]:
@@ -38,6 +47,12 @@ class WhaleCopy(BaseStrategy):
             self._refresh_whales()
             self._last_refresh = now
 
+        # First poll: snapshot all positions, emit no signals
+        if not self._initialized:
+            self._snapshot_all()
+            self._initialized = True
+            return []
+
         signals = []
         for wallet, whale in self._whales.items():
             if whale.get("trust", 0) < 0.5:
@@ -45,7 +60,11 @@ class WhaleCopy(BaseStrategy):
             new_signals = self._check_whale(wallet, whale)
             signals.extend(new_signals)
 
-        return signals
+            # Cap total signals per cycle
+            if len(signals) >= MAX_SIGNALS_PER_CYCLE:
+                break
+
+        return signals[:MAX_SIGNALS_PER_CYCLE]
 
     def _refresh_whales(self):
         try:
@@ -65,12 +84,35 @@ class WhaleCopy(BaseStrategy):
                         "username": entry.get("userName", ""),
                         "pnl": float(entry.get("pnl", 0)),
                         "vol": float(entry.get("vol", 0)),
-                        "win_rate": 0.8,  # approximate, enrichment is slow
+                        "win_rate": 0.8,
                         "trust": 0.7,
                     }
             log.info("Whale registry: %d whales tracked", len(self._whales))
         except Exception as e:
             log.warning("Whale refresh failed: %s", e)
+
+    def _snapshot_all(self):
+        """First poll: record every whale's current positions without emitting signals."""
+        log.info("Whale: snapshotting %d whales (no signals on first poll)...", len(self._whales))
+        for wallet in self._whales:
+            try:
+                resp = self.session.get(
+                    f"{DATA_API_BASE}/positions",
+                    params={"user": wallet, "sizeThreshold": 1, "limit": 50},
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                positions = resp.json()
+                snapshot = {}
+                for pos in positions:
+                    tid = pos.get("asset", "")
+                    size = float(pos.get("size", 0))
+                    if tid and size > 0:
+                        snapshot[tid] = size
+                self._known_positions[wallet] = snapshot
+            except Exception:
+                self._known_positions[wallet] = {}
+        log.info("Whale: snapshot complete, tracking %d whales", len(self._known_positions))
 
     def _check_whale(self, wallet: str, whale: dict) -> List[TradingSignal]:
         signals = []
@@ -96,13 +138,13 @@ class WhaleCopy(BaseStrategy):
                 delta = size - old.get(tid, 0)
                 cur_price = float(pos.get("curPrice", 0.5))
 
-                # New conviction move: delta > 0 and notional > $20
+                # New conviction move
                 if delta > 0 and delta * cur_price >= 20:
                     if cur_price > 0.95 or cur_price < 0.05:
-                        continue  # extreme tail only
+                        continue
 
                     if whale.get("win_rate", 0) < 0.60:
-                        continue  # lowered from 0.80
+                        continue
 
                     copy_size = min(
                         delta * self.config.copy_fraction,
@@ -127,6 +169,10 @@ class WhaleCopy(BaseStrategy):
                         confidence=whale.get("win_rate", 0),
                     ))
 
+                    # Cap per whale
+                    if len(signals) >= MAX_SIGNALS_PER_WHALE:
+                        break
+
             self._known_positions[wallet] = new
 
         except Exception as e:
@@ -138,4 +184,5 @@ class WhaleCopy(BaseStrategy):
         return {
             "whales_tracked": len(self._whales),
             "total_signals": self.total_signals,
+            "initialized": self._initialized,
         }
