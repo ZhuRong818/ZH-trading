@@ -1,6 +1,6 @@
 # ZH Trading
 
-Updated: 2026-05-08 (v3 — unified strategy interface)
+Updated: 2026-05-08 (v4 — arb/fade removed, oracle front-run added)
 
 ZH Trading is a lightweight Python trading pipeline for Polymarket. It discovers markets, polls live order books, runs strategy modules, applies portfolio and capital controls, routes orders through a shared execution layer, and tracks fills, positions, logs, and basic performance in memory.
 
@@ -16,7 +16,7 @@ This README documents the code that exists in this repository today. `POLYMARKET
 - Shared OMS for fills, positions, realized PnL, unrealized PnL, and live position reconciliation.
 - Capital allocation by strategy budget, market concentration, reserve, and locked collateral.
 - Risk checks for exposure, drawdown, stop losses, volatility pauses, and kill switch shutdown.
-- Strategy modules for Stoikov market making, sum-to-one arbitrage, whale copy trading, mean reversion, resolution fade, and BTC 5-minute markets.
+- Strategy modules for Stoikov market making, whale copy trading, mean reversion, BTC momentum, and oracle front-run.
 - Modular pipeline with enforced stages: Risk Gate, Capital Gate, Executor, Tracker, Logger.
 - Persistent JSONL trade logs plus runtime performance reports and heuristic tuning suggestions.
 
@@ -38,7 +38,7 @@ This README documents the code that exists in this repository today. `POLYMARKET
                             ▼
 ┌─────────────────────────────────────────────────────────────┐
 │              STRATEGIES  (strategies/)                        │
-│  Stoikov MM │ Whale Copy │ Arb │ Mean Rev │ Fade │ BTC 5m   │
+│  Stoikov MM │ Whale Copy │ Mean Rev │ Momentum │ Oracle    │
 │                                                              │
 │  Each strategy emits → TradingSignal                        │
 └───────────────────────────┬──────────────────────────────────┘
@@ -126,9 +126,7 @@ The pipeline tracks fill rate, rejection breakdown, and per-strategy signal stat
 |   |-- v2/                              # Unified strategies (all same interface)
 |   |   |-- mm.py                        # Stoikov market making
 |   |   |-- meanrev.py                   # Mean reversion
-|   |   |-- fade.py                      # Resolution fade
 |   |   |-- whale.py                     # Whale copy trading
-|   |   |-- arb.py                       # Combinatorial arbitrage
 |   |   |-- momentum.py                  # BTC/ETH momentum (5m markets)
 |   |   |-- oracle_frontrun.py           # Oracle front-run (5m markets)
 |   |   `-- runner.py                    # UnifiedRunnerV2 — runs all strategies
@@ -317,12 +315,6 @@ All v2 strategies (`strategies/v2/`) share the same interface and work on both l
 - Earns time decay premium as markets approach resolution.
 - Max 5 concurrent positions, 0.15x Kelly sizing.
 
-### Arbitrage (`strategies/v2/arb.py`)
-
-- Scans event slugs for sum-to-one violations (exclusive outcomes priced > $1 total).
-- Submits FOK legs through the pipeline.
-- Scans every 30 seconds (configurable).
-
 ### Whale Copy (`strategies/v2/whale.py`)
 
 - Monitors Polymarket leaderboard for top traders.
@@ -352,9 +344,7 @@ All v2 strategies (`strategies/v2/`) share the same interface and work on both l
 |---|---|---|
 | **MM** | Best fit — passive quoting, spread collection | Poor — token price trends, not oscillates |
 | **Mean Reversion** | Good — price oscillates around fair value | Poor — price trends toward 0 or 1 |
-| **Resolution Fade** | Good — time decay near resolution | Marginal — very short window |
 | **Whale Copy** | Good — follows conviction bets | Poor — detection lag vs 5m window |
-| **Arbitrage** | Good — scans across events | N/A — single market per window |
 | **Momentum** | N/A | Good — follows BTC direction |
 | **Oracle Front-Run** | N/A | Best — exploits price lag, highest expected win rate |
 
@@ -470,7 +460,7 @@ This makes strategies flexible across market types:
 python main.py --strategy rolling,btc5m --dry-run --no-learn
 
 # Long-dated market
-python main.py --strategy mm,meanrev,fade,whale --token TOKEN --dry-run --no-learn
+python main.py --strategy mm,meanrev,whale --token TOKEN --dry-run --no-learn
 ```
 
 `main.py` now uses v2 strategies exclusively. Legacy strategies in `strategies/` (outside `v2/`) are kept for reference.
