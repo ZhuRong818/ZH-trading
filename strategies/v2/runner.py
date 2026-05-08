@@ -82,15 +82,20 @@ class UnifiedRunnerV2:
 
     def step(self):
         """One iteration: refresh data → settle if needed → run strategies → submit signals."""
-        # 0. Capture previous-window settlement data BEFORE refresh overwrites it
+        # 0. Capture previous-window data BEFORE refresh overwrites it
         if self._is_rolling:
             prev_strike = self.provider.strike
             prev_end_ts = self.provider.end_timestamp
+            # Save token IDs for settlement BEFORE refresh changes them
+            prev_up_token = self.provider.up_token
+            prev_down_token = self.provider.down_token
         else:
             prev_strike = 0.0
             prev_end_ts = 0
+            prev_up_token = ""
+            prev_down_token = ""
 
-        # 1. Refresh market data
+        # 1. Refresh market data (this may discover a new window and overwrite tokens)
         self.provider.refresh()
         contexts = self.provider.all_contexts()
 
@@ -100,13 +105,14 @@ class UnifiedRunnerV2:
         # 2. Check for window roll (rolling markets)
         window_key = contexts[0].condition_id if contexts else ""
         if window_key != self._last_window_key and self._last_window_key:
+            # Use the PREVIOUS window's tokens for settlement
+            self._last_up_token = prev_up_token
+            self._last_down_token = prev_down_token
             self._on_window_roll(prev_strike, prev_end_ts)
             log.info("Runner: window rolled to %s", window_key[:30])
         self._last_window_key = window_key
 
-        # Save current provider tokens so they're available for OMS
-        # reconciliation on the NEXT window roll (refresh() already
-        # overwrites provider.up_token / provider.down_token).
+        # Save current window's tokens for next settlement
         if self._is_rolling:
             self._last_up_token = self.provider.up_token
             self._last_down_token = self.provider.down_token
@@ -149,6 +155,10 @@ class UnifiedRunnerV2:
                 # Track BUY fills for settlement
                 if result.side == "BUY" and self._is_rolling:
                     is_up = self._is_up_token(result.token_id)
+                    log.debug("Tracking entry: token=%s is_up=%s strategy=%s up_token=%s down_token=%s",
+                              result.token_id[:16], is_up, result.strategy,
+                              self.provider.up_token[:16] if hasattr(self.provider, 'up_token') else "?",
+                              self.provider.down_token[:16] if hasattr(self.provider, 'down_token') else "?")
                     self._open_entries.append(OpenEntry(
                         token_id=result.token_id,
                         side="BUY",
@@ -159,9 +169,20 @@ class UnifiedRunnerV2:
                     ))
 
     def _is_up_token(self, token_id: str) -> bool:
-        """Check if token is the 'Up' side of the current window."""
+        """Check if token is the 'Up' side of the current or previous window."""
         if isinstance(self.provider, RollingProvider):
-            return token_id == self.provider.up_token
+            # Check current window tokens
+            if token_id == self.provider.up_token:
+                return True
+            if token_id == self.provider.down_token:
+                return False
+            # Check previous window tokens (fill might be from last window)
+            if token_id == self._last_up_token:
+                return True
+            if token_id == self._last_down_token:
+                return False
+            # Unknown token — log and default to checking signal strategy name
+            log.warning("Unknown token %s for is_up check, defaulting to True", token_id[:16])
         return True
 
     def _on_window_roll(self, prev_strike: float = 0.0, prev_end_ts: int = 0):
