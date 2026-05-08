@@ -1,6 +1,6 @@
 # ZH Trading
 
-Updated: 2026-05-07 (v3 — unified strategy interface)
+Updated: 2026-05-08 (v3 — unified strategy interface)
 
 ZH Trading is a lightweight Python trading pipeline for Polymarket. It discovers markets, polls live order books, runs strategy modules, applies portfolio and capital controls, routes orders through a shared execution layer, and tracks fills, positions, logs, and basic performance in memory.
 
@@ -87,7 +87,9 @@ The pipeline tracks fill rate, rejection breakdown, and per-strategy signal stat
 |   `-- settings.py                      # API URLs and config dataclasses
 |-- data_pipeline/
 |   |-- market_data.py                   # Gamma/CLOB polling and market state
-|   `-- market_provider.py               # MarketContext, StaticProvider, RollingProvider
+|   |-- market_provider.py               # MarketContext, StaticProvider, RollingProvider
+|   |-- price_feeds.py                   # Binance BTC/ETH price feeds
+|   `-- oracle.py                        # Chainlink oracle integration
 |-- ems/
 |   |-- execution.py                     # Auth, live orders, rate limit, SOR
 |   |-- dry_run_sim.py                   # Book-aware dry-run fill simulator
@@ -108,6 +110,7 @@ The pipeline tracks fill rate, rejection breakdown, and per-strategy signal stat
 |   |-- snapshot_collector.py            # Periodic market/strategy state capture
 |   |-- performance.py                   # PnL, drawdown, Sharpe, win rate
 |   |-- tuner.py                         # Human-review tuning suggestions
+|   |-- learner.py                       # Auto-learner (reads past reports, adjusts params)
 |   |-- post_session.py                  # PostSessionAnalyzer orchestrator
 |   |-- strategy_analyzers/
 |   |   |-- base.py                      # Universal trade metrics
@@ -230,7 +233,9 @@ Important flags:
 
 | Flag | Purpose |
 | --- | --- |
-| `--strategy` | `mm`, `whale`, `arb`, `meanrev`, `fade`, `all`, or comma-separated values |
+| `--strategy` | `mm`, `whale`, `arb`, `meanrev`, `fade`, `btc5m`, `rolling`, `all`, or comma-separated |
+| `--rolling-asset` | Asset for rolling 5m markets: `btc` or `eth` (default: `btc`) |
+| `--no-learn` | Disable auto-learner (skip loading past reports) |
 | `--search` | Search markets interactively by keyword |
 | `--token` | Comma-separated CLOB token IDs; skips market search |
 | `--arb-events` | Comma-separated Gamma event slugs for arbitrage scans |
@@ -246,30 +251,29 @@ Important flags:
 | `--reconcile-interval` | Live position reconciliation interval |
 | `--verbose` | Debug logging |
 
-## BTC 5-Minute Runner
+## BTC 5-Minute / Rolling Markets
 
-The BTC 5-minute strategy is standalone and is not wired through `main.py`.
+BTC 5-minute is now integrated into `main.py` via the `rolling` strategy and `RollingProvider`. It auto-discovers rolling 5-minute markets, rotates tokens every window, and settles positions when windows expire.
 
-It discovers rolling Polymarket BTC up/down 5-minute markets, polls Binance BTC/USDT as the price reference, computes momentum and trend strength, trades when estimated edge clears the configured threshold, and can attempt a buy-both-legs trade when `UP + DOWN < 1.0`.
+```bash
+# BTC 5m momentum only
+python main.py --strategy btc5m --dry-run --no-learn
 
-```powershell
-python strategies\btc_5m\btc_5m.py --dry-run
-python strategies\btc_5m\btc_5m.py --dry-run --verbose
-python strategies\btc_5m\btc_5m.py --dry-run --bankroll 5000 --kelly 0.20 --min-edge 0.03 --deadline 180
+# All strategies on BTC 5m rolling market (MM + meanrev + fade + momentum)
+python main.py --strategy rolling --dry-run --no-learn
+
+# Combined: rolling + momentum
+python main.py --strategy rolling,btc5m --dry-run --no-learn
+
+# ETH 5m instead of BTC
+python main.py --strategy rolling --rolling-asset eth --dry-run --no-learn
 ```
 
-BTC 5-minute flags:
+Rolling-specific flags:
 
 | Flag | Purpose |
 | --- | --- |
-| `--dry-run` | Paper mode |
-| `--bankroll` | Strategy bankroll in USDC; default `5000` |
-| `--kelly` | Kelly fraction; default `0.20` |
-| `--min-edge` | Minimum edge required to trade; default `0.03` |
-| `--deadline` | Entry cutoff in seconds before market end; default `180` |
-| `--min-entry-age` | Seconds after market open before allowing entries; default `20` |
-| `--max-adverse-bps` | Max adverse strike distance in bps; default `2.0` |
-| `--verbose` | Debug logging |
+| `--rolling-asset` | Asset for rolling markets: `btc` or `eth` (default: `btc`) |
 
 ## Fee Configuration
 
@@ -285,52 +289,49 @@ The BTC 5-minute strategy fee of 7.2% is **not yet deducted** from dry-run PnL c
 
 ## Strategies
 
-### Market Making
+All v2 strategies (`strategies/v2/`) share the same interface and work on both long-dated and 5-minute rolling markets.
 
-`strategies/market_making/stoikov_model.py`
+### Market Making (`strategies/v2/mm.py`)
 
-- Uses fresh CLOB order books for each selected token.
-- Computes adjusted midpoint after filtering small bait orders.
-- Falls back to Gamma market price when CLOB spread is too wide.
-- Computes Stoikov reservation price and spread.
-- Widens or tightens quotes based on market regime.
-- Cancels existing quotes and posts layered bid/ask quotes through the EMS.
+- Posts bid/ask quotes around a Stoikov reservation price.
+- Skews quotes based on inventory to reduce directional risk.
+- Adjusts spread by regime (wider in tail, tighter in contested).
+- Filters bait orders when computing midpoint.
+- Works on long-dated (static tokens) and 5m rolling markets.
 
-### Mean Reversion
+### Mean Reversion (`strategies/v2/meanrev.py`)
 
-`strategies/mean_reversion/mean_reversion.py`
+- Buys when price drops 1%+ below moving average, sells when it reverts.
+- Only trades in the 0.20-0.80 price range.
+- Stop-loss at 2x entry deviation, 120s cooldown after stop.
+- Sizes with fractional Kelly (0.25x).
+- On 5m markets: uses shorter lookback (20 vs 30) and tighter threshold.
 
-- Trades only in contested markets.
-- Uses recent midpoint history to compute a moving average.
-- Buys dips below the mean and sells rips above the mean.
-- Sizes with fractional Kelly.
-- Exits on target, stop loss, or regime exit.
+### Resolution Fade (`strategies/v2/fade.py`)
 
-### Resolution Fade
+- Three sub-strategies: certainty fade, last-minute liquidity, convergence.
+- Earns time decay premium as markets approach resolution.
+- Max 5 concurrent positions, 0.15x Kelly sizing.
 
-`strategies/resolution_fade/resolution_fade.py`
+### Arbitrage (`strategies/v2/arb.py`)
 
-- Trades certainty premium and time decay near resolution.
-- Includes certainty fade, last-minute liquidity, and convergence logic.
-- Uses conservative Kelly sizing and limits concurrent positions.
+- Scans event slugs for sum-to-one violations (exclusive outcomes priced > $1 total).
+- Submits FOK legs through the pipeline.
+- Scans every 30 seconds (configurable).
 
-### Arbitrage
+### Whale Copy (`strategies/v2/whale.py`)
 
-`strategies/arbitrage/arb_detector.py`
+- Monitors Polymarket leaderboard for top traders.
+- First poll snapshots only (no false signals from empty baseline).
+- Max 3 signals per whale, max 10 per cycle (prevents rate limit flood).
+- Win rate threshold: 60%+ to copy.
 
-- `main.py` currently calls `scan_sum_to_one(event_slug)`.
-- Detects exclusive outcome groups whose YES prices sum above the configured threshold.
-- Estimates excess and submits FOK legs through the EMS.
-- The detector also contains monotonic threshold checks, but those are not exposed through the main CLI.
+### BTC Momentum (`strategies/v2/momentum.py`)
 
-### Whale Tracking
-
-`strategies/whale_tracking/whale_tracker.py`
-
-- Builds a registry from Polymarket leaderboard data.
-- Enriches profiles with trade history and closed-position win rate.
-- Tracks trusted wallets for new entries.
-- Sizes copy trades by configured copy fraction and routes through the SOR when paired market metadata is available.
+- Trades BTC 5-minute Up/Down markets using short-term momentum.
+- Z-score model: distance-to-strike + momentum drift + volatility.
+- Risk/reward gate: won't buy above $0.65.
+- Positive edge required before trading.
 
 ## Execution Model
 
@@ -351,7 +352,7 @@ Live mode:
 - Posts signed orders to `/order`.
 - Tracks open order IDs and can cancel individual orders or all known orders.
 
-The EMS also checks capital allocation, depth, price ticks, and a simple per-second rate limit before submitting orders.
+The EMS checks depth, price ticks, and a per-second rate limit before submitting orders. Capital allocation is handled by the pipeline's CapitalGate (not the EMS) to avoid double-booking.
 
 ## OMS, Capital, And Risk
 
@@ -447,7 +448,7 @@ python main.py --strategy rolling,btc5m --dry-run --no-learn
 python main.py --strategy mm,meanrev,fade,whale --token TOKEN --dry-run --no-learn
 ```
 
-The legacy strategies in `strategies/` (outside `v2/`) still work and are used by `main.py`. The v2 strategies are the new path for unified operation.
+`main.py` now uses v2 strategies exclusively. Legacy strategies in `strategies/` (outside `v2/`) are kept for reference.
 
 ## Auto-Learner
 
@@ -459,10 +460,21 @@ On startup, the learner reads past `reports/analysis_*.json` files and adjusts p
 
 Disable with `--no-learn`. Clear old data with `rm reports/analysis_*.json`.
 
+## Shutdown Behavior
+
+On Ctrl+C, the system:
+1. Cancels all open orders.
+2. Closes all open positions at current best bid (sells everything).
+3. Settles any rolling market positions (BTC 5m windows).
+4. Runs post-session analysis and generates reports.
+5. Prints pipeline stats (signals, executed, rejected, fill rate, rejection reasons).
+6. Logs tuner suggestions.
+
 ## Current Limitations
 
-- Legacy strategies in `strategies/` (outside v2/) still call EMS directly. The v2 versions route through the pipeline.
 - Dry-run simulator rejects most passive limit orders (MM quotes) because it can't model queue-based fills. Live mode would work correctly.
+- Whale copy signals fire for markets the bot doesn't have book data for — these fail at the executor in dry-run mode.
+- Legacy strategies in `strategies/` (outside v2/) are kept for reference but no longer used by main.py.
 - No persistent database for positions, market state, or performance.
 - No automatic `.env` loader.
 - No `requirements.txt` or automated test suite.
