@@ -412,18 +412,19 @@ class TradingSystem:
 
         asset = getattr(self.config, '_rolling_asset', 'btc')
 
-        # Setup V2 Static Strategies
-        static_strats = [s for s in strategies if s in ("mm", "whale", "arb", "meanrev", "fade")]
-        if static_strats and not ("rolling" in strategies and set(static_strats).issubset({"mm", "meanrev", "fade", "btc5m", "momentum"})):
-            self.setup_v2_strategies(strategies)
-            
-        # Setup V2 Rolling Strategies
+        # Setup V2 Rolling Strategies (auto-discovers 5m tokens)
         if "rolling" in strategies:
             roll_strats = [s for s in strategies if s in ("mm", "meanrev", "fade", "btc5m", "momentum")]
-            # If rolling is the only strategy specified, add all rolling-compatible strategies
             if not roll_strats:
                 roll_strats = ["mm", "meanrev", "fade", "momentum"]
             self.setup_rolling(roll_strats, asset=asset)
+
+        # Setup V2 Static Strategies (only if NOT using rolling for these)
+        # Avoids double-setup when running rolling,meanrev
+        rolling_handles = set(roll_strats) if "rolling" in strategies else set()
+        static_strats = [s for s in strategies if s in ("mm", "whale", "arb", "meanrev", "fade") and s not in rolling_handles]
+        if static_strats:
+            self.setup_v2_strategies(static_strats)
 
         # Start heartbeat for live mode
         if not self.config.dry_run and self.auth:
@@ -674,7 +675,8 @@ Examples:
     signal.signal(signal.SIGINT, lambda *_: setattr(system, 'running', False))
 
     # Market selection for strategies that need tokens
-    needs_market = any(s in strategies for s in ["mm", "meanrev", "fade"])
+    # Skip if only rolling strategies — rolling auto-discovers its own tokens
+    needs_market = any(s in strategies for s in ["mm", "meanrev", "fade"]) and "rolling" not in strategies
     if needs_market:
         if args.token:
             system.set_tokens(args.token)
