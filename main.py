@@ -501,8 +501,50 @@ class TradingSystem:
         log.info("Shutting down...")
         self.ems.cancel_all()
 
+        # Close all open positions at current market price
+        self._close_all_positions()
+
         # Run post-session analysis (replaces the old simple report)
         self.post_analyzer.run_analysis()
+
+    def _close_all_positions(self):
+        """Sell all open positions at current mid price on shutdown."""
+        open_positions = self.oms.get_all_open()
+        if not open_positions:
+            return
+
+        log.info("Closing %d open position(s) at market...", len(open_positions))
+        for pos in open_positions:
+            if pos.size <= 0:
+                continue
+
+            # Get current price
+            book = self.data_feed.get_book(pos.token_id)
+            if book and book.best_bid:
+                sell_price = book.best_bid
+            elif book and book.mid:
+                sell_price = book.mid
+            else:
+                sell_price = pos.cur_price if pos.cur_price > 0 else pos.avg_price
+
+            # Emit a sell fill directly (bypass simulator — we're shutting down)
+            from oms.position_manager import Fill
+            import time
+            fill = Fill(
+                token_id=pos.token_id,
+                side="SELL",
+                size=pos.size,
+                price=sell_price,
+                timestamp=time.time(),
+                source="shutdown_close",
+            )
+            self.ems._fire_fill(fill)
+
+            pnl = (sell_price - pos.avg_price) * pos.size
+            log.info(
+                "CLOSED: %s %.1f @ %.4f (entry=%.4f) pnl=$%.2f",
+                pos.token_id[:16], pos.size, sell_price, pos.avg_price, pnl,
+            )
 
         # Pipeline stats
         pstats = self.pipeline.stats()

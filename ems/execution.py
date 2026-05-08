@@ -258,15 +258,8 @@ class ExecutionEngine:
             log.warning("Rate limited, skipping order")
             return None
 
-        # Capital allocation check
-        if self.capital_allocator:
-            cost = size * price
-            approved = self.capital_allocator.request_capital(source, token_id, cost)
-            if approved <= 0:
-                log.info("Capital rejected for %s %s $%.0f", source, side, cost)
-                return None
-            if approved < cost:
-                size = approved / price if price > 0 else 0
+        # Capital allocation is handled by the pipeline's CapitalGate.
+        # Do NOT check here — it would double-book the same capital.
 
         # ── Adaptive depth handling & order decomposition ──────────────
         if self.data:
