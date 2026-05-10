@@ -10,6 +10,7 @@ The rolling window management is handled by the provider, not the strategy.
 
 import logging
 import math
+import time
 from typing import List, Optional
 from collections import deque
 
@@ -31,14 +32,21 @@ class Momentum(BaseStrategy):
     def __init__(
         self,
         asset: str = "btc",
-        min_edge: float = 0.03,
+        min_edge: float = 0.08,
         kelly_frac: float = 0.20,
-        max_bet_pct: float = 0.05,
+        max_bet_pct: float = 0.025,
         bankroll: float = 5_000,
-        max_price: float = 0.65,
+        max_price: float = 0.62,
         min_price: float = 0.30,
         momentum_window: int = 20,
-        min_mom_vol_ratio: float = 0.5,
+        min_mom_vol_ratio: float = 0.8,
+        min_entry_age: float = 20.0,
+        entry_deadline: float = 60.0,
+        min_abs_z: float = 0.15,
+        min_distance_bps: float = 2.0,
+        max_vwap_slippage: float = 0.02,
+        down_edge_boost: float = 0.04,
+        down_min_abs_z: float = 0.25,
     ):
         self.asset = asset
         self.min_edge = min_edge
@@ -49,8 +57,16 @@ class Momentum(BaseStrategy):
         self.min_price = min_price
         self.momentum_window = momentum_window
         self.min_mom_vol_ratio = min_mom_vol_ratio
+        self.min_entry_age = min_entry_age
+        self.entry_deadline = entry_deadline
+        self.min_abs_z = min_abs_z
+        self.min_distance_bps = min_distance_bps
+        self.max_vwap_slippage = max_vwap_slippage
+        self.down_edge_boost = down_edge_boost
+        self.down_min_abs_z = down_min_abs_z
 
         self._prices: deque = deque(maxlen=200)
+        self._price_times: deque = deque(maxlen=200)
         self._session = requests.Session()
         self._has_position = False
         self.total_trades = 0
@@ -79,7 +95,7 @@ class Momentum(BaseStrategy):
         # We use executable book prices (best ask) instead of mid to reduce
         # paper-trade vs fill price divergence.
         if up_ctx and down_ctx:
-            if up_ctx.seconds_remaining >= 30:
+            if up_ctx.seconds_remaining >= self.entry_deadline:
                 s = self._compute(up_ctx, down_ctx)
                 if s:
                     return [s]
@@ -90,6 +106,7 @@ class Momentum(BaseStrategy):
             symbol = f"{self.asset.upper()}USDT"
             resp = self._session.get(BINANCE_TICKER, params={"symbol": symbol}, timeout=5)
             self._prices.append(float(resp.json()["price"]))
+            self._price_times.append(time.time())
         except Exception:
             pass
 
@@ -108,31 +125,53 @@ class Momentum(BaseStrategy):
         returns = [(recent[i] - recent[i-1]) / recent[i-1] for i in range(1, len(recent))]
         return float(np.std(returns)) if returns else 0.001
 
+    def _sample_interval(self) -> float:
+        if len(self._price_times) < 2:
+            return 5.0
+        intervals = [
+            self._price_times[i] - self._price_times[i - 1]
+            for i in range(1, len(self._price_times))
+            if self._price_times[i] > self._price_times[i - 1]
+        ]
+        if not intervals:
+            return 5.0
+        intervals.sort()
+        return max(1.0, min(10.0, intervals[len(intervals) // 2]))
+
     def _compute(self, up_ctx: MarketContext, down_ctx: MarketContext) -> Optional[TradingSignal]:
         momentum = self._momentum(self.momentum_window)
         vol = max(self._volatility(self.momentum_window), 0.00002)
 
-        current = self._prices[-1] if self._prices else 0
+        current = up_ctx.external_price or (self._prices[-1] if self._prices else 0)
         strike = up_ctx.strike_price
         remaining = up_ctx.seconds_remaining
+        window_age = max(0.0, 300.0 - remaining)
 
         if current <= 0 or strike <= 0:
             return None
 
+        if window_age < self.min_entry_age:
+            return None
+
         # Z-score from distance to strike
-        horizon_ticks = max(remaining / 0.5, 1.0)
+        horizon_ticks = max(remaining / self._sample_interval(), 1.0)
         horizon_sigma = current * vol * math.sqrt(horizon_ticks)
         distance = current - strike
         z_score = distance / horizon_sigma if horizon_sigma > 0 else 0
+        distance_bps = abs(distance) / current * 10_000
 
         # Momentum quality filter
         mom_vol_ratio = abs(momentum) / vol if vol > 0 else 0
-        if mom_vol_ratio < self.min_mom_vol_ratio and abs(z_score) < 0.5:
+        if (
+            mom_vol_ratio < self.min_mom_vol_ratio
+            or abs(z_score) < self.min_abs_z
+            or distance_bps < self.min_distance_bps
+        ):
             return None
 
         # Drift adjustment
         mom_z = max(-2.0, min(2.0, momentum / vol if vol > 0 else 0))
-        adjusted_z = z_score + 0.2 * mom_z
+        adjusted_z = z_score + 0.15 * mom_z
 
         # Convert to probability
         fair_prob_up = 0.5 * (1.0 + math.erf(adjusted_z / math.sqrt(2.0)))
@@ -143,14 +182,19 @@ class Momentum(BaseStrategy):
             direction = "UP"
             fair = fair_prob_up
             market_price = up_ctx.best_ask or 0.0
+            ctx = up_ctx
         elif fair_prob_up < 0.48:
             direction = "DOWN"
             fair = 1 - fair_prob_up
             market_price = down_ctx.best_ask or 0.0
+            ctx = down_ctx
         else:
             return None
 
         if market_price <= 0:
+            return None
+
+        if direction == "DOWN" and abs(z_score) < self.down_min_abs_z:
             return None
 
         # Risk/reward gate
@@ -159,7 +203,8 @@ class Momentum(BaseStrategy):
 
         # Edge check
         edge = fair - market_price
-        if edge <= 0 or edge < self.min_edge:
+        required_edge = self.min_edge + (self.down_edge_boost if direction == "DOWN" else 0.0)
+        if edge <= 0 or edge < required_edge:
             return None
 
         # Kelly sizing
@@ -175,6 +220,44 @@ class Momentum(BaseStrategy):
 
         size = kelly.size_usdc / market_price if market_price > 0 else 0
 
+        book = ctx.book
+        vwap = market_price
+        if book:
+            vwap_price, fillable = book.vwap_price("BUY", size)
+            if vwap_price is None or fillable < 1:
+                return None
+            if fillable < size:
+                size = fillable
+            if vwap_price - market_price > self.max_vwap_slippage:
+                return None
+            vwap = vwap_price
+
+        edge = fair - vwap
+        if edge < required_edge:
+            return None
+
+        kelly = kelly_size(
+            fair_prob=fair, market_price=vwap,
+            bankroll=self.bankroll,
+            kelly_fraction=self.kelly_frac,
+            max_bet_pct=self.max_bet_pct,
+            min_edge=required_edge,
+        )
+        if kelly.direction == "NONE" or kelly.size_usdc < 5:
+            return None
+
+        size = kelly.size_usdc / vwap if vwap > 0 else 0
+        if book:
+            vwap_price, fillable = book.vwap_price("BUY", size)
+            if vwap_price is None or fillable < 1:
+                return None
+            if fillable < size:
+                size = fillable
+            vwap = vwap_price
+            edge = fair - vwap
+            if vwap - market_price > self.max_vwap_slippage or edge < required_edge:
+                return None
+
         # Use the correct token
         if direction == "UP":
             token_id = up_ctx.token_id
@@ -182,15 +265,20 @@ class Momentum(BaseStrategy):
             token_id = down_ctx.token_id
 
         self.total_trades += 1
-        log.info("MOMENTUM: %s %.1f @ %.4f edge=%.4f z=%.2f mom=%.4f%% btc=$%.0f",
-                 direction, size, market_price, edge, z_score, momentum * 100, current)
+        log.info(
+            "MOMENTUM: %s %.1f @ %.4f vwap=%.4f edge=%.4f z=%.2f dist=$%.2f "
+            "mom=%.4f%% btc=$%.0f age=%.0fs",
+            direction, size, market_price, vwap, edge, z_score, distance,
+            momentum * 100, current, window_age,
+        )
 
         return TradingSignal(
-            token_id=token_id, side="BUY", price=market_price, size=size,
+            token_id=token_id, side="BUY", price=vwap, size=size,
             strategy=self.name, edge=edge,
             fair_value=fair, confidence=min(abs(adjusted_z) / 2, 1.0),
             direction=direction,
             tick_size=up_ctx.tick_size,
+            order_type="FAK",
         )
 
     def _resolve_up_down_contexts(
