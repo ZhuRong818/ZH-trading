@@ -1,6 +1,6 @@
 # ZH Trading
 
-Updated: 2026-05-08 (v4 — arb/fade removed, oracle front-run added)
+Updated: 2026-05-11 (v5 — executable pricing via best_ask, equity-based drawdown, enhanced debugging)
 
 ZH Trading is a lightweight Python trading pipeline for Polymarket. It discovers markets, polls live order books, runs strategy modules, applies portfolio and capital controls, routes orders through a shared execution layer, and tracks fills, positions, logs, and basic performance in memory.
 
@@ -11,14 +11,17 @@ This README documents the code that exists in this repository today. `POLYMARKET
 - Market discovery and filtering through the Polymarket Gamma API.
 - Order book polling through the Polymarket CLOB API.
 - In-memory market state, midpoint history, volatility, and regime classification.
+- **Executable pricing via best_ask/best_bid**: Strategies now use actual order book depths for order entry, not mid-prices.
 - Dry-run execution with book-aware VWAP fills, pending GTC orders, and FOK/FAK behavior.
 - Live CLOB order signing and submission with EIP-712 order signatures and CLOB API authentication.
 - Shared OMS for fills, positions, realized PnL, unrealized PnL, and live position reconciliation.
 - Capital allocation by strategy budget, market concentration, reserve, and locked collateral.
-- Risk checks for exposure, drawdown, stop losses, volatility pauses, and kill switch shutdown.
+- **Equity-based risk controls**: Portfolio drawdown now calculated as (peak_equity - current_equity) / peak_equity, where equity = initial_capital + cumulative_pnL. Default max drawdown: 1%.
+- Per-position stop losses, volatility pauses, and kill switch shutdown.
 - Strategy modules for Stoikov market making, whale copy trading, mean reversion, BTC momentum, and oracle front-run.
 - Modular pipeline with enforced stages: Risk Gate, Capital Gate, Executor, Tracker, Logger.
 - Persistent JSONL trade logs plus runtime performance reports and heuristic tuning suggestions.
+- **Enhanced debugging**: `--verbose` flag provides detailed execution logs for signal generation, price resolution, and risk gate decisions.
 
 ## Pipeline Flow
 
@@ -221,9 +224,33 @@ python main.py --strategy meanrev --search bitcoin --dry-run
 # Whale copy-trading dry-run
 python main.py --strategy whale --dry-run
 
+# BTC 5m momentum strategy with executable pricing
+python main.py --strategy btc5m --rolling-asset btc --dry-run --verbose
+
+# Oracle front-run strategy (exploit Binance-Polymarket lag)
+python main.py --strategy rolling,oracle --rolling-asset btc --dry-run --verbose
+
+# All 5m strategies (momentum + oracle front-run)
+python main.py --strategy rolling --dry-run --verbose
+
 # Run all strategies
 python main.py --strategy all --search election --dry-run
 ```
+
+### Debugging Pricing and Risk Decisions
+
+Use `--verbose` to see detailed logs for each signal:
+
+```powershell
+# View signal prices, execution prices, and risk gate decisions
+python main.py --strategy btc5m --dry-run --verbose
+```
+
+Verbose output includes:
+- Signal generation price (from best_ask/best_bid)
+- Risk gate checks (drawdown %, current equity, peak equity)
+- Capital gate allocation
+- Execution fill prices and slippage
 
 Important flags:
 
@@ -241,17 +268,19 @@ Important flags:
 | `--levels` | Quote levels per side |
 | `--interval` | Main loop refresh interval in seconds |
 | `--max-position` | Max position size per market in USDC |
-| `--max-drawdown` | Portfolio drawdown percentage before kill switch |
+| `--max-drawdown` | Portfolio drawdown percentage before kill switch (default: 1%) |
 | `--reconcile-interval` | Live position reconciliation interval |
-| `--verbose` | Debug logging |
+| `--verbose` | Debug logging (see signal prices, execution prices, risk gate decisions) |
 
 ## BTC 5-Minute / Rolling Markets
 
 BTC 5-minute is now integrated into `main.py` via the `rolling` strategy and `RollingProvider`. It auto-discovers rolling 5-minute markets, rotates tokens every window, and settles positions when windows expire.
 
+Strategies use **best_ask** for order entry, ensuring executable prices aligned with actual order book depth.
+
 ```bash
-# BTC 5m momentum only
-python main.py --strategy btc5m --dry-run --no-learn
+# BTC 5m momentum only (shows executable pricing in --verbose mode)
+python main.py --strategy btc5m --dry-run --no-learn --verbose
 
 # Default rolling (momentum + oracle front-run)
 python main.py --strategy rolling --dry-run --no-learn
@@ -315,6 +344,7 @@ All v2 strategies (`strategies/v2/`) share the same interface and work on both l
 
 - Trades BTC 5-minute Up/Down markets using short-term momentum.
 - Z-score model: distance-to-strike + momentum drift + volatility.
+- **Uses best_ask price for DOWN bets, best_ask for UP bets**: Ensures order placement at executable levels, not theoretical mid-prices.
 - Risk/reward gate: won't buy above $0.65.
 - Positive edge required before trading.
 
@@ -323,6 +353,7 @@ All v2 strategies (`strategies/v2/`) share the same interface and work on both l
 - Exploits the 1-3 second lag between Binance BTC price and Polymarket 5m odds.
 - Detects sharp BTC moves (>3 bps) on Binance, checks if Polymarket is stale.
 - If Polymarket hasn't adjusted: buys the underpriced side before it catches up.
+- **Uses best_ask price for order entry**: Trades at the actual order book depth, ensuring fills occur at executable levels.
 - Not a prediction — trades on something that already happened but isn't priced in yet.
 - Risk/reward gate: won't buy above $0.60, 10-second cooldown between trades.
 - Tracks stale vs already-priced signal ratio in snapshot.
@@ -372,12 +403,26 @@ The capital allocator enforces:
 The risk engine enforces:
 
 - Max portfolio exposure.
-- Max drawdown kill switch.
+- **Equity-based max drawdown kill switch**: Drawdown = (peak_equity - current_equity) / peak_equity × 100%, where equity = initial_capital + cumulative_PnL. Default threshold: 1%. This ensures risk is measured relative to the actual account size, not cumulative losses alone.
 - Per-position stop losses.
 - Per-market position-size checks for whale copy trades.
 - Volatility circuit breakers that pause a token.
 
 When the kill switch fires, the EMS cancels known orders and attempts to close open positions using current best bid liquidity.
+
+### Drawdown Tracking
+
+`risk_engine.py` now tracks:
+- **peak_equity**: Highest account value reached (starting with initial_capital)
+- **current_equity**: initial_capital + cumulative_PnL
+- **drawdown**: (peak_equity - current_equity) / peak_equity
+
+When a drawdown breach occurs, the log shows:
+```
+DRAWDOWN BREACH: X.X% > 1.0% | peak_eq=$Y current_eq=$Z pnl=$W
+```
+
+Example: With initial_capital=$100k, if cumulative_PnL swings from +$5k to -$1k, equity drops from $105k to $99k, drawdown is (105-99)/105 = 5.7%, which breaches the 1% threshold and triggers shutdown.
 
 ## Logs And Analytics
 
