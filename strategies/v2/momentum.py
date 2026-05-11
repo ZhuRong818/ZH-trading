@@ -32,12 +32,12 @@ class Momentum(BaseStrategy):
     def __init__(
         self,
         asset: str = "btc",
-        min_edge: float = 0.08,
+        min_edge: float = 0.12,
         kelly_frac: float = 0.20,
         max_bet_pct: float = 0.025,
         bankroll: float = 5_000,
-        max_price: float = 0.62,
-        min_price: float = 0.30,
+        max_price: float = 0.55,
+        min_price: float = 0.40,
         momentum_window: int = 20,
         min_mom_vol_ratio: float = 0.8,
         min_entry_age: float = 20.0,
@@ -45,8 +45,10 @@ class Momentum(BaseStrategy):
         min_abs_z: float = 0.15,
         min_distance_bps: float = 2.0,
         max_vwap_slippage: float = 0.02,
-        down_edge_boost: float = 0.04,
+        down_edge_boost: float = 0.08,
         down_min_abs_z: float = 0.25,
+        fair_cap: float = 0.80,
+        confirmations_required: int = 2,
     ):
         self.asset = asset
         self.min_edge = min_edge
@@ -64,11 +66,17 @@ class Momentum(BaseStrategy):
         self.max_vwap_slippage = max_vwap_slippage
         self.down_edge_boost = down_edge_boost
         self.down_min_abs_z = down_min_abs_z
+        self.fair_cap = fair_cap
+        self.confirmations_required = max(1, confirmations_required)
 
         self._prices: deque = deque(maxlen=200)
         self._price_times: deque = deque(maxlen=200)
         self._session = requests.Session()
         self._has_position = False
+        self._last_condition_id = ""
+        self._pending_signal_key: tuple[str, str] | None = None
+        self._pending_signal_count = 0
+        self._candidate_details: dict = {}
         self.total_trades = 0
         self.wins = 0
         self.losses = 0
@@ -78,6 +86,12 @@ class Momentum(BaseStrategy):
             self._has_position = True
         elif fill.side == "SELL":
             self._has_position = False
+            self._pending_signal_key = None
+            self._pending_signal_count = 0
+
+    def on_cancel(self):
+        self._pending_signal_key = None
+        self._pending_signal_count = 0
 
     def step(self, contexts: List[MarketContext]) -> List[TradingSignal]:
         up_ctx, down_ctx = self._resolve_up_down_contexts(contexts)
@@ -91,6 +105,12 @@ class Momentum(BaseStrategy):
         if len(self._prices) < 5:
             return []
 
+        condition_id = up_ctx.condition_id if up_ctx else ""
+        if condition_id and condition_id != self._last_condition_id:
+            self._last_condition_id = condition_id
+            self._pending_signal_key = None
+            self._pending_signal_count = 0
+
         # One signal per window — only process once using resolved UP/DOWN contexts.
         # We use executable book prices (best ask) instead of mid to reduce
         # paper-trade vs fill price divergence.
@@ -98,7 +118,30 @@ class Momentum(BaseStrategy):
             if up_ctx.seconds_remaining >= self.entry_deadline:
                 s = self._compute(up_ctx, down_ctx)
                 if s:
+                    key = (s.direction, s.token_id)
+                    if key == self._pending_signal_key:
+                        self._pending_signal_count += 1
+                    else:
+                        self._pending_signal_key = key
+                        self._pending_signal_count = 1
+
+                    if self._pending_signal_count < self.confirmations_required:
+                        return []
+
+                    self.total_trades += 1
+                    d = self._candidate_details
+                    log.info(
+                        "MOMENTUM: %s %.1f @ %.4f vwap=%.4f edge=%.4f z=%.2f "
+                        "dist=$%.2f mom=%.4f%% btc=$%.0f age=%.0fs conf=%d",
+                        s.direction, s.size, d.get("market_price", s.price),
+                        s.price, s.edge, d.get("z_score", 0.0),
+                        d.get("distance", 0.0), d.get("momentum", 0.0) * 100,
+                        d.get("current", 0.0), d.get("window_age", 0.0),
+                        self._pending_signal_count,
+                    )
                     return [s]
+                self._pending_signal_key = None
+                self._pending_signal_count = 0
         return []
 
     def _poll_price(self):
@@ -175,7 +218,7 @@ class Momentum(BaseStrategy):
 
         # Convert to probability
         fair_prob_up = 0.5 * (1.0 + math.erf(adjusted_z / math.sqrt(2.0)))
-        fair_prob_up = max(0.05, min(0.95, fair_prob_up))
+        fair_prob_up = max(1.0 - self.fair_cap, min(self.fair_cap, fair_prob_up))
 
         # Direction
         if fair_prob_up > 0.52:
@@ -232,6 +275,9 @@ class Momentum(BaseStrategy):
                 return None
             vwap = vwap_price
 
+        if vwap > self.max_price or vwap < self.min_price:
+            return None
+
         edge = fair - vwap
         if edge < required_edge:
             return None
@@ -255,7 +301,12 @@ class Momentum(BaseStrategy):
                 size = fillable
             vwap = vwap_price
             edge = fair - vwap
-            if vwap - market_price > self.max_vwap_slippage or edge < required_edge:
+            if (
+                vwap - market_price > self.max_vwap_slippage
+                or edge < required_edge
+                or vwap > self.max_price
+                or vwap < self.min_price
+            ):
                 return None
 
         # Use the correct token
@@ -264,13 +315,14 @@ class Momentum(BaseStrategy):
         else:
             token_id = down_ctx.token_id
 
-        self.total_trades += 1
-        log.info(
-            "MOMENTUM: %s %.1f @ %.4f vwap=%.4f edge=%.4f z=%.2f dist=$%.2f "
-            "mom=%.4f%% btc=$%.0f age=%.0fs",
-            direction, size, market_price, vwap, edge, z_score, distance,
-            momentum * 100, current, window_age,
-        )
+        self._candidate_details = {
+            "market_price": market_price,
+            "z_score": z_score,
+            "distance": distance,
+            "momentum": momentum,
+            "current": current,
+            "window_age": window_age,
+        }
 
         return TradingSignal(
             token_id=token_id, side="BUY", price=vwap, size=size,
