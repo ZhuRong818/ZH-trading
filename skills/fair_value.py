@@ -67,7 +67,7 @@ class OracleFairValueSkill:
     prob_shift = min(|move_bps| / scale, max_shift)
     """
 
-    def __init__(self, scale: float = 100.0, max_shift: float = 0.35):
+    def __init__(self, scale: float = 50.0, max_shift: float = 0.35):
         self.scale = scale
         self.max_shift = max_shift
 

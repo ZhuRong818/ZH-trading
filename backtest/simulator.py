@@ -414,11 +414,11 @@ class BacktestSimulator:
             runner = LegacyStrategyRunner(
                 name="oracle",
                 features=features,
-                fair_value_skill=OracleFairValueSkill(),
+                fair_value_skill=OracleFairValueSkill(scale=50.0, max_shift=0.35),  # aligned with v2: bps/50
                 edge_skill=edge_skill,
                 risk_gate=RiskGateSkill(),
                 risk_config=RiskGateConfig(
-                    min_edge=kwargs.get("staleness_threshold", 0.01),
+                    min_edge=kwargs.get("staleness_threshold", 0.15),   # v2 default
                     max_price=kwargs.get("max_price", 0.55),
                     min_price=kwargs.get("min_price", 0.20),
                     min_seconds_remaining=60,
@@ -429,8 +429,8 @@ class BacktestSimulator:
                     kelly_fraction=kwargs.get("kelly_frac", 0.25),
                     max_bet_pct=kwargs.get("max_bet_pct", 0.05),
                 ),
-                move_threshold_bps=kwargs.get("move_threshold_bps", 2.0),
-                staleness_threshold=kwargs.get("staleness_threshold", 0.01),
+                move_threshold_bps=kwargs.get("move_threshold_bps", 6.0),    # v2 default
+                staleness_threshold=kwargs.get("staleness_threshold", 0.15), # v2 default
                 max_notional=kwargs.get("max_notional", 500),
             )
         else:
