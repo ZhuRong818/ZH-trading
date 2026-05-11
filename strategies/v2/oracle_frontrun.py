@@ -44,8 +44,8 @@ class OracleFrontrun(BaseStrategy):
     def __init__(
         self,
         asset: str = "btc",
-        move_threshold_bps: float = 2.0,    # min BTC move to act (0.02%)
-        staleness_threshold: float = 0.01,   # min gap between fair and market (1%)
+        move_threshold_bps: float = 6.0,    # min BTC move to act (0.06%) — backtested optimal
+        staleness_threshold: float = 0.15,   # min gap between fair and market (15%) — backtested optimal
         lookback_ticks: int = 5,             # compare price over last N ticks
         max_price: float = 0.55,             # don't buy above this (contested zone only)
         min_price: float = 0.20,             # don't buy below this (avoid tail zone)

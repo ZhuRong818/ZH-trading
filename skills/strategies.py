@@ -166,7 +166,7 @@ class OracleFrontrunStrategy(BaseStrategy, _PriceFeedMixin):
 
     def __init__(self, asset: str = "btc", bankroll: float = 10_000,
                  kelly_frac: float = 0.25, max_bet_pct: float = 0.05,
-                 move_threshold_bps: float = 2.0, staleness_threshold: float = 0.01,
+                 move_threshold_bps: float = 6.0, staleness_threshold: float = 0.15,
                  max_price: float = 0.55, min_price: float = 0.20,
                  cooldown: float = 10.0, min_remaining: float = 60.0,
                  max_notional_usdc: float = 500.0):
