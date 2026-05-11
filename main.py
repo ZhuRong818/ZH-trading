@@ -310,7 +310,13 @@ class TradingSystem:
         if "btc5m" in strategies or "momentum" in strategies:
             btc_budget_frac = self.config.capital.strategy_budgets.get("btc5m", 0.10)
             actual_bankroll = self.config.capital.total_capital_usdc * btc_budget_frac
-            mom = Momentum(bankroll=actual_bankroll)
+            mom = Momentum(
+                bankroll=actual_bankroll,
+                min_edge=self.config.btc5m_min_edge,
+                max_price=self.config.btc5m_max_price,
+                min_price=self.config.btc5m_min_price,
+                down_edge_boost=self.config.btc5m_down_edge_boost,
+            )
             self.rolling_runner.add(mom)
             self.post_analyzer.register_strategy(mom, "v2_momentum")
 

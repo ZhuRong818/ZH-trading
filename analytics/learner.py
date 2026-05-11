@@ -257,17 +257,23 @@ class Learner:
                 ))
 
     def _adjust_btc5m(self, h: StrategyHistory, config: SystemConfig):
-        """Log BTC 5m suggestions (standalone runner, can't adjust directly)."""
+        """Adjust BTC 5m V2 momentum parameters."""
         if h.avg_win_rate < 45 and h.total_trades >= 15:
+            old = config.btc5m_min_edge
+            new = min(max(old + 0.02, 0.14), 0.20)
+            config.btc5m_min_edge = new
             self.adjustments.append(LearningResult(
-                "min_edge", 0.03, 0.05,
+                "min_edge", old, new,
                 f"BTC 5m win rate {h.avg_win_rate:.0f}% — raise min_edge to filter weak signals",
                 "btc_5m",
             ))
 
         if h.avg_win_rate > 65 and h.total_trades >= 20:
+            old = config.btc5m_min_edge
+            new = max(old - 0.01, 0.08)
+            config.btc5m_min_edge = new
             self.adjustments.append(LearningResult(
-                "min_edge", 0.03, 0.02,
+                "min_edge", old, new,
                 f"BTC 5m win rate {h.avg_win_rate:.0f}% — can lower min_edge for more trades",
                 "btc_5m",
             ))
