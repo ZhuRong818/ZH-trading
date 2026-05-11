@@ -283,7 +283,18 @@ class V2MomentumBacktestRunner:
         fair_prob_up = 0.5 * (1.0 + math.erf(adjusted_z / math.sqrt(2.0)))
         fair_prob_up = max(1.0 - self.fair_cap, min(self.fair_cap, fair_prob_up))
 
-        up_ask, down_ask = simulator.simulate_asks(strike, current, window_idx, entry_age)
+        # Use REAL Polymarket prices if available in the window
+        window_data = getattr(simulator, '_current_window', {})
+        up_prices = window_data.get("up_prices", [])
+        down_prices = window_data.get("down_prices", [])
+
+        if up_prices and down_prices:
+            entry_ts = window_data.get("start_ts", 0) + int(entry_age)
+            up_ask = simulator._find_nearest_price(up_prices, entry_ts)
+            down_ask = simulator._find_nearest_price(down_prices, entry_ts)
+        else:
+            up_ask, down_ask = simulator.simulate_asks(strike, current, window_idx, entry_age)
+
         if fair_prob_up > 0.52:
             direction = "UP"
             fair = fair_prob_up
@@ -451,6 +462,8 @@ class BacktestSimulator:
 
         for i, window in enumerate(windows):
             history_before_window = list(price_history)
+            # Store current window so V2MomentumBacktestRunner can access real prices
+            self._current_window = window
 
             for strategy in self.strategies:
                 name = strategy.name
