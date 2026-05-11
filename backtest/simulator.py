@@ -445,10 +445,24 @@ class BacktestSimulator:
         peak = self.bankroll
         price_history: List[float] = []
 
+        # Track cooldown per strategy (skip N windows after a trade)
+        cooldown_until: dict = {}  # strategy_name -> window_idx when can trade again
+        consecutive_losses: dict = {}  # strategy_name -> count
+
         for i, window in enumerate(windows):
             history_before_window = list(price_history)
 
             for strategy in self.strategies:
+                name = strategy.name
+
+                # Cooldown: skip 1 window after a trade (simulates position lock)
+                if cooldown_until.get(name, 0) > i:
+                    continue
+
+                # Kill switch: stop after 5 consecutive losses
+                if consecutive_losses.get(name, 0) >= 5:
+                    continue
+
                 if isinstance(strategy, V2MomentumBacktestRunner):
                     decision = strategy.evaluate_window(i, window, history_before_window, self)
                 else:
@@ -457,7 +471,12 @@ class BacktestSimulator:
                 if decision is None:
                     continue
 
-                trade = self._settle_decision(i, strategy.name, decision, window["outcome"])
+                trade = self._settle_decision(i, name, decision, window["outcome"])
+
+                # Skip zero-size trades (rejected by slippage check)
+                if trade.size_usdc <= 0:
+                    continue
+
                 self.result.trades.append(trade)
 
                 equity += trade.pnl
@@ -465,8 +484,13 @@ class BacktestSimulator:
                 self.result.max_drawdown = max(self.result.max_drawdown, peak - equity)
                 if trade.won:
                     self.result.wins += 1
+                    consecutive_losses[name] = 0
                 else:
                     self.result.losses += 1
+                    consecutive_losses[name] = consecutive_losses.get(name, 0) + 1
+
+                # Cooldown: can't trade the next window (position is held to settlement)
+                cooldown_until[name] = i + 2  # skip next window
 
             price_history.extend(window["prices"])
             if len(price_history) > 500:
@@ -511,9 +535,23 @@ class BacktestSimulator:
         outcome: str,
     ) -> BacktestTrade:
         signal_price = decision["entry_price"]
-        slippage = signal_price * self.slippage_rate * self.rng.uniform(0.5, 1.5)
+
+        # Realistic slippage: usually adverse but occasionally favorable
+        # Average 1% adverse, with variance
+        slippage_pct = self.rng.gauss(self.slippage_rate, self.slippage_rate * 0.5)
+        slippage = signal_price * max(0, slippage_pct)  # floor at 0 (no favorable slippage modeled)
         fill_price = min(0.95, signal_price + slippage)
         size_usdc = decision["size_usdc"]
+
+        # Reject if fill price is too far from signal (would have been rejected by EMS slippage check)
+        if fill_price > signal_price * 1.03:  # max 3% adverse slippage
+            return BacktestTrade(
+                window_idx=window_idx, strategy=strategy_name,
+                direction=decision["direction"], entry_price=fill_price,
+                size_usdc=0, edge=decision["edge"], fair=decision["fair"],
+                outcome=outcome, pnl=0, won=False,
+                regime=decision.get("regime", "contested"),
+            )
 
         shares = size_usdc / fill_price if fill_price > 0 else 0.0
         fee_per_share = self.fee_rate_constant * fill_price * (1.0 - fill_price)
@@ -546,15 +584,40 @@ class BacktestSimulator:
         )
 
     def simulate_asks(self, strike: float, current: float, window_idx: int, entry_age: float) -> tuple[float, float]:
+        """
+        Simulate realistic Polymarket ask prices from BTC price.
+
+        Key realism features:
+        - Polymarket reacts SLOWLY to BTC moves (lag_factor reduces sensitivity)
+        - Noise represents market maker disagreement and order flow
+        - Spread is applied correctly (up_ask + down_ask > 1.0 by spread amount)
+        - Prices are bounded to realistic range
+        """
         distance_pct = (current - strike) / strike if strike > 0 else 0.0
-        # Stable per candidate so confirmation checks are not just noise flips.
+
+        # Polymarket sensitivity: how much BTC move shifts odds
+        # Real Polymarket reacts less than 1:1 to BTC moves
+        # lag_factor < 1.0 means Polymarket is slower than BTC
+        lag_factor = 0.6  # Polymarket captures ~60% of the BTC move
+        sensitivity = 15  # multiplier: 0.1% BTC move → 1.5% probability shift
+
+        # Base probability with lag
+        raw_prob = 0.50 + distance_pct * sensitivity * lag_factor
+
+        # Noise: represents market maker disagreement, order flow, stale quotes
+        # Seeded per window+time for reproducibility
         rng = random.Random((window_idx + 1) * 1_000_003 + int(entry_age))
-        noise = rng.gauss(0, 0.05)
-        raw_prob = 0.50 + distance_pct * 30
-        simulated_up_price = max(0.10, min(0.90, raw_prob + noise))
-        simulated_down_price = 1.0 - simulated_up_price
+        noise = rng.gauss(0, 0.03)  # ±3% noise (reduced from 5%)
+
+        simulated_up_mid = max(0.05, min(0.95, raw_prob + noise))
+        simulated_down_mid = 1.0 - simulated_up_mid
+
+        # Apply spread correctly: ask is ABOVE mid, bid is BELOW mid
         half_spread = self.spread_rate / 2
-        return min(0.95, simulated_up_price + half_spread), min(0.95, simulated_down_price + half_spread)
+        up_ask = min(0.95, simulated_up_mid + half_spread)
+        down_ask = min(0.95, simulated_down_mid + half_spread)
+
+        return up_ask, down_ask
 
     def estimate_vwap(self, ask_price: float) -> float:
         return min(0.95, ask_price * (1.0 + self.slippage_rate * 0.5))
