@@ -167,10 +167,10 @@ class BacktestSimulator:
     - Only 1 trade per window per strategy (no pile-up)
     """
 
-    def __init__(self, bankroll: float = 10_000, fee_bps: float = 720,
+    def __init__(self, bankroll: float = 10_000, fee_rate: float = 0.072,
                  slippage_bps: float = 200, spread_bps: float = 500):
         self.bankroll = bankroll
-        self.fee_rate = fee_bps / 10_000      # 7.2% for crypto 5m
+        self.fee_rate_constant = fee_rate     # Polymarket crypto feeRate constant
         self.slippage_rate = slippage_bps / 10_000  # 2% average slippage
         self.spread_rate = spread_bps / 10_000      # 5% bid-ask spread
         self.strategies: List[StrategyRunner] = []
@@ -317,17 +317,20 @@ class BacktestSimulator:
                 fill_price = signal_price + slippage  # worse for buyer
                 fill_price = min(0.95, fill_price)
 
-                # ---- Settlement ----
+                # ---- Settlement with parabolic fee ----
+                # Polymarket fee = shares × feeRate × p × (1-p)
+                # where p = fill_price, feeRate = 0.072 for crypto
+                shares = size_usdc / fill_price if fill_price > 0 else 0
+                fee_per_share = self.fee_rate_constant * fill_price * (1 - fill_price)
+                fees = shares * fee_per_share
+
                 if direction == outcome:
                     # Won: payout $1 per share, minus entry cost and fees
-                    shares = size_usdc / fill_price if fill_price > 0 else 0
                     gross_pnl = shares * (1.0 - fill_price)
-                    fees = size_usdc * self.fee_rate
                     pnl = gross_pnl - fees
                     won = pnl > 0  # might still lose after fees
                 else:
                     # Lost: lose entire entry cost plus fees
-                    fees = size_usdc * self.fee_rate
                     pnl = -(size_usdc + fees)
                     won = False
 

@@ -17,9 +17,13 @@ NEG_RISK_CTF_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 
 @dataclass
 class FeeConfig:
-    maker_fee_bps: float = 0.0       # Polymarket maker fee (currently 0)
-    taker_fee_bps: float = 100.0     # 1% taker fee (100 basis points)
-    crypto_5m_fee_bps: float = 720.0 # 7.2% on 5-min crypto markets
+    maker_fee_bps: float = 0.0          # Polymarket maker fee (always 0)
+    # Taker fee uses parabolic formula: fee = shares × feeRate × p × (1-p)
+    # feeRate varies by category:
+    crypto_fee_rate: float = 0.072      # crypto markets (max 1.80% at p=0.50)
+    politics_fee_rate: float = 0.04     # politics/tech/finance
+    sports_fee_rate: float = 0.03       # sports
+    geopolitics_fee_rate: float = 0.0   # geopolitics (free)
 
 
 @dataclass
