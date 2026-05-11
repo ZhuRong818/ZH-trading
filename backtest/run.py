@@ -56,6 +56,10 @@ def main():
     parser.add_argument("--disable-trending", action=argparse.BooleanOptionalAction, default=True,
                         help="Filter trending regime unless edge/price are exceptional (default: enabled)")
 
+    parser.add_argument("--real-prices", action="store_true",
+                        help="Use real Polymarket historical prices (slower, more accurate)")
+    parser.add_argument("--hours", type=int, default=0,
+                        help="Hours of data for --real-prices mode (default: days*24)")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -66,11 +70,19 @@ def main():
     )
 
     # Load data
-    print(f"Loading {args.days} days of {args.interval} BTC data from Binance...")
-    loader = BinanceDataLoader()
-    klines = loader.load_klines("BTCUSDT", args.interval, days=args.days)
-    windows = loader.klines_to_windows(klines)
-    print(f"Created {len(windows)} 5-minute windows")
+    if args.real_prices:
+        from backtest.polymarket_loader import PolymarketHistoricalLoader
+        hours = args.hours if args.hours > 0 else args.days * 24
+        print(f"Loading {hours} hours of REAL Polymarket + BTC data...")
+        pm_loader = PolymarketHistoricalLoader()
+        windows = pm_loader.load_windows(hours=hours)
+        print(f"Loaded {len(windows)} windows with real Polymarket prices")
+    else:
+        print(f"Loading {args.days} days of {args.interval} BTC data from Binance (simulated Polymarket prices)...")
+        loader = BinanceDataLoader()
+        klines = loader.load_klines("BTCUSDT", args.interval, days=args.days)
+        windows = loader.klines_to_windows(klines)
+        print(f"Created {len(windows)} 5-minute windows (simulated prices)")
 
     # Setup simulator
     sim = BacktestSimulator(bankroll=args.bankroll)

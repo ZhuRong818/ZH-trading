@@ -514,18 +514,45 @@ class BacktestSimulator:
         if entry_idx >= len(prices):
             return None
         current = prices[entry_idx]
-        up_ask, down_ask = self.simulate_asks(window["strike"], current, window_idx, entry_idx * 60.0)
+
+        # Use REAL Polymarket prices if available, else simulate
+        up_prices = window.get("up_prices", [])
+        down_prices = window.get("down_prices", [])
+
+        if up_prices and down_prices:
+            # Find the price point closest to entry time
+            entry_ts = window["start_ts"] + (entry_idx * 60)
+            up_ask = self._find_nearest_price(up_prices, entry_ts)
+            down_ask = self._find_nearest_price(down_prices, entry_ts)
+        else:
+            # Fallback to simulated prices
+            up_ask, down_ask = self.simulate_asks(window["strike"], current, window_idx, entry_idx * 60.0)
+
         seconds_remaining = 300.0 * (1.0 - entry_idx / max(len(prices), 1))
         market = RollingMarket(
             strike_price=window["strike"],
             seconds_remaining=seconds_remaining,
             up_price=up_ask,
             down_price=down_ask,
-            up_token_id=f"up_{window_idx}",
-            down_token_id=f"down_{window_idx}",
+            up_token_id=window.get("up_token", f"up_{window_idx}"),
+            down_token_id=window.get("down_token", f"down_{window_idx}"),
         )
         eval_prices = history_before_window + prices[: entry_idx + 1]
         return strategy.evaluate(eval_prices, market)
+
+    @staticmethod
+    def _find_nearest_price(price_points: list, target_ts: int) -> float:
+        """Find the price closest to target timestamp from Polymarket history."""
+        if not price_points:
+            return 0.5
+        best = price_points[0]
+        best_dist = abs(best["t"] - target_ts)
+        for p in price_points[1:]:
+            dist = abs(p["t"] - target_ts)
+            if dist < best_dist:
+                best = p
+                best_dist = dist
+        return best["p"]
 
     def _settle_decision(
         self,
