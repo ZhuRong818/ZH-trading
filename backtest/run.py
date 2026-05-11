@@ -35,8 +35,8 @@ def main():
                         help="Kline interval: 1m, 5m (default: 1m)")
 
     # Strategy params
-    parser.add_argument("--min-edge", type=float, default=defaults.btc5m_min_edge,
-                        help=f"Momentum min edge (default: {defaults.btc5m_min_edge})")
+    parser.add_argument("--min-edge", type=float, default=0.03,
+                        help="Momentum min edge (default: 0.03)")
     parser.add_argument("--move-bps", type=float, default=2.0,
                         help="Oracle move threshold bps (default: 2.0)")
     parser.add_argument("--staleness", type=float, default=0.01,
