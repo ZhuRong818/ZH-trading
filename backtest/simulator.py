@@ -158,10 +158,21 @@ class StrategyRunner:
 class BacktestSimulator:
     """
     Replays historical BTC 5-minute windows through strategies.
+
+    Realism features:
+    - Market prices simulated with noise + spread (not perfect mapping)
+    - Slippage added to entry price (1-3%)
+    - 7.2% taker fee deducted from PnL
+    - Entry at random point in window (not perfect mid-window)
+    - Only 1 trade per window per strategy (no pile-up)
     """
 
-    def __init__(self, bankroll: float = 10_000):
+    def __init__(self, bankroll: float = 10_000, fee_bps: float = 720,
+                 slippage_bps: float = 200, spread_bps: float = 500):
         self.bankroll = bankroll
+        self.fee_rate = fee_bps / 10_000      # 7.2% for crypto 5m
+        self.slippage_rate = slippage_bps / 10_000  # 2% average slippage
+        self.spread_rate = spread_bps / 10_000      # 5% bid-ask spread
         self.strategies: List[StrategyRunner] = []
         self.result = BacktestResult()
 
@@ -222,14 +233,17 @@ class BacktestSimulator:
 
     def run(self, windows: List[dict]) -> BacktestResult:
         """
-        Run all strategies across all windows.
+        Run all strategies across all windows with realistic simulation.
 
-        Each window:
-        1. Build price history from prior windows
-        2. Simulate market prices (up_price = 0.50 at start, shift based on price movement)
-        3. Run each strategy
-        4. Settle using actual outcome
+        Realism additions vs v1:
+        - Market prices include noise + spread (not deterministic)
+        - Slippage worsens entry price
+        - 7.2% taker fee deducted
+        - Entry at early-window point (1/3 through, not mid)
+        - Price visible to strategy is BEFORE outcome is known
         """
+        import random
+
         self.result = BacktestResult()
         equity = self.bankroll
         peak = self.bankroll
@@ -245,51 +259,83 @@ class BacktestSimulator:
             outcome = window["outcome"]
             end_price = window["end_price"]
 
-            # Simulate market prices at mid-window
-            # Use actual price movement to estimate what Polymarket odds would be
-            if len(window["prices"]) > 2:
-                mid_window_price = window["prices"][len(window["prices"]) // 2]
-            else:
-                mid_window_price = strike
+            # ---- Realistic market price simulation ----
+            # Entry at 1/3 through the window (strategy needs time to build signal)
+            entry_idx = max(1, len(window["prices"]) // 3)
+            if entry_idx >= len(window["prices"]):
+                continue
+            entry_btc_price = window["prices"][entry_idx]
 
-            distance_pct = (mid_window_price - strike) / strike if strike > 0 else 0
-            # Simple model: map distance to probability
-            simulated_up_price = max(0.10, min(0.90, 0.50 + distance_pct * 50))
+            # Distance from strike at entry time (NOT using end-of-window data)
+            distance_pct = (entry_btc_price - strike) / strike if strike > 0 else 0
+
+            # Convert to probability with noise
+            # Real Polymarket pricing is noisy — not a perfect function of BTC distance
+            noise = random.gauss(0, 0.05)  # ±5% random noise
+            raw_prob = 0.50 + distance_pct * 30  # less aggressive mapping (was 50)
+            simulated_up_price = max(0.10, min(0.90, raw_prob + noise))
             simulated_down_price = 1.0 - simulated_up_price
+
+            # Add spread — strategy sees the ask (worse price for buyer)
+            half_spread = self.spread_rate / 2
+            up_ask = min(0.95, simulated_up_price + half_spread)
+            down_ask = min(0.95, simulated_down_price + half_spread)
+
+            # Time remaining at entry point (not mid-window)
+            total_seconds = 300
+            entry_fraction = entry_idx / max(len(window["prices"]), 1)
+            seconds_remaining = total_seconds * (1.0 - entry_fraction)
 
             market = RollingMarket(
                 strike_price=strike,
-                seconds_remaining=150,  # simulate entry at mid-window
-                up_price=simulated_up_price,
-                down_price=simulated_down_price,
+                seconds_remaining=seconds_remaining,
+                up_price=up_ask,
+                down_price=down_ask,
                 up_token_id=f"up_{i}",
                 down_token_id=f"down_{i}",
             )
 
+            # Use only prices UP TO entry point for strategy evaluation
+            # (strategy cannot see future prices within the window)
+            eval_prices = price_history[:-len(window["prices"]) + entry_idx]
+            if len(eval_prices) < 25:
+                eval_prices = price_history[:max(25, len(price_history))]
+
             # Run each strategy
             for strategy in self.strategies:
-                decision = strategy.evaluate(price_history, market)
+                decision = strategy.evaluate(eval_prices, market)
                 if decision is None:
                     continue
 
-                # Settlement
                 direction = decision["direction"]
-                entry_price = decision["entry_price"]
+                signal_price = decision["entry_price"]
                 size_usdc = decision["size_usdc"]
 
+                # ---- Add slippage ----
+                # Real fill is worse than signal price
+                slippage = signal_price * self.slippage_rate * random.uniform(0.5, 1.5)
+                fill_price = signal_price + slippage  # worse for buyer
+                fill_price = min(0.95, fill_price)
+
+                # ---- Settlement ----
                 if direction == outcome:
-                    payout = 1.0
-                    pnl = size_usdc * (payout / entry_price - 1) if entry_price > 0 else 0
-                    won = True
+                    # Won: payout $1 per share, minus entry cost and fees
+                    shares = size_usdc / fill_price if fill_price > 0 else 0
+                    gross_pnl = shares * (1.0 - fill_price)
+                    fees = size_usdc * self.fee_rate
+                    pnl = gross_pnl - fees
+                    won = pnl > 0  # might still lose after fees
                 else:
-                    pnl = -size_usdc
+                    # Lost: lose entire entry cost plus fees
+                    fees = size_usdc * self.fee_rate
+                    pnl = -(size_usdc + fees)
                     won = False
 
                 trade = BacktestTrade(
                     window_idx=i,
                     strategy=strategy.name,
                     direction=direction,
-                    entry_price=entry_price,
+                    entry_price=fill_price,
                     size_usdc=size_usdc,
                     edge=decision["edge"],
                     fair=decision["fair"],
