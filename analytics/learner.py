@@ -45,6 +45,7 @@ class StrategyHistory:
     avg_sharpe: float = 0.0
     max_drawdown: float = 0.0
     avg_slippage: float = 0.0
+    avg_profit_factor: float = 0.0
     sessions: int = 0
     consecutive_negative_sessions: int = 0
     last_pnl: float = 0.0
@@ -133,6 +134,9 @@ class Learner:
 
             slippage = stats.get("avg_slippage", 0)
             h.avg_slippage = (h.avg_slippage * (h.sessions - 1) + slippage) / h.sessions
+
+            profit_factor = stats.get("profit_factor", 0)
+            h.avg_profit_factor = (h.avg_profit_factor * (h.sessions - 1) + profit_factor) / h.sessions
 
             # Strategy-specific
             if "mm_avg_spread_captured" in stats:
@@ -258,7 +262,7 @@ class Learner:
 
     def _adjust_btc5m(self, h: StrategyHistory, config: SystemConfig):
         """Adjust BTC 5m V2 momentum parameters."""
-        if h.avg_win_rate < 45 and h.total_trades >= 15:
+        if (h.avg_win_rate < 45 or h.avg_profit_factor < 1.0) and h.total_trades >= 15:
             old = config.btc5m_min_edge
             new = min(max(old + 0.02, 0.14), 0.20)
             config.btc5m_min_edge = new
@@ -268,7 +272,7 @@ class Learner:
                 "btc_5m",
             ))
 
-        if h.avg_win_rate > 65 and h.total_trades >= 20:
+        if h.avg_win_rate > 65 and h.avg_profit_factor > 1.20 and h.total_trades >= 50:
             old = config.btc5m_min_edge
             new = max(old - 0.01, 0.08)
             config.btc5m_min_edge = new

@@ -1,41 +1,24 @@
 """
-Backtest Simulator — replays historical data through strategies.
+Backtest Simulator - replays historical BTC 5-minute windows.
 
-Simulates the full lifecycle:
-  1. Feed price history to strategies tick by tick
-  2. Strategies emit signals via skills
-  3. Simulator fills at the signal price (no book depth simulation)
-  4. Settlement at window end using actual historical outcome
-  5. Track PnL, win rate, drawdown
-
-No network calls — everything runs from loaded data.
-
-Usage:
-    from backtest.data_loader import BinanceDataLoader
-    from backtest.simulator import BacktestSimulator
-
-    loader = BinanceDataLoader()
-    klines = loader.load_klines("BTCUSDT", "1m", days=7)
-    windows = loader.klines_to_windows(klines)
-
-    sim = BacktestSimulator(bankroll=10000)
-    sim.add_strategy("momentum")
-    sim.add_strategy("oracle")
-    results = sim.run(windows)
-    sim.print_report()
+The default ``momentum`` path is aligned with ``strategies.v2.momentum``:
+it uses the same probability cap, price band, edge gates, DOWN penalty,
+time gates, and confirmation requirement. ``momentum_legacy`` keeps the
+older skills-based implementation for baseline comparisons.
 """
 
 import logging
 import math
+import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import List, Optional
 
-from skills.price_features import PriceFeatureSkill
-from skills.fair_value import MomentumFairValueSkill, OracleFairValueSkill
 from skills.edge import EdgeSkill
-from skills.risk_gate import RiskGateSkill, RiskGateConfig
+from skills.fair_value import MomentumFairValueSkill, OracleFairValueSkill
+from skills.price_features import PriceFeatureSkill
+from skills.risk_gate import RiskGateConfig, RiskGateSkill
 from skills.sizing import PositionSizerSkill, SizingConfig
-from skills.types import RollingMarket, PriceFeatures
+from skills.types import RollingMarket
 
 log = logging.getLogger(__name__)
 
@@ -49,9 +32,15 @@ class BacktestTrade:
     size_usdc: float
     edge: float
     fair: float
-    outcome: str        # actual: "UP" or "DOWN"
+    outcome: str
     pnl: float = 0.0
     won: bool = False
+    entry_age_seconds: float = 0.0
+    z_score: float = 0.0
+    market_price: float = 0.0
+    fee: float = 0.0
+    slippage: float = 0.0
+    regime: str = "contested"
 
 
 @dataclass
@@ -86,16 +75,23 @@ class BacktestResult:
         return gross_profit / gross_loss if gross_loss > 0 else float("inf")
 
 
-class StrategyRunner:
-    """Runs a single strategy on one window's price data."""
+class LegacyStrategyRunner:
+    """Runs the older skills-based strategies for baseline comparison."""
 
-    def __init__(self, name: str, features: PriceFeatureSkill,
-                 fair_value_skill, edge_skill: EdgeSkill,
-                 risk_gate: RiskGateSkill, risk_config: RiskGateConfig,
-                 sizer: PositionSizerSkill, sizing_config: SizingConfig,
-                 move_threshold_bps: float = 0.0,
-                 staleness_threshold: float = 0.0,
-                 max_notional: float = 500.0):
+    def __init__(
+        self,
+        name: str,
+        features: PriceFeatureSkill,
+        fair_value_skill,
+        edge_skill: EdgeSkill,
+        risk_gate: RiskGateSkill,
+        risk_config: RiskGateConfig,
+        sizer: PositionSizerSkill,
+        sizing_config: SizingConfig,
+        move_threshold_bps: float = 0.0,
+        staleness_threshold: float = 0.0,
+        max_notional: float = 500.0,
+    ):
         self.name = name
         self.features = features
         self.fair_value = fair_value_skill
@@ -109,11 +105,6 @@ class StrategyRunner:
         self.max_notional = max_notional
 
     def evaluate(self, prices: List[float], market: RollingMarket) -> Optional[dict]:
-        """
-        Run the strategy on a window's price data.
-        Returns trade decision dict or None.
-        """
-        # Need enough price history
         if len(prices) < 25:
             return None
 
@@ -121,21 +112,16 @@ class StrategyRunner:
         if pf is None:
             return None
 
-        # Oracle-specific: move filter
-        if self.move_threshold_bps > 0:
-            if abs(pf.move_bps) < self.move_threshold_bps:
-                return None
+        if self.move_threshold_bps > 0 and abs(pf.move_bps) < self.move_threshold_bps:
+            return None
 
         fair = self.fair_value.estimate(pf, market)
         if fair is None:
             return None
 
         edge = self.edge_skill.best_edge(fair, market)
-
-        # Oracle-specific: staleness check
-        if self.staleness_threshold > 0:
-            if edge.edge < self.staleness_threshold:
-                return None
+        if self.staleness_threshold > 0 and edge.edge < self.staleness_threshold:
+            return None
 
         if not self.risk_gate.passes(edge, market, self.risk_config):
             return None
@@ -144,47 +130,268 @@ class StrategyRunner:
         if size_usdc <= 0:
             return None
 
-        size_usdc = min(size_usdc, self.max_notional)
-
         return {
             "direction": edge.direction,
             "entry_price": edge.market_price,
-            "size_usdc": size_usdc,
+            "market_price": edge.market_price,
+            "size_usdc": min(size_usdc, self.max_notional),
             "edge": edge.edge,
             "fair": edge.fair,
+            "z_score": 0.0,
+            "entry_age_seconds": 0.0,
+            "regime": BacktestSimulator.classify_regime(edge.market_price),
         }
+
+
+class V2MomentumBacktestRunner:
+    """Offline equivalent of strategies.v2.momentum.Momentum."""
+
+    name = "momentum"
+
+    def __init__(
+        self,
+        bankroll: float,
+        min_edge: float = 0.14,
+        kelly_frac: float = 0.20,
+        max_bet_pct: float = 0.025,
+        max_notional: float = 500.0,
+        max_price: float = 0.55,
+        min_price: float = 0.40,
+        momentum_window: int = 20,
+        min_mom_vol_ratio: float = 0.8,
+        min_entry_age: float = 20.0,
+        entry_deadline: float = 60.0,
+        min_abs_z: float = 0.15,
+        min_distance_bps: float = 2.0,
+        down_edge_boost: float = 0.08,
+        down_min_abs_z: float = 0.35,
+        fair_cap: float = 0.80,
+        confirmations_required: int = 2,
+        disable_trending: bool = True,
+    ):
+        self.bankroll = bankroll
+        self.min_edge = min_edge
+        self.kelly_frac = kelly_frac
+        self.max_bet_pct = max_bet_pct
+        self.max_notional = max_notional
+        self.max_price = max_price
+        self.min_price = min_price
+        self.momentum_window = momentum_window
+        self.min_mom_vol_ratio = min_mom_vol_ratio
+        self.min_entry_age = min_entry_age
+        self.entry_deadline = entry_deadline
+        self.min_abs_z = min_abs_z
+        self.min_distance_bps = min_distance_bps
+        self.down_edge_boost = down_edge_boost
+        self.down_min_abs_z = down_min_abs_z
+        self.fair_cap = fair_cap
+        self.confirmations_required = max(1, confirmations_required)
+        self.disable_trending = disable_trending
+
+    def evaluate_window(
+        self,
+        window_idx: int,
+        window: dict,
+        history_before_window: List[float],
+        simulator: "BacktestSimulator",
+    ) -> Optional[dict]:
+        prices = window["prices"]
+        if len(prices) < 2:
+            return None
+
+        pending_key = None
+        pending_count = 0
+        total_seconds = 300.0
+        sample_interval = total_seconds / max(len(prices), 1)
+
+        for entry_idx in range(1, len(prices)):
+            entry_age = entry_idx * sample_interval
+            seconds_remaining = max(total_seconds - entry_age, 0.0)
+            if entry_age < self.min_entry_age or seconds_remaining < self.entry_deadline:
+                continue
+
+            eval_prices = history_before_window + prices[: entry_idx + 1]
+            decision = self._evaluate_candidate(
+                eval_prices=eval_prices,
+                strike=window["strike"],
+                seconds_remaining=seconds_remaining,
+                entry_age=entry_age,
+                window_idx=window_idx,
+                simulator=simulator,
+            )
+
+            if decision is None:
+                pending_key = None
+                pending_count = 0
+                continue
+
+            key = (decision["direction"], decision["token_id"])
+            if key == pending_key:
+                pending_count += 1
+            else:
+                pending_key = key
+                pending_count = 1
+
+            if pending_count >= self.confirmations_required:
+                decision["confirmations"] = pending_count
+                return decision
+
+        return None
+
+    def _evaluate_candidate(
+        self,
+        eval_prices: List[float],
+        strike: float,
+        seconds_remaining: float,
+        entry_age: float,
+        window_idx: int,
+        simulator: "BacktestSimulator",
+    ) -> Optional[dict]:
+        if len(eval_prices) < self.momentum_window + 1:
+            return None
+
+        current = eval_prices[-1]
+        if current <= 0 or strike <= 0:
+            return None
+
+        recent = eval_prices[-self.momentum_window :]
+        returns = [
+            (recent[i] - recent[i - 1]) / recent[i - 1]
+            for i in range(1, len(recent))
+            if recent[i - 1] > 0
+        ]
+        vol = max(self._std(returns), 0.00002)
+        momentum = (eval_prices[-1] - eval_prices[-self.momentum_window]) / eval_prices[-self.momentum_window]
+        mom_vol_ratio = abs(momentum) / vol if vol > 0 else 0.0
+
+        sample_interval = 60.0  # backtests generally use 1m candles
+        horizon_ticks = max(seconds_remaining / sample_interval, 1.0)
+        horizon_sigma = current * vol * math.sqrt(horizon_ticks)
+        distance = current - strike
+        z_score = distance / horizon_sigma if horizon_sigma > 0 else 0.0
+        distance_bps = abs(distance) / current * 10_000
+
+        if (
+            mom_vol_ratio < self.min_mom_vol_ratio
+            or abs(z_score) < self.min_abs_z
+            or distance_bps < self.min_distance_bps
+        ):
+            return None
+
+        mom_z = max(-2.0, min(2.0, momentum / vol if vol > 0 else 0.0))
+        adjusted_z = z_score + 0.15 * mom_z
+        fair_prob_up = 0.5 * (1.0 + math.erf(adjusted_z / math.sqrt(2.0)))
+        fair_prob_up = max(1.0 - self.fair_cap, min(self.fair_cap, fair_prob_up))
+
+        up_ask, down_ask = simulator.simulate_asks(strike, current, window_idx, entry_age)
+        if fair_prob_up > 0.52:
+            direction = "UP"
+            fair = fair_prob_up
+            market_price = up_ask
+            token_id = f"up_{window_idx}"
+        elif fair_prob_up < 0.48:
+            direction = "DOWN"
+            fair = 1.0 - fair_prob_up
+            market_price = down_ask
+            token_id = f"down_{window_idx}"
+        else:
+            return None
+
+        if direction == "DOWN" and abs(z_score) < self.down_min_abs_z:
+            return None
+        if market_price > self.max_price or market_price < self.min_price:
+            return None
+
+        required_edge = self.min_edge + (self.down_edge_boost if direction == "DOWN" else 0.0)
+        if market_price >= 0.50:
+            required_edge = max(required_edge, 0.18)
+
+        edge = fair - market_price
+        regime = simulator.classify_regime(market_price)
+        if self.disable_trending and regime == "trending" and not (edge >= 0.20 and market_price <= 0.52):
+            return None
+        if edge < required_edge:
+            return None
+
+        vwap = simulator.estimate_vwap(market_price)
+        if vwap > self.max_price or vwap < self.min_price:
+            return None
+        edge = fair - vwap
+        if edge < required_edge:
+            return None
+
+        # Binary Kelly. This mirrors the live strategy's sizing intent while
+        # keeping the backtest independent from live network-bound state.
+        full_kelly = (fair - vwap) / (1.0 - vwap) if vwap < 1.0 else 0.0
+        size_usdc = self.bankroll * min(max(full_kelly * self.kelly_frac, 0.0), self.max_bet_pct)
+        size_usdc = min(size_usdc, self.max_notional)
+        if size_usdc < 5:
+            return None
+
+        return {
+            "direction": direction,
+            "token_id": token_id,
+            "entry_price": vwap,
+            "market_price": market_price,
+            "size_usdc": size_usdc,
+            "edge": edge,
+            "fair": fair,
+            "z_score": z_score,
+            "entry_age_seconds": entry_age,
+            "regime": regime,
+        }
+
+    @staticmethod
+    def _std(xs: List[float]) -> float:
+        if len(xs) < 2:
+            return 0.0
+        mean = sum(xs) / len(xs)
+        return (sum((x - mean) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5
 
 
 class BacktestSimulator:
     """
     Replays historical BTC 5-minute windows through strategies.
-
-    Realism features:
-    - Market prices simulated with noise + spread (not perfect mapping)
-    - Slippage added to entry price (1-3%)
-    - 7.2% taker fee deducted from PnL
-    - Entry at random point in window (not perfect mid-window)
-    - Only 1 trade per window per strategy (no pile-up)
     """
 
-    def __init__(self, bankroll: float = 10_000, fee_rate: float = 0.07,
-                 slippage_bps: float = 200, spread_bps: float = 500):
+    def __init__(
+        self,
+        bankroll: float = 10_000,
+        fee_rate: float = 0.07,
+        slippage_bps: float = 200,
+        spread_bps: float = 500,
+        seed: int = 42,
+    ):
         self.bankroll = bankroll
-        self.fee_rate_constant = fee_rate     # Polymarket crypto feeRate constant
-        self.slippage_rate = slippage_bps / 10_000  # 2% average slippage
-        self.spread_rate = spread_bps / 10_000      # 5% bid-ask spread
-        self.strategies: List[StrategyRunner] = []
+        self.fee_rate_constant = fee_rate
+        self.slippage_rate = slippage_bps / 10_000
+        self.spread_rate = spread_bps / 10_000
+        self.rng = random.Random(seed)
+        self.strategies: List[object] = []
         self.result = BacktestResult()
 
     def add_strategy(self, name: str, **kwargs):
-        """Add a strategy by name."""
         features = PriceFeatureSkill(lookback_ticks=5, momentum_ticks=20)
         edge_skill = EdgeSkill()
         sizer = PositionSizerSkill()
 
         if name == "momentum":
-            runner = StrategyRunner(
-                name="momentum",
+            runner = V2MomentumBacktestRunner(
+                bankroll=self.bankroll,
+                min_edge=kwargs.get("min_edge", 0.14),
+                kelly_frac=kwargs.get("kelly_frac", 0.20),
+                max_bet_pct=kwargs.get("max_bet_pct", 0.025),
+                max_notional=kwargs.get("max_notional", 500),
+                max_price=kwargs.get("max_price", 0.55),
+                min_price=kwargs.get("min_price", 0.40),
+                down_edge_boost=kwargs.get("down_edge_boost", 0.08),
+                fair_cap=kwargs.get("fair_cap", 0.80),
+                confirmations_required=kwargs.get("confirmations_required", 2),
+                disable_trending=kwargs.get("disable_trending", True),
+            )
+        elif name == "momentum_legacy":
+            runner = LegacyStrategyRunner(
+                name="momentum_legacy",
                 features=features,
                 fair_value_skill=MomentumFairValueSkill(),
                 edge_skill=edge_skill,
@@ -192,6 +399,7 @@ class BacktestSimulator:
                 risk_config=RiskGateConfig(
                     min_edge=kwargs.get("min_edge", 0.03),
                     max_price=kwargs.get("max_price", 0.65),
+                    min_price=kwargs.get("min_price", 0.05),
                     min_seconds_remaining=30,
                 ),
                 sizer=sizer,
@@ -203,7 +411,7 @@ class BacktestSimulator:
                 max_notional=kwargs.get("max_notional", 500),
             )
         elif name == "oracle":
-            runner = StrategyRunner(
+            runner = LegacyStrategyRunner(
                 name="oracle",
                 features=features,
                 fair_value_skill=OracleFairValueSkill(),
@@ -232,144 +440,134 @@ class BacktestSimulator:
         log.info("Backtest: added strategy '%s'", name)
 
     def run(self, windows: List[dict]) -> BacktestResult:
-        """
-        Run all strategies across all windows with realistic simulation.
-
-        Realism additions vs v1:
-        - Market prices include noise + spread (not deterministic)
-        - Slippage worsens entry price
-        - 7.2% taker fee deducted
-        - Entry at early-window point (1/3 through, not mid)
-        - Price visible to strategy is BEFORE outcome is known
-        """
-        import random
-
         self.result = BacktestResult()
         equity = self.bankroll
         peak = self.bankroll
-        price_history = []
+        price_history: List[float] = []
 
         for i, window in enumerate(windows):
-            # Accumulate price history
-            price_history.extend(window["prices"])
-            if len(price_history) > 500:
-                price_history = price_history[-300:]
+            history_before_window = list(price_history)
 
-            strike = window["strike"]
-            outcome = window["outcome"]
-            end_price = window["end_price"]
-
-            # ---- Realistic market price simulation ----
-            # Entry at 1/3 through the window (strategy needs time to build signal)
-            entry_idx = max(1, len(window["prices"]) // 3)
-            if entry_idx >= len(window["prices"]):
-                continue
-            entry_btc_price = window["prices"][entry_idx]
-
-            # Distance from strike at entry time (NOT using end-of-window data)
-            distance_pct = (entry_btc_price - strike) / strike if strike > 0 else 0
-
-            # Convert to probability with noise
-            # Real Polymarket pricing is noisy — not a perfect function of BTC distance
-            noise = random.gauss(0, 0.05)  # ±5% random noise
-            raw_prob = 0.50 + distance_pct * 30  # less aggressive mapping (was 50)
-            simulated_up_price = max(0.10, min(0.90, raw_prob + noise))
-            simulated_down_price = 1.0 - simulated_up_price
-
-            # Add spread — strategy sees the ask (worse price for buyer)
-            half_spread = self.spread_rate / 2
-            up_ask = min(0.95, simulated_up_price + half_spread)
-            down_ask = min(0.95, simulated_down_price + half_spread)
-
-            # Time remaining at entry point (not mid-window)
-            total_seconds = 300
-            entry_fraction = entry_idx / max(len(window["prices"]), 1)
-            seconds_remaining = total_seconds * (1.0 - entry_fraction)
-
-            market = RollingMarket(
-                strike_price=strike,
-                seconds_remaining=seconds_remaining,
-                up_price=up_ask,
-                down_price=down_ask,
-                up_token_id=f"up_{i}",
-                down_token_id=f"down_{i}",
-            )
-
-            # Use only prices UP TO entry point for strategy evaluation
-            # (strategy cannot see future prices within the window)
-            eval_prices = price_history[:-len(window["prices"]) + entry_idx]
-            if len(eval_prices) < 25:
-                eval_prices = price_history[:max(25, len(price_history))]
-
-            # Run each strategy
             for strategy in self.strategies:
-                decision = strategy.evaluate(eval_prices, market)
+                if isinstance(strategy, V2MomentumBacktestRunner):
+                    decision = strategy.evaluate_window(i, window, history_before_window, self)
+                else:
+                    decision = self._evaluate_legacy(strategy, i, window, history_before_window)
+
                 if decision is None:
                     continue
 
-                direction = decision["direction"]
-                signal_price = decision["entry_price"]
-                size_usdc = decision["size_usdc"]
-
-                # ---- Add slippage ----
-                # Real fill is worse than signal price
-                slippage = signal_price * self.slippage_rate * random.uniform(0.5, 1.5)
-                fill_price = signal_price + slippage  # worse for buyer
-                fill_price = min(0.95, fill_price)
-
-                # ---- Settlement with parabolic fee ----
-                # Polymarket fee = shares × feeRate × p × (1-p)
-                # where p = fill_price, feeRate = 0.072 for crypto
-                shares = size_usdc / fill_price if fill_price > 0 else 0
-                fee_per_share = self.fee_rate_constant * fill_price * (1 - fill_price)
-                fees = shares * fee_per_share
-
-                if direction == outcome:
-                    # Won: payout $1 per share, minus entry cost and fees
-                    gross_pnl = shares * (1.0 - fill_price)
-                    pnl = gross_pnl - fees
-                    won = pnl > 0  # might still lose after fees
-                else:
-                    # Lost: lose entire entry cost plus fees
-                    pnl = -(size_usdc + fees)
-                    won = False
-
-                trade = BacktestTrade(
-                    window_idx=i,
-                    strategy=strategy.name,
-                    direction=direction,
-                    entry_price=fill_price,
-                    size_usdc=size_usdc,
-                    edge=decision["edge"],
-                    fair=decision["fair"],
-                    outcome=outcome,
-                    pnl=pnl,
-                    won=won,
-                )
+                trade = self._settle_decision(i, strategy.name, decision, window["outcome"])
                 self.result.trades.append(trade)
 
-                equity += pnl
-                if equity > peak:
-                    peak = equity
-                dd = peak - equity
-                if dd > self.result.max_drawdown:
-                    self.result.max_drawdown = dd
-
-                if won:
+                equity += trade.pnl
+                peak = max(peak, equity)
+                self.result.max_drawdown = max(self.result.max_drawdown, peak - equity)
+                if trade.won:
                     self.result.wins += 1
                 else:
                     self.result.losses += 1
 
+            price_history.extend(window["prices"])
+            if len(price_history) > 500:
+                price_history = price_history[-300:]
             self.result.equity_curve.append(equity)
 
         self.result.total_pnl = equity - self.bankroll
         self.result.peak_equity = peak
-
         log.info("Backtest complete: %d windows, %d trades", len(windows), len(self.result.trades))
         return self.result
 
+    def _evaluate_legacy(
+        self,
+        strategy: LegacyStrategyRunner,
+        window_idx: int,
+        window: dict,
+        history_before_window: List[float],
+    ) -> Optional[dict]:
+        prices = window["prices"]
+        entry_idx = max(1, len(prices) // 3)
+        if entry_idx >= len(prices):
+            return None
+        current = prices[entry_idx]
+        up_ask, down_ask = self.simulate_asks(window["strike"], current, window_idx, entry_idx * 60.0)
+        seconds_remaining = 300.0 * (1.0 - entry_idx / max(len(prices), 1))
+        market = RollingMarket(
+            strike_price=window["strike"],
+            seconds_remaining=seconds_remaining,
+            up_price=up_ask,
+            down_price=down_ask,
+            up_token_id=f"up_{window_idx}",
+            down_token_id=f"down_{window_idx}",
+        )
+        eval_prices = history_before_window + prices[: entry_idx + 1]
+        return strategy.evaluate(eval_prices, market)
+
+    def _settle_decision(
+        self,
+        window_idx: int,
+        strategy_name: str,
+        decision: dict,
+        outcome: str,
+    ) -> BacktestTrade:
+        signal_price = decision["entry_price"]
+        slippage = signal_price * self.slippage_rate * self.rng.uniform(0.5, 1.5)
+        fill_price = min(0.95, signal_price + slippage)
+        size_usdc = decision["size_usdc"]
+
+        shares = size_usdc / fill_price if fill_price > 0 else 0.0
+        fee_per_share = self.fee_rate_constant * fill_price * (1.0 - fill_price)
+        fees = shares * fee_per_share
+
+        if decision["direction"] == outcome:
+            pnl = shares * (1.0 - fill_price) - fees
+            won = pnl > 0
+        else:
+            pnl = -(size_usdc + fees)
+            won = False
+
+        return BacktestTrade(
+            window_idx=window_idx,
+            strategy=strategy_name,
+            direction=decision["direction"],
+            entry_price=fill_price,
+            size_usdc=size_usdc,
+            edge=decision["edge"],
+            fair=decision["fair"],
+            outcome=outcome,
+            pnl=pnl,
+            won=won,
+            entry_age_seconds=decision.get("entry_age_seconds", 0.0),
+            z_score=decision.get("z_score", 0.0),
+            market_price=decision.get("market_price", signal_price),
+            fee=fees,
+            slippage=slippage,
+            regime=decision.get("regime", self.classify_regime(decision.get("market_price", signal_price))),
+        )
+
+    def simulate_asks(self, strike: float, current: float, window_idx: int, entry_age: float) -> tuple[float, float]:
+        distance_pct = (current - strike) / strike if strike > 0 else 0.0
+        # Stable per candidate so confirmation checks are not just noise flips.
+        rng = random.Random((window_idx + 1) * 1_000_003 + int(entry_age))
+        noise = rng.gauss(0, 0.05)
+        raw_prob = 0.50 + distance_pct * 30
+        simulated_up_price = max(0.10, min(0.90, raw_prob + noise))
+        simulated_down_price = 1.0 - simulated_up_price
+        half_spread = self.spread_rate / 2
+        return min(0.95, simulated_up_price + half_spread), min(0.95, simulated_down_price + half_spread)
+
+    def estimate_vwap(self, ask_price: float) -> float:
+        return min(0.95, ask_price * (1.0 + self.slippage_rate * 0.5))
+
+    @staticmethod
+    def classify_regime(price: float) -> str:
+        if price <= 0.15 or price >= 0.85:
+            return "tail"
+        if 0.35 <= price <= 0.65:
+            return "contested"
+        return "trending"
+
     def print_report(self):
-        """Print backtest results."""
         r = self.result
         trades = r.trades
         total = r.wins + r.losses
@@ -380,6 +578,7 @@ class BacktestSimulator:
         print("=" * 60)
         print(f"  Windows processed: {len(r.equity_curve)}")
         print(f"  Total trades:      {total}")
+        print(f"  Trade rate:        {total / max(len(r.equity_curve), 1) * 100:.1f}%")
         print(f"  Wins:              {r.wins}")
         print(f"  Losses:            {r.losses}")
         print(f"  Win rate:          {r.win_rate:.1f}%")
@@ -391,30 +590,63 @@ class BacktestSimulator:
         if trades:
             avg_win = sum(t.pnl for t in trades if t.won) / max(r.wins, 1)
             avg_loss = sum(t.pnl for t in trades if not t.won) / max(r.losses, 1)
+            req_wr = abs(avg_loss) / (avg_win + abs(avg_loss)) * 100 if avg_win > 0 else 100
             print(f"  Avg win:           ${avg_win:.2f}")
             print(f"  Avg loss:          ${avg_loss:.2f}")
+            print(f"  Required WR:       {req_wr:.1f}%")
 
-        # Per strategy breakdown
-        strat_names = set(t.strategy for t in trades)
-        if len(strat_names) > 1:
-            print()
-            print("  Per-Strategy:")
-            for name in sorted(strat_names):
-                st = [t for t in trades if t.strategy == name]
-                sw = sum(1 for t in st if t.won)
-                sl = len(st) - sw
-                spnl = sum(t.pnl for t in st)
-                swr = sw / len(st) * 100 if st else 0
-                print(f"    {name:15s}: {len(st)} trades, {swr:.0f}% WR, ${spnl:.2f} PnL")
-
-        # Direction breakdown
-        up_trades = [t for t in trades if t.direction == "UP"]
-        down_trades = [t for t in trades if t.direction == "DOWN"]
-        if up_trades or down_trades:
-            print()
-            up_wr = sum(1 for t in up_trades if t.won) / max(len(up_trades), 1) * 100
-            down_wr = sum(1 for t in down_trades if t.won) / max(len(down_trades), 1) * 100
-            print(f"  UP trades:   {len(up_trades)}, {up_wr:.0f}% WR")
-            print(f"  DOWN trades: {len(down_trades)}, {down_wr:.0f}% WR")
-
+        self._print_breakdown("Per-Strategy", trades, lambda t: t.strategy)
+        self._print_breakdown("Direction", trades, lambda t: t.direction)
+        self._print_breakdown("Regime", trades, lambda t: t.regime)
+        self._print_breakdown("Market price bucket", trades, lambda t: self._price_bucket(t.market_price))
+        self._print_breakdown("Fill price bucket", trades, lambda t: self._price_bucket(t.entry_price))
+        self._print_breakdown("Edge bucket", trades, lambda t: self._edge_bucket(t.edge))
+        self._print_breakdown("Entry age bucket", trades, lambda t: self._age_bucket(t.entry_age_seconds))
         print("=" * 60)
+
+    def _print_breakdown(self, title: str, trades: List[BacktestTrade], key_fn):
+        buckets = {}
+        for t in trades:
+            buckets.setdefault(key_fn(t), []).append(t)
+        if not buckets:
+            return
+        print()
+        print(f"  {title}:")
+        for key in sorted(buckets):
+            group = buckets[key]
+            wins = sum(1 for t in group if t.won)
+            pnl = sum(t.pnl for t in group)
+            wr = wins / len(group) * 100
+            print(f"    {str(key):15s}: {len(group):4d} trades, {wr:5.1f}% WR, ${pnl:9.2f}")
+
+    @staticmethod
+    def _price_bucket(price: float) -> str:
+        if price < 0.40:
+            return "<0.40"
+        if price < 0.45:
+            return "0.40-0.45"
+        if price < 0.50:
+            return "0.45-0.50"
+        if price <= 0.55:
+            return "0.50-0.55"
+        return ">0.55"
+
+    @staticmethod
+    def _edge_bucket(edge: float) -> str:
+        if edge < 0.14:
+            return "<0.14"
+        if edge < 0.18:
+            return "0.14-0.18"
+        if edge < 0.25:
+            return "0.18-0.25"
+        return ">=0.25"
+
+    @staticmethod
+    def _age_bucket(age: float) -> str:
+        if age < 60:
+            return "<60s"
+        if age < 120:
+            return "60-120s"
+        if age < 180:
+            return "120-180s"
+        return ">=180s"

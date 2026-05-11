@@ -96,7 +96,7 @@ class SystemConfig:
     dry_run: bool = True
     no_learn: bool = False
     heartbeat_interval: float = 5.0
-    btc5m_min_edge: float = 0.12
+    btc5m_min_edge: float = 0.14
     btc5m_max_price: float = 0.55
     btc5m_min_price: float = 0.40
     btc5m_down_edge_boost: float = 0.08

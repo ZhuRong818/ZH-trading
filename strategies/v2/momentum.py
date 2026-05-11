@@ -32,7 +32,7 @@ class Momentum(BaseStrategy):
     def __init__(
         self,
         asset: str = "btc",
-        min_edge: float = 0.12,
+        min_edge: float = 0.14,
         kelly_frac: float = 0.20,
         max_bet_pct: float = 0.025,
         bankroll: float = 5_000,
@@ -46,7 +46,7 @@ class Momentum(BaseStrategy):
         min_distance_bps: float = 2.0,
         max_vwap_slippage: float = 0.02,
         down_edge_boost: float = 0.08,
-        down_min_abs_z: float = 0.25,
+        down_min_abs_z: float = 0.35,
         fair_cap: float = 0.80,
         confirmations_required: int = 2,
     ):
