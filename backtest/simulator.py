@@ -167,7 +167,7 @@ class BacktestSimulator:
     - Only 1 trade per window per strategy (no pile-up)
     """
 
-    def __init__(self, bankroll: float = 10_000, fee_rate: float = 0.072,
+    def __init__(self, bankroll: float = 10_000, fee_rate: float = 0.07,
                  slippage_bps: float = 200, spread_bps: float = 500):
         self.bankroll = bankroll
         self.fee_rate_constant = fee_rate     # Polymarket crypto feeRate constant

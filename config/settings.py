@@ -20,7 +20,7 @@ class FeeConfig:
     maker_fee_bps: float = 0.0          # Polymarket maker fee (always 0)
     # Taker fee uses parabolic formula: fee = shares × feeRate × p × (1-p)
     # feeRate varies by category:
-    crypto_fee_rate: float = 0.072      # crypto markets (max 1.80% at p=0.50)
+    crypto_fee_rate: float = 0.07       # crypto markets (max $1.75 per 100 shares at p=0.50)
     politics_fee_rate: float = 0.04     # politics/tech/finance
     sports_fee_rate: float = 0.03       # sports
     geopolitics_fee_rate: float = 0.0   # geopolitics (free)
