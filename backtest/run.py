@@ -33,10 +33,10 @@ def main():
     # Strategy params
     parser.add_argument("--min-edge", type=float, default=0.03,
                         help="Momentum min edge (default: 0.03)")
-    parser.add_argument("--move-bps", type=float, default=2.0,
-                        help="Oracle move threshold bps (default: 2.0)")
-    parser.add_argument("--staleness", type=float, default=0.01,
-                        help="Oracle staleness threshold (default: 0.01)")
+    parser.add_argument("--move-bps", type=float, default=6.0,
+                        help="Oracle move threshold bps (default: 6.0)")
+    parser.add_argument("--staleness", type=float, default=0.15,
+                        help="Oracle staleness threshold (default: 0.15)")
     parser.add_argument("--max-notional", type=float, default=500,
                         help="Max notional per trade (default: 500)")
     parser.add_argument("--max-price", type=float, default=0.55,
