@@ -1,10 +1,11 @@
 """
-Live Data Recorder — records real-time BTC/ETH price + Polymarket book data
+Live Data Recorder — records real-time BTC/ETH/SOL/XRP price + Polymarket data
 for future backtesting with real data.
 
 Saves every 1 second:
-- BTC/ETH price from Binance
-- Polymarket UP/DOWN token best_bid, best_ask, mid from CLOB API
+- Asset price from Binance
+- Polymarket UP/DOWN token prices from CLOB /midpoint and /price endpoints
+- Book depth from CLOB /book (top 5 levels)
 - Window metadata (slug, strike, tokens)
 
 Output: JSONL files in data/ directory, one per day.
@@ -86,9 +87,9 @@ class LiveRecorder:
             if price is None:
                 continue
 
-            # Fetch Polymarket book for UP and DOWN tokens
-            up_book = self._fetch_book(window["up_token"])
-            down_book = self._fetch_book(window["down_token"])
+            # Fetch real Polymarket prices for UP and DOWN tokens
+            up_data = self._fetch_token_data(window["up_token"])
+            down_data = self._fetch_token_data(window["down_token"])
 
             record = {
                 "ts": round(now, 3),
@@ -96,21 +97,21 @@ class LiveRecorder:
                 "asset": asset,
                 "slug": window["slug"],
                 "strike": window["strike"],
-                "btc_price": price,
+                "price": price,
                 "up_token": window["up_token"][:20],
-                "up_best_bid": up_book.get("best_bid", 0),
-                "up_best_ask": up_book.get("best_ask", 0),
-                "up_mid": up_book.get("mid", 0),
-                "up_spread": up_book.get("spread", 0),
-                "up_bid_depth": up_book.get("bid_depth", 0),
-                "up_ask_depth": up_book.get("ask_depth", 0),
+                "up_mid": up_data.get("mid", 0),
+                "up_buy": up_data.get("buy", 0),
+                "up_sell": up_data.get("sell", 0),
+                "up_spread": up_data.get("spread", 0),
+                "up_bid_depth": up_data.get("bid_depth", 0),
+                "up_ask_depth": up_data.get("ask_depth", 0),
                 "down_token": window["down_token"][:20],
-                "down_best_bid": down_book.get("best_bid", 0),
-                "down_best_ask": down_book.get("best_ask", 0),
-                "down_mid": down_book.get("mid", 0),
-                "down_spread": down_book.get("spread", 0),
-                "down_bid_depth": down_book.get("bid_depth", 0),
-                "down_ask_depth": down_book.get("ask_depth", 0),
+                "down_mid": down_data.get("mid", 0),
+                "down_buy": down_data.get("buy", 0),
+                "down_sell": down_data.get("sell", 0),
+                "down_spread": down_data.get("spread", 0),
+                "down_bid_depth": down_data.get("bid_depth", 0),
+                "down_ask_depth": down_data.get("ask_depth", 0),
                 "window_end_ts": window["end_ts"],
                 "seconds_remaining": max(0, window["end_ts"] - now),
             }
@@ -121,10 +122,10 @@ class LiveRecorder:
             if self._tick_count % 60 == 0:
                 remaining = max(0, window["end_ts"] - now)
                 log.info(
-                    "[%s] tick=%d price=$%.2f up=%.3f/%.3f down=%.3f/%.3f remain=%.0fs",
+                    "[%s] tick=%d price=$%.2f up_mid=%.3f(%.3f/%.3f) down_mid=%.3f(%.3f/%.3f) remain=%.0fs",
                     asset, self._tick_count, price,
-                    up_book.get("best_bid", 0), up_book.get("best_ask", 0),
-                    down_book.get("best_bid", 0), down_book.get("best_ask", 0),
+                    up_data.get("mid", 0), up_data.get("buy", 0), up_data.get("sell", 0),
+                    down_data.get("mid", 0), down_data.get("buy", 0), down_data.get("sell", 0),
                     remaining,
                 )
 
@@ -190,38 +191,68 @@ class LiveRecorder:
         except Exception:
             return None
 
-    def _fetch_book(self, token_id: str) -> dict:
+    def _fetch_token_data(self, token_id: str) -> dict:
+        """Fetch real prices from CLOB /midpoint + /price + /book endpoints."""
+        result = {}
+
+        # 1. Midpoint — the real mid price
+        try:
+            resp = self.session.get(
+                f"{CLOB_BASE}/midpoint",
+                params={"token_id": token_id},
+                timeout=3,
+            )
+            if resp.status_code == 200:
+                result["mid"] = float(resp.json().get("mid", 0))
+        except Exception:
+            pass
+
+        # 2. Buy/sell prices — what you'd actually pay/receive
+        try:
+            resp = self.session.get(
+                f"{CLOB_BASE}/price",
+                params={"token_id": token_id, "side": "buy"},
+                timeout=3,
+            )
+            if resp.status_code == 200:
+                result["buy"] = float(resp.json().get("price", 0))
+        except Exception:
+            pass
+
+        try:
+            resp = self.session.get(
+                f"{CLOB_BASE}/price",
+                params={"token_id": token_id, "side": "sell"},
+                timeout=3,
+            )
+            if resp.status_code == 200:
+                result["sell"] = float(resp.json().get("price", 0))
+        except Exception:
+            pass
+
+        # Compute spread: sell (best ask) - buy (best bid)
+        buy = result.get("buy", 0)
+        sell = result.get("sell", 0)
+        if buy and sell:
+            result["spread"] = sell - buy
+
+        # 3. Book depth (top 5 levels)
         try:
             resp = self.session.get(
                 f"{CLOB_BASE}/book",
                 params={"token_id": token_id},
                 timeout=3,
             )
-            if resp.status_code != 200:
-                return {}
-
-            data = resp.json()
-            bids = data.get("bids", [])
-            asks = data.get("asks", [])
-
-            best_bid = float(bids[0]["price"]) if bids else 0
-            best_ask = float(asks[0]["price"]) if asks else 0
-            mid = (best_bid + best_ask) / 2 if best_bid and best_ask else 0
-            spread = best_ask - best_bid if best_bid and best_ask else 0
-
-            bid_depth = sum(float(b["size"]) for b in bids[:5])
-            ask_depth = sum(float(a["size"]) for a in asks[:5])
-
-            return {
-                "best_bid": best_bid,
-                "best_ask": best_ask,
-                "mid": mid,
-                "spread": spread,
-                "bid_depth": bid_depth,
-                "ask_depth": ask_depth,
-            }
+            if resp.status_code == 200:
+                data = resp.json()
+                bids = data.get("bids", [])
+                asks = data.get("asks", [])
+                result["bid_depth"] = sum(float(b["size"]) for b in bids[:5])
+                result["ask_depth"] = sum(float(a["size"]) for a in asks[:5])
         except Exception:
-            return {}
+            pass
+
+        return result
 
     def _write_record(self, record: dict):
         today = datetime.now().strftime("%Y-%m-%d")
