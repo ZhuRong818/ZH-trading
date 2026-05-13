@@ -2,7 +2,10 @@
 Live Data Recorder — records real-time BTC/ETH/SOL/XRP price + Polymarket data
 for future backtesting with real data.
 
-Saves every 1 second:
+All API calls are async (aiohttp) so each tick fetches all data in parallel,
+achieving sub-second tick rates even with 9 API calls per asset.
+
+Saves every tick:
 - Asset price from Binance
 - Polymarket UP/DOWN token prices from CLOB /midpoint and /price endpoints
 - Book depth from CLOB /book (top 5 levels)
@@ -13,10 +16,11 @@ Output: JSONL files in data/ directory, one per day.
 Usage:
     python -m backtest.recorder                          # BTC only
     python -m backtest.recorder --assets btc,eth         # BTC + ETH
-    python -m backtest.recorder --interval 0.5           # 500ms polling
+    python -m backtest.recorder --assets btc,eth,sol,xrp --interval 0.1
     caffeinate -i python -m backtest.recorder             # keep Mac awake
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -26,7 +30,7 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
-import requests
+import aiohttp
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -44,52 +48,72 @@ class LiveRecorder:
         self.interval = interval
         self.data_dir = data_dir
         os.makedirs(data_dir, exist_ok=True)
-        self.session = requests.Session()
         self.running = False
 
         # Current window state per asset
-        self._windows: Dict[str, dict] = {}  # asset -> {slug, up_token, down_token, strike, end_ts}
+        self._windows: Dict[str, dict] = {}
         self._file = None
         self._current_date = None
         self._tick_count = 0
 
-    def run(self):
+    async def run(self):
         self.running = True
-        log.info("Recording started: assets=%s interval=%.1fs", self.assets, self.interval)
+        log.info("Recording started (async): assets=%s interval=%.2fs", self.assets, self.interval)
 
-        while self.running:
-            try:
-                self._tick()
-                time.sleep(self.interval)
-            except KeyboardInterrupt:
-                break
-            except Exception as e:
-                log.warning("Tick error: %s", e)
-                time.sleep(1)
+        async with aiohttp.ClientSession() as session:
+            self._session = session
+            while self.running:
+                try:
+                    t0 = time.time()
+                    await self._tick()
+                    elapsed = time.time() - t0
+                    sleep_time = max(0, self.interval - elapsed)
+                    if sleep_time > 0:
+                        await asyncio.sleep(sleep_time)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    log.warning("Tick error: %s", e)
+                    await asyncio.sleep(1)
 
         self._close_file()
         log.info("Recording stopped. %d ticks saved.", self._tick_count)
 
-    def _tick(self):
-        """Record one data point for all assets."""
+    async def _tick(self):
+        """Record one data point for all assets in parallel."""
         now = time.time()
         ts_iso = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
 
+        # Ensure windows for all assets (sequential, only on window change)
         for asset in self.assets:
-            # Check/discover current window
-            self._ensure_window(asset)
-            window = self._windows.get(asset)
-            if not window:
-                continue
+            await self._ensure_window(asset)
 
-            # Fetch BTC/ETH price
-            price = self._fetch_price(asset)
-            if price is None:
-                continue
+        # Build list of assets with valid windows
+        active = [(a, self._windows[a]) for a in self.assets if a in self._windows]
+        if not active:
+            return
 
-            # Fetch real Polymarket prices for UP and DOWN tokens
-            up_data = self._fetch_token_data(window["up_token"])
-            down_data = self._fetch_token_data(window["down_token"])
+        # Fetch ALL data in parallel: price + up_data + down_data for each asset
+        tasks = []
+        for asset, window in active:
+            tasks.append(self._fetch_price(asset))
+            tasks.append(self._fetch_token_data(window["up_token"]))
+            tasks.append(self._fetch_token_data(window["down_token"]))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Process results (3 per asset: price, up_data, down_data)
+        for i, (asset, window) in enumerate(active):
+            price = results[i * 3]
+            up_data = results[i * 3 + 1]
+            down_data = results[i * 3 + 2]
+
+            if isinstance(price, Exception) or price is None:
+                continue
+            if isinstance(up_data, Exception):
+                up_data = {}
+            if isinstance(down_data, Exception):
+                down_data = {}
 
             record = {
                 "ts": round(now, 3),
@@ -129,26 +153,31 @@ class LiveRecorder:
                     remaining,
                 )
 
-    def _ensure_window(self, asset: str):
+    async def _ensure_window(self, asset: str):
         """Discover or refresh the current 5m window."""
         now = int(time.time())
         window_ts = now - (now % 300)
         current = self._windows.get(asset)
 
         if current and current.get("window_ts") == window_ts:
-            return  # same window
+            return
 
         slug = f"{asset}-updown-5m-{window_ts}"
         try:
-            resp = self.session.get(f"{GAMMA_BASE}/events/slug/{slug}", timeout=5)
-            if resp.status_code != 200:
-                # Try next window
-                slug = f"{asset}-updown-5m-{window_ts + 300}"
-                resp = self.session.get(f"{GAMMA_BASE}/events/slug/{slug}", timeout=5)
-                if resp.status_code != 200:
-                    return
+            async with self._session.get(
+                f"{GAMMA_BASE}/events/slug/{slug}", timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status != 200:
+                    slug = f"{asset}-updown-5m-{window_ts + 300}"
+                    async with self._session.get(
+                        f"{GAMMA_BASE}/events/slug/{slug}", timeout=aiohttp.ClientTimeout(total=5)
+                    ) as resp2:
+                        if resp2.status != 200:
+                            return
+                        event = await resp2.json()
+                else:
+                    event = await resp.json()
 
-            event = resp.json()
             markets = event.get("markets", [])
             if not markets:
                 return
@@ -166,8 +195,7 @@ class LiveRecorder:
             except (ValueError, TypeError):
                 end_ts = window_ts + 300
 
-            # Get strike from current price
-            price = self._fetch_price(asset)
+            price = await self._fetch_price(asset)
             strike = price or 0
 
             self._windows[asset] = {
@@ -183,74 +211,81 @@ class LiveRecorder:
         except Exception as e:
             log.warning("Window discovery failed for %s: %s", asset, e)
 
-    def _fetch_price(self, asset: str) -> Optional[float]:
+    async def _fetch_price(self, asset: str) -> Optional[float]:
         try:
-            symbol = f"{asset.upper()}USDT"
-            resp = self.session.get(BINANCE_TICKER, params={"symbol": symbol}, timeout=3)
-            return float(resp.json()["price"])
+            async with self._session.get(
+                BINANCE_TICKER,
+                params={"symbol": f"{asset.upper()}USDT"},
+                timeout=aiohttp.ClientTimeout(total=3),
+            ) as resp:
+                data = await resp.json()
+                return float(data["price"])
         except Exception:
             return None
 
-    def _fetch_token_data(self, token_id: str) -> dict:
-        """Fetch real prices from CLOB /midpoint + /price + /book endpoints."""
-        result = {}
+    async def _fetch_token_data(self, token_id: str) -> dict:
+        """Fetch midpoint + buy/sell prices + book depth in parallel."""
+        timeout = aiohttp.ClientTimeout(total=3)
 
-        # 1. Midpoint — the real mid price
-        try:
-            resp = self.session.get(
-                f"{CLOB_BASE}/midpoint",
-                params={"token_id": token_id},
-                timeout=3,
-            )
-            if resp.status_code == 200:
-                result["mid"] = float(resp.json().get("mid", 0))
-        except Exception:
-            pass
+        async def get_midpoint():
+            try:
+                async with self._session.get(
+                    f"{CLOB_BASE}/midpoint",
+                    params={"token_id": token_id},
+                    timeout=timeout,
+                ) as resp:
+                    if resp.status == 200:
+                        return float((await resp.json()).get("mid", 0))
+            except Exception:
+                pass
+            return 0
 
-        # 2. Buy/sell prices — what you'd actually pay/receive
-        try:
-            resp = self.session.get(
-                f"{CLOB_BASE}/price",
-                params={"token_id": token_id, "side": "buy"},
-                timeout=3,
-            )
-            if resp.status_code == 200:
-                result["buy"] = float(resp.json().get("price", 0))
-        except Exception:
-            pass
+        async def get_price(side):
+            try:
+                async with self._session.get(
+                    f"{CLOB_BASE}/price",
+                    params={"token_id": token_id, "side": side},
+                    timeout=timeout,
+                ) as resp:
+                    if resp.status == 200:
+                        return float((await resp.json()).get("price", 0))
+            except Exception:
+                pass
+            return 0
 
-        try:
-            resp = self.session.get(
-                f"{CLOB_BASE}/price",
-                params={"token_id": token_id, "side": "sell"},
-                timeout=3,
-            )
-            if resp.status_code == 200:
-                result["sell"] = float(resp.json().get("price", 0))
-        except Exception:
-            pass
+        async def get_book_depth():
+            try:
+                async with self._session.get(
+                    f"{CLOB_BASE}/book",
+                    params={"token_id": token_id},
+                    timeout=timeout,
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        bids = data.get("bids", [])
+                        asks = data.get("asks", [])
+                        return (
+                            sum(float(b["size"]) for b in bids[:5]),
+                            sum(float(a["size"]) for a in asks[:5]),
+                        )
+            except Exception:
+                pass
+            return (0, 0)
 
-        # Compute spread: sell (best ask) - buy (best bid)
-        buy = result.get("buy", 0)
-        sell = result.get("sell", 0)
+        # All 4 calls in parallel
+        mid, buy, sell, (bid_depth, ask_depth) = await asyncio.gather(
+            get_midpoint(), get_price("buy"), get_price("sell"), get_book_depth()
+        )
+
+        result = {
+            "mid": mid,
+            "buy": buy,
+            "sell": sell,
+            "bid_depth": bid_depth,
+            "ask_depth": ask_depth,
+        }
         if buy and sell:
             result["spread"] = sell - buy
-
-        # 3. Book depth (top 5 levels)
-        try:
-            resp = self.session.get(
-                f"{CLOB_BASE}/book",
-                params={"token_id": token_id},
-                timeout=3,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                bids = data.get("bids", [])
-                asks = data.get("asks", [])
-                result["bid_depth"] = sum(float(b["size"]) for b in bids[:5])
-                result["ask_depth"] = sum(float(a["size"]) for a in asks[:5])
-        except Exception:
-            pass
 
         return result
 
@@ -277,7 +312,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Record live Polymarket + Binance data")
     parser.add_argument("--assets", type=str, default="btc",
-                        help="Assets to record: btc, eth, or btc,eth")
+                        help="Assets to record: btc, eth, or btc,eth,sol,xrp")
     parser.add_argument("--interval", type=float, default=1.0,
                         help="Seconds between ticks (default: 1.0)")
     parser.add_argument("--data-dir", type=str, default="data",
@@ -292,8 +327,14 @@ def main():
 
     assets = [a.strip() for a in args.assets.split(",")]
     recorder = LiveRecorder(assets=assets, interval=args.interval, data_dir=args.data_dir)
-    signal.signal(signal.SIGINT, lambda *_: setattr(recorder, 'running', False))
-    recorder.run()
+
+    loop = asyncio.new_event_loop()
+    loop.add_signal_handler(signal.SIGINT, lambda: setattr(recorder, 'running', False))
+    loop.add_signal_handler(signal.SIGTERM, lambda: setattr(recorder, 'running', False))
+    try:
+        loop.run_until_complete(recorder.run())
+    finally:
+        loop.close()
 
 
 if __name__ == "__main__":
