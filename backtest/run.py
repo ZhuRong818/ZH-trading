@@ -35,8 +35,8 @@ def main():
                         help="Kline interval: 1m, 5m (default: 1m)")
 
     # Strategy params
-    parser.add_argument("--min-edge", type=float, default=0.03,
-                        help="Momentum min edge (default: 0.03)")
+    parser.add_argument("--min-edge", type=float, default=defaults.btc5m_min_edge,
+                        help=f"Momentum min edge (default: {defaults.btc5m_min_edge})")
     parser.add_argument("--move-bps", type=float, default=2.0,
                         help="Oracle move threshold bps (default: 2.0)")
     parser.add_argument("--staleness", type=float, default=0.01,
@@ -49,10 +49,22 @@ def main():
                         help=f"Min entry price (default: {defaults.btc5m_min_price})")
     parser.add_argument("--down-edge-boost", type=float, default=defaults.btc5m_down_edge_boost,
                         help=f"Extra DOWN min edge (default: {defaults.btc5m_down_edge_boost})")
-    parser.add_argument("--fair-cap", type=float, default=0.80,
-                        help="Fair probability cap for V2 momentum (default: 0.80)")
-    parser.add_argument("--confirmations", type=int, default=2,
-                        help="Consecutive same-side confirmations for V2 momentum (default: 2)")
+    parser.add_argument("--min-entry-age", type=float, default=defaults.btc5m_min_entry_age,
+                        help=f"Earliest entry age in seconds (default: {defaults.btc5m_min_entry_age})")
+    parser.add_argument("--entry-deadline", type=float, default=defaults.btc5m_entry_deadline,
+                        help=f"Minimum seconds remaining to allow entry (default: {defaults.btc5m_entry_deadline})")
+    parser.add_argument("--min-abs-z", type=float, default=defaults.btc5m_min_abs_z,
+                        help=f"Minimum absolute strike-distance z-score (default: {defaults.btc5m_min_abs_z})")
+    parser.add_argument("--down-min-abs-z", type=float, default=defaults.btc5m_down_min_abs_z,
+                        help=f"Minimum DOWN absolute z-score (default: {defaults.btc5m_down_min_abs_z})")
+    parser.add_argument("--min-mom-vol-ratio", type=float, default=defaults.btc5m_min_mom_vol_ratio,
+                        help=f"Minimum momentum/vol ratio (default: {defaults.btc5m_min_mom_vol_ratio})")
+    parser.add_argument("--max-vwap-slippage", type=float, default=defaults.btc5m_max_vwap_slippage,
+                        help=f"Maximum VWAP slippage vs ask (default: {defaults.btc5m_max_vwap_slippage})")
+    parser.add_argument("--fair-cap", type=float, default=defaults.btc5m_fair_cap,
+                        help=f"Fair probability cap for V2 momentum (default: {defaults.btc5m_fair_cap})")
+    parser.add_argument("--confirmations", type=int, default=defaults.btc5m_confirmations_required,
+                        help=f"Consecutive same-side confirmations for V2 momentum (default: {defaults.btc5m_confirmations_required})")
     parser.add_argument("--disable-trending", action=argparse.BooleanOptionalAction, default=True,
                         help="Filter trending regime unless edge/price are exceptional (default: enabled)")
 
@@ -77,12 +89,14 @@ def main():
         pm_loader = PolymarketHistoricalLoader()
         windows = pm_loader.load_windows(hours=hours)
         print(f"Loaded {len(windows)} windows with real Polymarket prices")
+        print("Price source: real_history")
     else:
         print(f"Loading {args.days} days of {args.interval} BTC data from Binance (simulated Polymarket prices)...")
         loader = BinanceDataLoader()
         klines = loader.load_klines("BTCUSDT", args.interval, days=args.days)
         windows = loader.klines_to_windows(klines)
         print(f"Created {len(windows)} 5-minute windows (simulated prices)")
+        print("Price source: synthetic_quotes")
 
     # Setup simulator
     sim = BacktestSimulator(bankroll=args.bankroll)
@@ -95,6 +109,12 @@ def main():
                 min_edge=args.min_edge,
                 max_price=args.max_price,
                 min_price=args.min_price,
+                min_entry_age=args.min_entry_age,
+                entry_deadline=args.entry_deadline,
+                min_abs_z=args.min_abs_z,
+                down_min_abs_z=args.down_min_abs_z,
+                min_mom_vol_ratio=args.min_mom_vol_ratio,
+                max_vwap_slippage=args.max_vwap_slippage,
                 down_edge_boost=args.down_edge_boost,
                 fair_cap=args.fair_cap,
                 confirmations_required=args.confirmations,

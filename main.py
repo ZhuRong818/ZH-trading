@@ -315,6 +315,14 @@ class TradingSystem:
                 min_edge=self.config.btc5m_min_edge,
                 max_price=self.config.btc5m_max_price,
                 min_price=self.config.btc5m_min_price,
+                min_entry_age=self.config.btc5m_min_entry_age,
+                entry_deadline=self.config.btc5m_entry_deadline,
+                min_abs_z=self.config.btc5m_min_abs_z,
+                down_min_abs_z=self.config.btc5m_down_min_abs_z,
+                min_mom_vol_ratio=self.config.btc5m_min_mom_vol_ratio,
+                fair_cap=self.config.btc5m_fair_cap,
+                confirmations_required=self.config.btc5m_confirmations_required,
+                max_vwap_slippage=self.config.btc5m_max_vwap_slippage,
                 down_edge_boost=self.config.btc5m_down_edge_boost,
             )
             self.rolling_runner.add(mom)

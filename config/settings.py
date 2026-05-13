@@ -96,10 +96,18 @@ class SystemConfig:
     dry_run: bool = True
     no_learn: bool = False
     heartbeat_interval: float = 5.0
-    btc5m_min_edge: float = 0.14
+    btc5m_min_edge: float = 0.16
     btc5m_max_price: float = 0.55
     btc5m_min_price: float = 0.40
-    btc5m_down_edge_boost: float = 0.08
+    btc5m_min_entry_age: float = 60.0
+    btc5m_entry_deadline: float = 180.0
+    btc5m_min_abs_z: float = 0.15
+    btc5m_down_min_abs_z: float = 0.45
+    btc5m_min_mom_vol_ratio: float = 0.8
+    btc5m_fair_cap: float = 0.80
+    btc5m_confirmations_required: int = 2
+    btc5m_max_vwap_slippage: float = 0.015
+    btc5m_down_edge_boost: float = 0.10
 
     risk: RiskConfig = field(default_factory=RiskConfig)
     fees: FeeConfig = field(default_factory=FeeConfig)

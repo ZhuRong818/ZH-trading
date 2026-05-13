@@ -15,7 +15,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import requests
 
@@ -59,7 +59,7 @@ class PolymarketHistoricalLoader:
         # Step 1: Load BTC klines for the full period
         log.info("Loading %d hours of BTC data from Binance...", hours)
         btc_klines = self._load_btc_klines(start_time, end_time)
-        btc_by_minute = {int(k["timestamp"]): k["close"] for k in btc_klines}
+        btc_klines.sort(key=lambda k: k["open_time"])
         log.info("Loaded %d BTC klines", len(btc_klines))
 
         # Step 2: Discover and load each 5m window
@@ -75,7 +75,7 @@ class PolymarketHistoricalLoader:
         while current_ts < end_ts_epoch:
             slug = f"{asset}-updown-{interval}-{current_ts}"
             window = self._load_single_window(
-                slug, current_ts, interval_seconds, btc_by_minute,
+                slug, current_ts, interval_seconds, btc_klines,
             )
             if window:
                 windows.append(window)
@@ -97,7 +97,7 @@ class PolymarketHistoricalLoader:
 
     def _load_single_window(
         self, slug: str, window_ts: int, interval_seconds: int,
-        btc_by_minute: Dict[int, float],
+        btc_klines: List[dict],
     ) -> Optional[dict]:
         """Load one 5m window: discover tokens, fetch prices."""
         try:
@@ -143,19 +143,12 @@ class PolymarketHistoricalLoader:
             if not up_prices:
                 return None
 
-            # Get BTC prices for this window (1-minute intervals)
-            btc_prices = []
-            for ts in range(window_ts, window_ts + interval_seconds, 60):
-                # Find closest minute
-                closest = min(btc_by_minute.keys(), key=lambda x: abs(x - ts), default=None)
-                if closest is not None and abs(closest - ts) < 120:
-                    btc_prices.append(btc_by_minute[closest])
-
-            if not btc_prices:
+            price_points = self._window_price_points(btc_klines, window_ts, window_ts + interval_seconds)
+            if len(price_points) < 2:
                 return None
 
-            strike = btc_prices[0]
-            end_btc = btc_prices[-1]
+            strike = price_points[0]["p"]
+            end_btc = price_points[-1]["p"]
             outcome = "UP" if end_btc >= strike else "DOWN"
 
             return {
@@ -165,7 +158,8 @@ class PolymarketHistoricalLoader:
                 "strike": strike,
                 "end_price": end_btc,
                 "outcome": outcome,
-                "prices": btc_prices,  # BTC prices (for strategy signal)
+                "prices": [point["p"] for point in price_points],  # BTC prices known by each point time
+                "price_points": price_points,
                 "up_token": up_token,
                 "down_token": down_token,
                 "up_prices": up_prices,    # real Polymarket prices
@@ -176,9 +170,29 @@ class PolymarketHistoricalLoader:
             log.debug("Failed to load window %s: %s", slug, e)
             return None
 
+    @staticmethod
+    def _window_price_points(btc_klines: List[dict], start_ts: int, end_ts: int) -> List[dict]:
+        """Build BTC points using only prices known by each timestamp."""
+        start_kline = next((k for k in btc_klines if int(k["open_time"]) == start_ts), None)
+        if start_kline:
+            strike = start_kline["open"]
+        else:
+            known_before_start = [k for k in btc_klines if int(k["close_time"]) <= start_ts]
+            if not known_before_start:
+                return []
+            strike = known_before_start[-1]["close"]
+
+        points = [{"t": start_ts, "p": strike}]
+        for k in btc_klines:
+            close_ts = int(k["close_time"])
+            if start_ts < close_ts <= end_ts:
+                points.append({"t": close_ts, "p": k["close"]})
+
+        return points
+
     def _load_btc_klines(self, start: datetime, end: datetime) -> List[dict]:
         """Load BTC 1-minute klines from Binance."""
-        start_ms = int(start.timestamp() * 1000)
+        start_ms = int((start - timedelta(minutes=1)).timestamp() * 1000)
         end_ms = int(end.timestamp() * 1000)
         all_klines = []
         current = start_ms
@@ -199,7 +213,9 @@ class PolymarketHistoricalLoader:
 
                 for k in data:
                     all_klines.append({
-                        "timestamp": k[0] / 1000,
+                        "open_time": k[0] / 1000,
+                        "close_time": (k[6] + 1) / 1000,
+                        "open": float(k[1]),
                         "close": float(k[4]),
                     })
 

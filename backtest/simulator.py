@@ -151,7 +151,7 @@ class V2MomentumBacktestRunner:
     def __init__(
         self,
         bankroll: float,
-        min_edge: float = 0.14,
+        min_edge: float = 0.16,
         kelly_frac: float = 0.20,
         max_bet_pct: float = 0.025,
         max_notional: float = 500.0,
@@ -159,12 +159,13 @@ class V2MomentumBacktestRunner:
         min_price: float = 0.40,
         momentum_window: int = 20,
         min_mom_vol_ratio: float = 0.8,
-        min_entry_age: float = 20.0,
-        entry_deadline: float = 60.0,
+        min_entry_age: float = 60.0,
+        entry_deadline: float = 180.0,
         min_abs_z: float = 0.15,
         min_distance_bps: float = 2.0,
-        down_edge_boost: float = 0.08,
-        down_min_abs_z: float = 0.35,
+        max_vwap_slippage: float = 0.015,
+        down_edge_boost: float = 0.10,
+        down_min_abs_z: float = 0.45,
         fair_cap: float = 0.80,
         confirmations_required: int = 2,
         disable_trending: bool = True,
@@ -182,6 +183,7 @@ class V2MomentumBacktestRunner:
         self.entry_deadline = entry_deadline
         self.min_abs_z = min_abs_z
         self.min_distance_bps = min_distance_bps
+        self.max_vwap_slippage = max_vwap_slippage
         self.down_edge_boost = down_edge_boost
         self.down_min_abs_z = down_min_abs_z
         self.fair_cap = fair_cap
@@ -195,7 +197,8 @@ class V2MomentumBacktestRunner:
         history_before_window: List[float],
         simulator: "BacktestSimulator",
     ) -> Optional[dict]:
-        prices = window["prices"]
+        price_points = window.get("price_points", [])
+        prices = [float(p["p"]) for p in price_points] if price_points else window["prices"]
         if len(prices) < 2:
             return None
 
@@ -205,8 +208,19 @@ class V2MomentumBacktestRunner:
         sample_interval = total_seconds / max(len(prices), 1)
 
         for entry_idx in range(1, len(prices)):
-            entry_age = entry_idx * sample_interval
-            seconds_remaining = max(total_seconds - entry_age, 0.0)
+            if price_points:
+                entry_ts = int(price_points[entry_idx]["t"])
+                entry_age = max(float(entry_ts - window.get("start_ts", entry_ts)), 0.0)
+                seconds_remaining = max(float(window.get("end_ts", entry_ts) - entry_ts), 0.0)
+                if entry_idx > 0:
+                    sample_interval = max(
+                        float(price_points[entry_idx]["t"] - price_points[entry_idx - 1]["t"]),
+                        1.0,
+                    )
+            else:
+                entry_age = entry_idx * sample_interval
+                seconds_remaining = max(total_seconds - entry_age, 0.0)
+                entry_ts = int(window.get("start_ts", 0) + entry_age) if window.get("start_ts") else 0
             if entry_age < self.min_entry_age or seconds_remaining < self.entry_deadline:
                 continue
 
@@ -216,6 +230,8 @@ class V2MomentumBacktestRunner:
                 strike=window["strike"],
                 seconds_remaining=seconds_remaining,
                 entry_age=entry_age,
+                entry_ts=entry_ts,
+                sample_interval=sample_interval,
                 window_idx=window_idx,
                 simulator=simulator,
             )
@@ -244,6 +260,8 @@ class V2MomentumBacktestRunner:
         strike: float,
         seconds_remaining: float,
         entry_age: float,
+        entry_ts: int,
+        sample_interval: float,
         window_idx: int,
         simulator: "BacktestSimulator",
     ) -> Optional[dict]:
@@ -264,7 +282,6 @@ class V2MomentumBacktestRunner:
         momentum = (eval_prices[-1] - eval_prices[-self.momentum_window]) / eval_prices[-self.momentum_window]
         mom_vol_ratio = abs(momentum) / vol if vol > 0 else 0.0
 
-        sample_interval = 60.0  # backtests generally use 1m candles
         horizon_ticks = max(seconds_remaining / sample_interval, 1.0)
         horizon_sigma = current * vol * math.sqrt(horizon_ticks)
         distance = current - strike
@@ -289,9 +306,11 @@ class V2MomentumBacktestRunner:
         down_prices = window_data.get("down_prices", [])
 
         if up_prices and down_prices:
-            entry_ts = window_data.get("start_ts", 0) + int(entry_age)
-            up_ask = simulator._find_nearest_price(up_prices, entry_ts)
-            down_ask = simulator._find_nearest_price(down_prices, entry_ts)
+            entry_ts = entry_ts or window_data.get("start_ts", 0) + int(entry_age)
+            up_ask = simulator._find_past_price(up_prices, entry_ts)
+            down_ask = simulator._find_past_price(down_prices, entry_ts)
+            if up_ask is None or down_ask is None:
+                return None
         else:
             up_ask, down_ask = simulator.simulate_asks(strike, current, window_idx, entry_age)
 
@@ -313,9 +332,7 @@ class V2MomentumBacktestRunner:
         if market_price > self.max_price or market_price < self.min_price:
             return None
 
-        required_edge = self.min_edge + (self.down_edge_boost if direction == "DOWN" else 0.0)
-        if market_price >= 0.50:
-            required_edge = max(required_edge, 0.18)
+        required_edge = self._required_edge(direction, market_price)
 
         edge = fair - market_price
         regime = simulator.classify_regime(market_price)
@@ -325,9 +342,12 @@ class V2MomentumBacktestRunner:
             return None
 
         vwap = simulator.estimate_vwap(market_price)
+        if vwap - market_price > self.max_vwap_slippage:
+            return None
         if vwap > self.max_price or vwap < self.min_price:
             return None
         edge = fair - vwap
+        required_edge = self._required_edge(direction, vwap)
         if edge < required_edge:
             return None
 
@@ -358,6 +378,13 @@ class V2MomentumBacktestRunner:
             return 0.0
         mean = sum(xs) / len(xs)
         return (sum((x - mean) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5
+
+    def _required_edge(self, direction: str, price: float) -> float:
+        if direction == "DOWN":
+            return max(self.min_edge + self.down_edge_boost, 0.26)
+        if direction == "UP" and price >= 0.50:
+            return max(self.min_edge, 0.18)
+        return self.min_edge
 
 
 class BacktestSimulator:
@@ -395,7 +422,13 @@ class BacktestSimulator:
                 max_notional=kwargs.get("max_notional", 500),
                 max_price=kwargs.get("max_price", 0.55),
                 min_price=kwargs.get("min_price", 0.40),
-                down_edge_boost=kwargs.get("down_edge_boost", 0.08),
+                min_entry_age=kwargs.get("min_entry_age", 60.0),
+                entry_deadline=kwargs.get("entry_deadline", 180.0),
+                min_abs_z=kwargs.get("min_abs_z", 0.15),
+                down_min_abs_z=kwargs.get("down_min_abs_z", 0.45),
+                min_mom_vol_ratio=kwargs.get("min_mom_vol_ratio", 0.8),
+                max_vwap_slippage=kwargs.get("max_vwap_slippage", 0.015),
+                down_edge_boost=kwargs.get("down_edge_boost", 0.10),
                 fair_cap=kwargs.get("fair_cap", 0.80),
                 confirmations_required=kwargs.get("confirmations_required", 2),
                 disable_trending=kwargs.get("disable_trending", True),
@@ -533,10 +566,12 @@ class BacktestSimulator:
         down_prices = window.get("down_prices", [])
 
         if up_prices and down_prices:
-            # Find the price point closest to entry time
+            # Use only prices available at or before entry time.
             entry_ts = window["start_ts"] + (entry_idx * 60)
-            up_ask = self._find_nearest_price(up_prices, entry_ts)
-            down_ask = self._find_nearest_price(down_prices, entry_ts)
+            up_ask = self._find_past_price(up_prices, entry_ts)
+            down_ask = self._find_past_price(down_prices, entry_ts)
+            if up_ask is None or down_ask is None:
+                return None
         else:
             # Fallback to simulated prices
             up_ask, down_ask = self.simulate_asks(window["strike"], current, window_idx, entry_idx * 60.0)
@@ -554,18 +589,15 @@ class BacktestSimulator:
         return strategy.evaluate(eval_prices, market)
 
     @staticmethod
-    def _find_nearest_price(price_points: list, target_ts: int) -> float:
-        """Find the price closest to target timestamp from Polymarket history."""
+    def _find_past_price(price_points: list, target_ts: int) -> Optional[float]:
+        """Find the latest price available at or before target timestamp."""
         if not price_points:
-            return 0.5
-        best = price_points[0]
-        best_dist = abs(best["t"] - target_ts)
-        for p in price_points[1:]:
-            dist = abs(p["t"] - target_ts)
-            if dist < best_dist:
+            return None
+        best = None
+        for p in price_points:
+            if p["t"] <= target_ts and (best is None or p["t"] > best["t"]):
                 best = p
-                best_dist = dist
-        return best["p"]
+        return best["p"] if best else None
 
     def _settle_decision(
         self,
@@ -697,6 +729,8 @@ class BacktestSimulator:
             print(f"  Avg win:           ${avg_win:.2f}")
             print(f"  Avg loss:          ${avg_loss:.2f}")
             print(f"  Required WR:       {req_wr:.1f}%")
+            print(f"  Win target 55%:    {'PASS' if r.win_rate >= 55 else 'FAIL'}")
+            print(f"  PF target 1.05:    {'PASS' if r.profit_factor >= 1.05 else 'FAIL'}")
 
         self._print_breakdown("Per-Strategy", trades, lambda t: t.strategy)
         self._print_breakdown("Direction", trades, lambda t: t.direction)

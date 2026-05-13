@@ -32,6 +32,8 @@ log = logging.getLogger(__name__)
 # Safe adjustment bounds (fraction of default value)
 MAX_ADJUSTMENT = 0.30  # never change more than ±30%
 MIN_TRADES_TO_LEARN = 10
+BTC5M_MIN_TRADES_TO_LEARN = 50
+BTC5M_MIN_SESSIONS_TO_LEARN = 3
 
 
 @dataclass
@@ -262,6 +264,22 @@ class Learner:
 
     def _adjust_btc5m(self, h: StrategyHistory, config: SystemConfig):
         """Adjust BTC 5m V2 momentum parameters."""
+        if h.total_trades < BTC5M_MIN_TRADES_TO_LEARN or h.sessions < BTC5M_MIN_SESSIONS_TO_LEARN:
+            log.info(
+                "Learner: btc_5m has %d trades across %d sessions; need %d trades and %d sessions before auto-adjusting",
+                h.total_trades,
+                h.sessions,
+                BTC5M_MIN_TRADES_TO_LEARN,
+                BTC5M_MIN_SESSIONS_TO_LEARN,
+            )
+            if h.avg_win_rate < 45 or h.avg_profit_factor < 1.0:
+                log.info(
+                    "Learner: btc_5m would suggest stricter filtering (WR %.1f%% PF %.2f), but sample is insufficient",
+                    h.avg_win_rate,
+                    h.avg_profit_factor,
+                )
+            return
+
         if (h.avg_win_rate < 45 or h.avg_profit_factor < 1.0) and h.total_trades >= 15:
             old = config.btc5m_min_edge
             new = min(max(old + 0.02, 0.14), 0.20)

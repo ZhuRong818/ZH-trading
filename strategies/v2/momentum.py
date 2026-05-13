@@ -12,7 +12,7 @@ import logging
 import math
 import time
 from typing import List, Optional
-from collections import deque
+from collections import Counter, deque
 
 import requests
 
@@ -32,7 +32,7 @@ class Momentum(BaseStrategy):
     def __init__(
         self,
         asset: str = "btc",
-        min_edge: float = 0.14,
+        min_edge: float = 0.16,
         kelly_frac: float = 0.20,
         max_bet_pct: float = 0.025,
         bankroll: float = 5_000,
@@ -40,13 +40,13 @@ class Momentum(BaseStrategy):
         min_price: float = 0.40,
         momentum_window: int = 20,
         min_mom_vol_ratio: float = 0.8,
-        min_entry_age: float = 20.0,
-        entry_deadline: float = 60.0,
+        min_entry_age: float = 60.0,
+        entry_deadline: float = 180.0,
         min_abs_z: float = 0.15,
         min_distance_bps: float = 2.0,
-        max_vwap_slippage: float = 0.02,
-        down_edge_boost: float = 0.08,
-        down_min_abs_z: float = 0.35,
+        max_vwap_slippage: float = 0.015,
+        down_edge_boost: float = 0.10,
+        down_min_abs_z: float = 0.45,
         fair_cap: float = 0.80,
         confirmations_required: int = 2,
     ):
@@ -77,6 +77,10 @@ class Momentum(BaseStrategy):
         self._pending_signal_key: tuple[str, str] | None = None
         self._pending_signal_count = 0
         self._candidate_details: dict = {}
+        self._reject_counts: Counter = Counter()
+        self._window_evaluations = 0
+        self._window_candidates = 0
+        self._best_candidate: dict = {}
         self.total_trades = 0
         self.wins = 0
         self.losses = 0
@@ -103,13 +107,17 @@ class Momentum(BaseStrategy):
             return []  # already in a trade, wait for settlement
 
         if len(self._prices) < 5:
+            if up_ctx and down_ctx:
+                self._reject("warmup")
             return []
 
         condition_id = up_ctx.condition_id if up_ctx else ""
         if condition_id and condition_id != self._last_condition_id:
+            self._log_window_diagnostics()
             self._last_condition_id = condition_id
             self._pending_signal_key = None
             self._pending_signal_count = 0
+            self._reset_window_diagnostics()
 
         # One signal per window — only process once using resolved UP/DOWN contexts.
         # We use executable book prices (best ask) instead of mid to reduce
@@ -126,6 +134,7 @@ class Momentum(BaseStrategy):
                         self._pending_signal_count = 1
 
                     if self._pending_signal_count < self.confirmations_required:
+                        self._reject("confirmation")
                         return []
 
                     self.total_trades += 1
@@ -142,7 +151,57 @@ class Momentum(BaseStrategy):
                     return [s]
                 self._pending_signal_key = None
                 self._pending_signal_count = 0
+            else:
+                self._reject("age")
         return []
+
+    def _reject(self, reason: str):
+        self._reject_counts[reason] += 1
+
+    def _reset_window_diagnostics(self):
+        self._reject_counts.clear()
+        self._window_evaluations = 0
+        self._window_candidates = 0
+        self._best_candidate = {}
+
+    def _log_window_diagnostics(self):
+        if not self._last_condition_id:
+            return
+        total_rejects = sum(self._reject_counts.values())
+        if self._window_evaluations <= 0 and total_rejects <= 0:
+            return
+
+        top = ",".join(
+            f"{reason}:{count}"
+            for reason, count in self._reject_counts.most_common(4)
+        ) or "none"
+
+        candidate = self._best_candidate
+        if candidate:
+            best = (
+                "best="
+                f"{candidate.get('direction', '?')} "
+                f"fair={candidate.get('fair', 0.0):.3f} "
+                f"ask={candidate.get('market_price', 0.0):.3f} "
+                f"vwap={candidate.get('vwap', candidate.get('market_price', 0.0)):.3f} "
+                f"edge={candidate.get('edge', 0.0):.3f}/{candidate.get('required_edge', 0.0):.3f} "
+                f"z={candidate.get('z_score', 0.0):.2f} "
+                f"mom={candidate.get('momentum', 0.0) * 100:.4f}% "
+                f"age={candidate.get('window_age', 0.0):.0f}s "
+                f"reason={candidate.get('reason', 'candidate')}"
+            )
+        else:
+            best = "best=none"
+
+        log.info(
+            "MOMENTUM_DIAG window=%s evals=%d candidates=%d rejects=%d top=%s %s",
+            self._last_condition_id[:30],
+            self._window_evaluations,
+            self._window_candidates,
+            total_rejects,
+            top,
+            best,
+        )
 
     def _poll_price(self):
         try:
@@ -181,7 +240,55 @@ class Momentum(BaseStrategy):
         intervals.sort()
         return max(1.0, min(10.0, intervals[len(intervals) // 2]))
 
+    def _required_edge(self, direction: str, price: float) -> float:
+        if direction == "DOWN":
+            return max(self.min_edge + self.down_edge_boost, 0.26)
+        if direction == "UP" and price >= 0.50:
+            return max(self.min_edge, 0.18)
+        return self.min_edge
+
+    def _remember_candidate(
+        self,
+        *,
+        direction: str,
+        fair: float,
+        market_price: float,
+        vwap: float,
+        edge: float,
+        required_edge: float,
+        z_score: float,
+        distance: float,
+        momentum: float,
+        current: float,
+        window_age: float,
+        reason: str,
+        count: bool = False,
+    ):
+        if count:
+            self._window_candidates += 1
+
+        candidate = {
+            "direction": direction,
+            "fair": fair,
+            "market_price": market_price,
+            "vwap": vwap,
+            "edge": edge,
+            "required_edge": required_edge,
+            "z_score": z_score,
+            "distance": distance,
+            "momentum": momentum,
+            "current": current,
+            "window_age": window_age,
+            "reason": reason,
+        }
+
+        current_gap = self._best_candidate.get("edge", -999.0) - self._best_candidate.get("required_edge", 0.0)
+        new_gap = edge - required_edge
+        if not self._best_candidate or new_gap >= current_gap:
+            self._best_candidate = candidate
+
     def _compute(self, up_ctx: MarketContext, down_ctx: MarketContext) -> Optional[TradingSignal]:
+        self._window_evaluations += 1
         momentum = self._momentum(self.momentum_window)
         vol = max(self._volatility(self.momentum_window), 0.00002)
 
@@ -191,9 +298,11 @@ class Momentum(BaseStrategy):
         window_age = max(0.0, 300.0 - remaining)
 
         if current <= 0 or strike <= 0:
+            self._reject("warmup")
             return None
 
         if window_age < self.min_entry_age:
+            self._reject("age")
             return None
 
         # Z-score from distance to strike
@@ -205,11 +314,14 @@ class Momentum(BaseStrategy):
 
         # Momentum quality filter
         mom_vol_ratio = abs(momentum) / vol if vol > 0 else 0
-        if (
-            mom_vol_ratio < self.min_mom_vol_ratio
-            or abs(z_score) < self.min_abs_z
-            or distance_bps < self.min_distance_bps
-        ):
+        if mom_vol_ratio < self.min_mom_vol_ratio:
+            self._reject("mom_vol")
+            return None
+        if abs(z_score) < self.min_abs_z:
+            self._reject("z")
+            return None
+        if distance_bps < self.min_distance_bps:
+            self._reject("distance_bps")
             return None
 
         # Drift adjustment
@@ -232,22 +344,53 @@ class Momentum(BaseStrategy):
             market_price = down_ctx.best_ask or 0.0
             ctx = down_ctx
         else:
+            self._reject("z")
             return None
 
         if market_price <= 0:
+            self._reject("price_band")
             return None
 
+        required_edge = self._required_edge(direction, market_price)
+        edge = fair - market_price
+        self._remember_candidate(
+            direction=direction, fair=fair, market_price=market_price,
+            vwap=market_price, edge=edge, required_edge=required_edge,
+            z_score=z_score, distance=distance, momentum=momentum,
+            current=current, window_age=window_age, reason="candidate",
+            count=True,
+        )
+
         if direction == "DOWN" and abs(z_score) < self.down_min_abs_z:
+            self._remember_candidate(
+                direction=direction, fair=fair, market_price=market_price,
+                vwap=market_price, edge=edge, required_edge=required_edge,
+                z_score=z_score, distance=distance, momentum=momentum,
+                current=current, window_age=window_age, reason="down_z",
+            )
+            self._reject("down_z")
             return None
 
         # Risk/reward gate
         if market_price > self.max_price or market_price < self.min_price:
+            self._remember_candidate(
+                direction=direction, fair=fair, market_price=market_price,
+                vwap=market_price, edge=edge, required_edge=required_edge,
+                z_score=z_score, distance=distance, momentum=momentum,
+                current=current, window_age=window_age, reason="price_band",
+            )
+            self._reject("price_band")
             return None
 
         # Edge check
-        edge = fair - market_price
-        required_edge = self.min_edge + (self.down_edge_boost if direction == "DOWN" else 0.0)
         if edge <= 0 or edge < required_edge:
+            self._remember_candidate(
+                direction=direction, fair=fair, market_price=market_price,
+                vwap=market_price, edge=edge, required_edge=required_edge,
+                z_score=z_score, distance=distance, momentum=momentum,
+                current=current, window_age=window_age, reason="edge",
+            )
+            self._reject("edge")
             return None
 
         # Kelly sizing
@@ -256,9 +399,16 @@ class Momentum(BaseStrategy):
             bankroll=self.bankroll,
             kelly_fraction=self.kelly_frac,
             max_bet_pct=self.max_bet_pct,
-            min_edge=self.min_edge,
+            min_edge=required_edge,
         )
         if kelly.direction == "NONE" or kelly.size_usdc < 5:
+            self._remember_candidate(
+                direction=direction, fair=fair, market_price=market_price,
+                vwap=market_price, edge=edge, required_edge=required_edge,
+                z_score=z_score, distance=distance, momentum=momentum,
+                current=current, window_age=window_age, reason="edge",
+            )
+            self._reject("edge")
             return None
 
         size = kelly.size_usdc / market_price if market_price > 0 else 0
@@ -268,18 +418,55 @@ class Momentum(BaseStrategy):
         if book:
             vwap_price, fillable = book.vwap_price("BUY", size)
             if vwap_price is None or fillable < 1:
+                self._remember_candidate(
+                    direction=direction, fair=fair, market_price=market_price,
+                    vwap=market_price, edge=edge, required_edge=required_edge,
+                    z_score=z_score, distance=distance, momentum=momentum,
+                    current=current, window_age=window_age, reason="vwap_depth",
+                )
+                self._reject("vwap_depth")
                 return None
             if fillable < size:
                 size = fillable
             if vwap_price - market_price > self.max_vwap_slippage:
+                self._remember_candidate(
+                    direction=direction, fair=fair, market_price=market_price,
+                    vwap=vwap_price, edge=fair - vwap_price,
+                    required_edge=self._required_edge(direction, vwap_price),
+                    z_score=z_score, distance=distance, momentum=momentum,
+                    current=current, window_age=window_age, reason="vwap_slippage",
+                )
+                self._reject("vwap_slippage")
                 return None
             vwap = vwap_price
 
         if vwap > self.max_price or vwap < self.min_price:
+            self._remember_candidate(
+                direction=direction, fair=fair, market_price=market_price,
+                vwap=vwap, edge=fair - vwap,
+                required_edge=self._required_edge(direction, vwap),
+                z_score=z_score, distance=distance, momentum=momentum,
+                current=current, window_age=window_age, reason="price_band",
+            )
+            self._reject("price_band")
             return None
 
         edge = fair - vwap
+        required_edge = self._required_edge(direction, vwap)
+        self._remember_candidate(
+            direction=direction, fair=fair, market_price=market_price,
+            vwap=vwap, edge=edge, required_edge=required_edge,
+            z_score=z_score, distance=distance, momentum=momentum,
+            current=current, window_age=window_age, reason="candidate",
+        )
         if edge < required_edge:
+            self._remember_candidate(
+                direction=direction, fair=fair, market_price=market_price,
+                vwap=vwap, edge=edge, required_edge=required_edge,
+                z_score=z_score, distance=distance, momentum=momentum,
+                current=current, window_age=window_age, reason="edge",
+            )
+            self._reject("edge")
             return None
 
         kelly = kelly_size(
@@ -290,23 +477,58 @@ class Momentum(BaseStrategy):
             min_edge=required_edge,
         )
         if kelly.direction == "NONE" or kelly.size_usdc < 5:
+            self._remember_candidate(
+                direction=direction, fair=fair, market_price=market_price,
+                vwap=vwap, edge=edge, required_edge=required_edge,
+                z_score=z_score, distance=distance, momentum=momentum,
+                current=current, window_age=window_age, reason="edge",
+            )
+            self._reject("edge")
             return None
 
         size = kelly.size_usdc / vwap if vwap > 0 else 0
         if book:
             vwap_price, fillable = book.vwap_price("BUY", size)
             if vwap_price is None or fillable < 1:
+                self._remember_candidate(
+                    direction=direction, fair=fair, market_price=market_price,
+                    vwap=vwap, edge=edge, required_edge=required_edge,
+                    z_score=z_score, distance=distance, momentum=momentum,
+                    current=current, window_age=window_age, reason="vwap_depth",
+                )
+                self._reject("vwap_depth")
                 return None
             if fillable < size:
                 size = fillable
             vwap = vwap_price
             edge = fair - vwap
-            if (
-                vwap - market_price > self.max_vwap_slippage
-                or edge < required_edge
-                or vwap > self.max_price
-                or vwap < self.min_price
-            ):
+            required_edge = self._required_edge(direction, vwap)
+            if vwap - market_price > self.max_vwap_slippage:
+                self._remember_candidate(
+                    direction=direction, fair=fair, market_price=market_price,
+                    vwap=vwap, edge=edge, required_edge=required_edge,
+                    z_score=z_score, distance=distance, momentum=momentum,
+                    current=current, window_age=window_age, reason="vwap_slippage",
+                )
+                self._reject("vwap_slippage")
+                return None
+            if vwap > self.max_price or vwap < self.min_price:
+                self._remember_candidate(
+                    direction=direction, fair=fair, market_price=market_price,
+                    vwap=vwap, edge=edge, required_edge=required_edge,
+                    z_score=z_score, distance=distance, momentum=momentum,
+                    current=current, window_age=window_age, reason="price_band",
+                )
+                self._reject("price_band")
+                return None
+            if edge < required_edge:
+                self._remember_candidate(
+                    direction=direction, fair=fair, market_price=market_price,
+                    vwap=vwap, edge=edge, required_edge=required_edge,
+                    z_score=z_score, distance=distance, momentum=momentum,
+                    current=current, window_age=window_age, reason="edge",
+                )
+                self._reject("edge")
                 return None
 
         # Use the correct token
@@ -322,6 +544,8 @@ class Momentum(BaseStrategy):
             "momentum": momentum,
             "current": current,
             "window_age": window_age,
+            "fair": fair,
+            "required_edge": required_edge,
         }
 
         return TradingSignal(
@@ -365,4 +589,7 @@ class Momentum(BaseStrategy):
             "wins": self.wins,
             "losses": self.losses,
             "prices_buffered": len(self._prices),
+            "window_evaluations": self._window_evaluations,
+            "window_candidates": self._window_candidates,
+            "reject_counts": dict(self._reject_counts),
         }
