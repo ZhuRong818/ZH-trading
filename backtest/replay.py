@@ -808,6 +808,198 @@ class ConvergenceReplayStrategy:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Strategy 5: Last Seconds Snipe
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SnipeReplayStrategy:
+    """
+    Replays last_seconds_snipe logic on recorded data.
+
+    Two tiers:
+      - Strict (last 30s): needs price > 0.98, distance > $25
+      - Soft (30-60s): needs price > 0.90, distance > $50
+
+    Direction is determined by BTC price vs strike, then confirmed
+    by Polymarket odds alignment.
+
+    Stop-loss: if the token mid drops below stop_loss_price, sell immediately
+    instead of holding to settlement. This caps catastrophic losses.
+    """
+    name = "snipe"
+
+    def __init__(
+        self,
+        max_seconds_remaining: float = 30.0,
+        min_seconds_remaining: float = 12.0,
+        min_distance_usd: float = 25.0,
+        min_market_odds: float = 0.98,
+        min_edge: float = 0.005,
+        min_fair: float = 0.99,
+        soft_max_seconds_remaining: float = 60.0,
+        soft_min_distance_usd: float = 50.0,
+        soft_min_market_odds: float = 0.90,
+        soft_min_edge: float = 0.02,
+        soft_min_fair: float = 0.95,
+        max_notional_usdc: float = 250.0,
+        stop_loss_price: float = 0.0,  # 0 = disabled, e.g. 0.70 = sell if mid drops below 0.70
+    ):
+        self.max_seconds = max_seconds_remaining
+        self.min_seconds = min_seconds_remaining
+        self.min_distance_usd = min_distance_usd
+        self.min_market_odds = min_market_odds
+        self.min_edge = min_edge
+        self.min_fair = min_fair
+        self.soft_max_seconds = soft_max_seconds_remaining
+        self.soft_min_distance_usd = soft_min_distance_usd
+        self.soft_min_market_odds = soft_min_market_odds
+        self.soft_min_edge = soft_min_edge
+        self.soft_min_fair = soft_min_fair
+        self.max_notional_usdc = max_notional_usdc
+        self.stop_loss_price = stop_loss_price
+
+    def run(self, records: List[dict], bankroll: float = 10_000) -> ReplayResult:
+        result = ReplayResult(
+            asset=records[0]["asset"] if records else "?",
+            strategy=self.name,
+            bankroll=bankroll,
+        )
+        result.equity_curve.append(bankroll)
+
+        window_outcomes = compute_window_outcomes(records)
+        current_trade: Optional[ReplayTrade] = None
+        current_slug = None
+        signaled_window = False
+
+        for rec in records:
+            ts = rec["ts"]
+            slug = rec["slug"]
+            btc_price = rec["price"]
+            strike = rec.get("strike", 0)
+            up_mid = rec.get("up_mid", 0)
+            down_mid = rec.get("down_mid", 0)
+            up_sell = rec.get("up_sell", 0) or up_mid
+            down_sell = rec.get("down_sell", 0) or down_mid
+            up_buy = rec.get("up_buy", 0) or up_mid
+            down_buy = rec.get("down_buy", 0) or down_mid
+            remaining = rec.get("seconds_remaining", 0)
+
+            # Window change — settle and reset
+            if slug != current_slug:
+                if current_trade is not None:
+                    settle_trade(current_trade, window_outcomes, result)
+                    current_trade = None
+                current_slug = slug
+                signaled_window = False
+
+            # Already in a trade — check stop-loss, then hold
+            if current_trade is not None:
+                if self.stop_loss_price > 0:
+                    # Check if our token's mid has dropped below stop-loss
+                    if current_trade.direction == "UP":
+                        current_mid = up_mid
+                        sell_price = up_buy  # sell at bid
+                    else:
+                        current_mid = down_mid
+                        sell_price = down_buy
+
+                    if current_mid > 0 and current_mid < self.stop_loss_price:
+                        # Stop-loss triggered — sell at current bid
+                        if sell_price <= 0:
+                            sell_price = current_mid
+                        exit_fee = current_trade.shares * FEE_RATE * sell_price * (1 - sell_price)
+                        current_trade.pnl = (
+                            current_trade.shares * sell_price
+                            - current_trade.shares * current_trade.entry_price
+                            - current_trade.fee - exit_fee
+                        )
+                        current_trade.outcome = "STOP"
+                        current_trade.meta += f" → STOP@{sell_price:.3f}"
+                        result.total_pnl += current_trade.pnl
+                        result.total_fees += current_trade.fee + exit_fee
+                        result.bankroll += current_trade.pnl
+                        result.losses += 1
+                        result.equity_curve.append(result.bankroll)
+                        result.trades.append(current_trade)
+                        current_trade = None
+                        continue
+                continue
+
+            # One signal per window
+            if signaled_window:
+                continue
+
+            # Time window
+            if remaining < self.min_seconds or remaining > self.soft_max_seconds:
+                continue
+
+            if btc_price <= 0 or strike <= 0:
+                continue
+
+            # Determine tier
+            tier = "strict" if remaining <= self.max_seconds else "soft"
+            min_distance = self.min_distance_usd if tier == "strict" else self.soft_min_distance_usd
+            min_odds = self.min_market_odds if tier == "strict" else self.soft_min_market_odds
+            min_edge = self.min_edge if tier == "strict" else self.soft_min_edge
+            min_fair = self.min_fair if tier == "strict" else self.soft_min_fair
+
+            # Distance from strike
+            distance = abs(btc_price - strike)
+            if distance < min_distance:
+                continue
+
+            # Direction from BTC price vs strike
+            direction = "UP" if btc_price >= strike else "DOWN"
+
+            if direction == "UP":
+                market_price = up_sell
+                opposite_price = down_sell
+            else:
+                market_price = down_sell
+                opposite_price = up_sell
+
+            if market_price <= 0:
+                continue
+
+            # Market odds check
+            if market_price < min_odds:
+                continue
+
+            # Direction mismatch: opposite side shouldn't be more confident
+            if opposite_price >= min_odds and market_price < min_odds:
+                continue
+
+            # Fair value
+            fair = max(min_fair, min(0.999, market_price + min_edge))
+            edge = fair - market_price
+            if edge < min_edge:
+                continue
+
+            # Sizing: fixed notional
+            size_usdc = min(self.max_notional_usdc, result.bankroll * 0.05)
+            if size_usdc < 5:
+                continue
+            shares = size_usdc / market_price
+            fee = shares * FEE_RATE * market_price * (1 - market_price)
+
+            current_trade = ReplayTrade(
+                strategy=self.name, window_slug=slug, asset=rec["asset"],
+                direction=direction, entry_price=market_price,
+                fair_value=fair, edge=edge,
+                size_usdc=size_usdc, shares=shares, entry_ts=ts, fee=fee,
+                seconds_remaining=remaining,
+                meta=f"tier={tier} dist=${distance:.0f} odds={market_price:.3f}",
+            )
+            signaled_window = True
+
+        # Settle final trade
+        if current_trade is not None:
+            settle_trade(current_trade, window_outcomes, result)
+
+        compute_max_drawdown(result)
+        return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Data loading
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -902,7 +1094,7 @@ def print_report(strategy_name: str, results: dict[str, ReplayResult], params: d
 def main():
     parser = argparse.ArgumentParser(description="Replay backtest on recorded data")
     parser.add_argument("--strategy", type=str, default="oracle",
-                        help="Strategy: oracle, momentum, leadlag, convergence, or comma-separated")
+                        help="Strategy: oracle, momentum, leadlag, convergence, snipe, or comma-separated")
     parser.add_argument("--assets", type=str, default="btc,eth,sol,xrp",
                         help="Assets to backtest (default: btc,eth,sol,xrp)")
     parser.add_argument("--data-dir", type=str, default="data_v2",
@@ -943,6 +1135,10 @@ def main():
                         help="Momentum confirmations required (default: 2)")
     parser.add_argument("--down-edge-boost", type=float, default=0.10,
                         help="Momentum extra DOWN min edge (default: 0.10)")
+
+    # Snipe params
+    parser.add_argument("--stop-loss", type=float, default=0.0,
+                        help="Snipe stop-loss price — sell if token mid drops below this (default: 0 = disabled)")
 
     # Convergence params
     parser.add_argument("--conv-threshold", type=float, default=0.88,
@@ -1060,6 +1256,22 @@ def main():
             print_report("Settlement Convergence", results, {
                 "threshold": args.conv_threshold, "window_sec": args.conv_window,
                 "confirm_ticks": args.conv_confirm,
+            })
+
+        elif strat_name == "snipe":
+            results = {}
+            for asset in sorted(all_records):
+                recs = all_records[asset]
+                windows = len(set(r["slug"] for r in recs))
+                print(f"[snipe] Replaying {asset.upper()}: {len(recs):,} ticks, {windows} windows...")
+                strategy = SnipeReplayStrategy(
+                    max_notional_usdc=args.max_notional,
+                    stop_loss_price=args.stop_loss,
+                )
+                results[asset] = strategy.run(recs, bankroll=args.bankroll)
+            sl_label = f"stop_loss={args.stop_loss}" if args.stop_loss > 0 else "stop_loss=OFF"
+            print_report("Last Seconds Snipe", results, {
+                "strict": "30s/0.98/$25", "soft": "60s/0.90/$50", "stop_loss": sl_label,
             })
 
         else:
