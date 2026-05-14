@@ -144,11 +144,12 @@ class PositionSizer:
     """Kelly criterion sizing with fee awareness."""
 
     def __init__(self, kelly_frac: float = 0.20, max_bet_pct: float = 0.05,
-                 bankroll: float = 10_000, min_bet: float = 5.0, fee_bps: float = 0.0):
+                 bankroll: float = 10_000, min_bet: float = 5.0, min_edge: float = 0.02, fee_bps: float = 0.0):
         self.kelly_frac = kelly_frac
         self.max_bet_pct = max_bet_pct
         self.bankroll = bankroll
         self.min_bet = min_bet
+        self.min_edge = min_edge
         self.fee_bps = fee_bps
 
     def size(self, fair: float, market_price: float) -> Optional[float]:
@@ -159,6 +160,7 @@ class PositionSizer:
             bankroll=self.bankroll,
             kelly_fraction=self.kelly_frac,
             max_bet_pct=self.max_bet_pct,
+            min_edge=self.min_edge,
             fee_bps=self.fee_bps,
         )
         if result.direction == "NONE" or result.size_usdc < self.min_bet:

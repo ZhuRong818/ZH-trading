@@ -109,6 +109,25 @@ class SystemConfig:
     btc5m_max_vwap_slippage: float = 0.015
     btc5m_down_edge_boost: float = 0.10
 
+    btc5m_snipe_max_seconds: float = 30.0
+    btc5m_snipe_min_seconds: float = 12.0
+    btc5m_snipe_min_distance_usd: float = 25.0
+    btc5m_snipe_min_distance_bps: float = 0.0
+    btc5m_snipe_min_market_odds: float = 0.98
+    btc5m_snipe_min_edge: float = 0.005
+    btc5m_snipe_min_fair: float = 0.99
+    btc5m_snipe_soft_max_seconds: float = 60.0
+    btc5m_snipe_soft_min_distance_usd: float = 50.0
+    btc5m_snipe_soft_min_distance_bps: float = 0.0
+    btc5m_snipe_soft_min_market_odds: float = 0.90
+    btc5m_snipe_soft_min_edge: float = 0.02
+    btc5m_snipe_soft_min_fair: float = 0.95
+    btc5m_snipe_kelly_frac: float = 0.10
+    btc5m_snipe_max_bet_pct: float = 0.01
+    btc5m_snipe_max_notional_usdc: float = 250.0
+    btc5m_snipe_max_vwap_slippage: float = 0.01
+    btc5m_snipe_cooldown: float = 5.0
+
     risk: RiskConfig = field(default_factory=RiskConfig)
     fees: FeeConfig = field(default_factory=FeeConfig)
     capital: CapitalConfig = field(default_factory=CapitalConfig)

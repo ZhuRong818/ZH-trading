@@ -172,6 +172,7 @@ class RollingProvider(MarketProvider):
         self._current_slug: str = ""
         self._current_window_ts: int = 0
         self._strike_price: float = 0.0
+        self._strike_source: str = ""
         self._up_token: str = ""
         self._down_token: str = ""
         self._end_time: Optional[datetime] = None
@@ -224,7 +225,7 @@ class RollingProvider(MarketProvider):
                 volatility=self.data.rolling_volatility(token_id) if book else 0.01,
                 condition_id=self._current_slug,
                 question=f"{self.asset.upper()} {self.interval} {side.upper()}",
-                is_valid=book is not None and remaining > 0,
+                is_valid=book is not None and remaining > 0 and self._strike_price > 0,
                 external_price=external_price,
                 strike_price=self._strike_price,
             )
@@ -235,6 +236,7 @@ class RollingProvider(MarketProvider):
     def _discover_window(self, window_ts: int):
         """Find the 5m market for a given timestamp."""
         slug = f"{self.asset}-updown-{self.interval}-{window_ts}"
+        discovered_window_ts = window_ts
         try:
             resp = self.session.get(
                 f"{GAMMA_BASE}/events/slug/{slug}",
@@ -242,7 +244,8 @@ class RollingProvider(MarketProvider):
             )
             if resp.status_code != 200:
                 # Try next window
-                slug = f"{self.asset}-updown-{self.interval}-{window_ts + self.interval_seconds}"
+                discovered_window_ts = window_ts + self.interval_seconds
+                slug = f"{self.asset}-updown-{self.interval}-{discovered_window_ts}"
                 resp = self.session.get(f"{GAMMA_BASE}/events/slug/{slug}", timeout=5)
                 if resp.status_code != 200:
                     return
@@ -257,6 +260,8 @@ class RollingProvider(MarketProvider):
             clob = json.loads(clob_raw) if isinstance(clob_raw, str) else (clob_raw or [])
             if len(clob) < 2:
                 return
+            outcomes_raw = m.get("outcomes", "[]")
+            outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else (outcomes_raw or [])
 
             end_str = m.get("endDate", "")
             try:
@@ -265,22 +270,22 @@ class RollingProvider(MarketProvider):
                 self._end_time = datetime.fromtimestamp(window_ts + self.interval_seconds, tz=timezone.utc)
 
             self._current_slug = slug
-            self._current_window_ts = window_ts
-            self._up_token = clob[0]
-            self._down_token = clob[1]
+            self._current_window_ts = discovered_window_ts
+            token_by_outcome = {
+                str(outcome).strip().lower(): token_id
+                for outcome, token_id in zip(outcomes, clob)
+            }
+            self._up_token = token_by_outcome.get("up", clob[0])
+            self._down_token = token_by_outcome.get("down", clob[1])
 
-            # Set strike price from external feed
-            if self.price_feed:
-                try:
-                    self._strike_price = self.price_feed()
-                except Exception:
-                    self._strike_price = 0.0
+            self._strike_price = self.oracle.get_window_start_price(self.asset, discovered_window_ts) or 0.0
+            self._strike_source = "window_start_proxy" if self._strike_price > 0 else ""
 
             # Clear old contexts
             self.contexts.clear()
 
-            log.info("Rolling window: %s | strike=$%.2f | ends=%s",
-                     slug, self._strike_price,
+            log.info("Rolling window: %s | price_to_beat=$%.2f (%s) | ends=%s",
+                     slug, self._strike_price, self._strike_source or "missing",
                      self._end_time.strftime("%H:%M:%S") if self._end_time else "?")
 
         except Exception as e:

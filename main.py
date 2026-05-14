@@ -300,16 +300,18 @@ class TradingSystem:
         from strategies.v2.momentum import Momentum
         from strategies.v2.mm import StoikovMM
         from strategies.v2.meanrev import MeanReversion
+        from strategies.v2.last_seconds_snipe import LastSecondsSnipe
 
         price_feeds = {"btc": get_btc_price, "eth": get_eth_price}
         price_feed = price_feeds.get(asset, get_btc_price)
 
         provider = RollingProvider(self.data_feed, asset=asset, interval=interval, price_feed=price_feed)
         self.rolling_runner = UnifiedRunnerV2(provider, self.pipeline, self.ems, oms=self.oms)
+
+        btc_budget_frac = self.config.capital.strategy_budgets.get("btc5m", 0.10)
+        actual_bankroll = self.config.capital.total_capital_usdc * btc_budget_frac
         
         if "btc5m" in strategies or "momentum" in strategies:
-            btc_budget_frac = self.config.capital.strategy_budgets.get("btc5m", 0.10)
-            actual_bankroll = self.config.capital.total_capital_usdc * btc_budget_frac
             mom = Momentum(
                 bankroll=actual_bankroll,
                 min_edge=self.config.btc5m_min_edge,
@@ -338,9 +340,38 @@ class TradingSystem:
             self.rolling_runner.add(mr)
             self.post_analyzer.register_strategy(mr, "v2_rolling_meanrev")
 
+        if "snipe" in strategies:
+            snipe = LastSecondsSnipe(
+                asset=asset,
+                max_seconds_remaining=self.config.btc5m_snipe_max_seconds,
+                min_seconds_remaining=self.config.btc5m_snipe_min_seconds,
+                min_distance_usd=self.config.btc5m_snipe_min_distance_usd,
+                min_distance_bps=self.config.btc5m_snipe_min_distance_bps,
+                min_market_odds=self.config.btc5m_snipe_min_market_odds,
+                min_edge=self.config.btc5m_snipe_min_edge,
+                min_fair=self.config.btc5m_snipe_min_fair,
+                soft_max_seconds_remaining=self.config.btc5m_snipe_soft_max_seconds,
+                soft_min_distance_usd=self.config.btc5m_snipe_soft_min_distance_usd,
+                soft_min_distance_bps=self.config.btc5m_snipe_soft_min_distance_bps,
+                soft_min_market_odds=self.config.btc5m_snipe_soft_min_market_odds,
+                soft_min_edge=self.config.btc5m_snipe_soft_min_edge,
+                soft_min_fair=self.config.btc5m_snipe_soft_min_fair,
+                kelly_frac=self.config.btc5m_snipe_kelly_frac,
+                max_bet_pct=self.config.btc5m_snipe_max_bet_pct,
+                bankroll=actual_bankroll,
+                max_notional_usdc=self.config.btc5m_snipe_max_notional_usdc,
+                max_vwap_slippage=self.config.btc5m_snipe_max_vwap_slippage,
+                cooldown=self.config.btc5m_snipe_cooldown,
+            )
+            self.rolling_runner.add(snipe)
+            self.post_analyzer.register_strategy(snipe, "v2_btc5m_snipe")
+
         if "oracle" in strategies:
             from strategies.v2.oracle_frontrun import OracleFrontrun
-            oracle = OracleFrontrun(asset=asset, bankroll=actual_bankroll if "btc5m" in strategies or "momentum" in strategies else 10_000)
+            oracle = OracleFrontrun(
+                asset=asset,
+                bankroll=actual_bankroll if "btc5m" in strategies or "momentum" in strategies else 10_000,
+            )
             self.rolling_runner.add(oracle)
             self.post_analyzer.register_strategy(oracle, "v2_oracle_frontrun")
 
@@ -414,7 +445,7 @@ class TradingSystem:
 
         # Setup V2 Rolling Strategies (auto-discovers 5m tokens)
         if "rolling" in strategies:
-            roll_strats = [s for s in strategies if s in ("mm", "meanrev", "btc5m", "momentum", "oracle")]
+            roll_strats = [s for s in strategies if s in ("mm", "meanrev", "btc5m", "momentum", "oracle", "snipe")]
             if not roll_strats:
                 roll_strats = ["momentum", "oracle"]
             self.setup_rolling(roll_strats, asset=asset)
@@ -585,6 +616,7 @@ Strategies (comma-separated or 'all'):
   btc5m    BTC 5-minute rolling markets — momentum (auto)
   rolling  Run strategies on 5-minute rolling markets (momentum + oracle by default)
   oracle   Oracle front-run — exploit Binance-Polymarket price lag
+    snipe    Last-seconds snipe on BTC 5m markets (high-odds endgame)
   all      Run all strategies
 
 5-minute rolling market (all strategies on BTC 5m):
@@ -600,7 +632,7 @@ Examples:
         """,
     )
     parser.add_argument("--strategy", type=str, default="mm",
-                        help="Strategy: mm, whale, meanrev, btc5m, rolling, oracle, all (comma-separated)")
+                        help="Strategy: mm, whale, meanrev, btc5m, rolling, oracle, snipe, all (comma-separated)")
     parser.add_argument("--search", type=str, default="",
                         help="Search for market(s) interactively")
     parser.add_argument("--token", type=str,
