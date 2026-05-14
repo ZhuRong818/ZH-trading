@@ -87,3 +87,49 @@ class OracleFairValueSkill:
             fair_down=fair_down,
             reason=f"oracle: {move_bps:.1f}bps move → {prob_shift:.3f} prob shift",
         )
+
+
+class LeadLagFairValueSkill:
+    """
+    Fair value from a LEADER asset's price move applied to a FOLLOWER asset.
+
+    When BTC moves sharply, correlated assets (ETH, SOL, XRP) tend to follow
+    with a 1-5 second lag. This skill uses the leader's PriceFeatures to
+    estimate fair value on the follower's market.
+
+    The follower's own price doesn't matter for fair value — only the
+    leader's move matters, because the edge is in the speed of propagation.
+
+    Portable: can be used with any leader/follower pair.
+    """
+
+    def __init__(self, scale: float = 50.0, max_shift: float = 0.35,
+                 correlation_discount: float = 0.90):
+        self.scale = scale
+        self.max_shift = max_shift
+        self.correlation_discount = correlation_discount  # dampen for imperfect correlation
+
+    def estimate(self, leader_features: PriceFeatures, follower_market: RollingMarket) -> Optional[FairValue]:
+        """
+        Estimate fair value of a follower market based on leader's price move.
+
+        Args:
+            leader_features: PriceFeatures from the LEADER asset (e.g., BTC)
+            follower_market: RollingMarket of the FOLLOWER asset (e.g., ETH)
+        """
+        move_bps = leader_features.move_bps
+        prob_shift = min(abs(move_bps) / self.scale, self.max_shift)
+        prob_shift *= self.correlation_discount
+
+        if move_bps > 0:
+            fair_up = 0.50 + prob_shift
+            fair_down = 1.0 - fair_up
+        else:
+            fair_down = 0.50 + prob_shift
+            fair_up = 1.0 - fair_down
+
+        return FairValue(
+            fair_up=fair_up,
+            fair_down=fair_down,
+            reason=f"leadlag: leader {move_bps:.1f}bps → follower shift {prob_shift:.3f} (corr={self.correlation_discount:.0%})",
+        )
