@@ -278,6 +278,218 @@ class OracleReplayStrategy:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Strategy 2: Momentum V2
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MomentumReplayStrategy:
+    """
+    Replays V2 momentum logic on recorded data.
+
+    Uses z-score from distance to strike, adjusted for volatility and
+    momentum drift. Mirrors strategies/v2/momentum.py logic.
+    """
+    name = "momentum"
+
+    def __init__(
+        self,
+        min_edge: float = 0.16,
+        max_price: float = 0.55,
+        min_price: float = 0.40,
+        down_edge_boost: float = 0.10,
+        fair_cap: float = 0.80,
+        min_abs_z: float = 0.15,
+        down_min_abs_z: float = 0.45,
+        min_mom_vol_ratio: float = 0.8,
+        min_distance_bps: float = 2.0,
+        min_entry_age: float = 60.0,
+        entry_deadline: float = 180.0,
+        confirmations_required: int = 2,
+        momentum_window: int = 20,
+        max_notional_usdc: float = 500.0,
+    ):
+        self.min_edge = min_edge
+        self.max_price = max_price
+        self.min_price = min_price
+        self.down_edge_boost = down_edge_boost
+        self.fair_cap = fair_cap
+        self.min_abs_z = min_abs_z
+        self.down_min_abs_z = down_min_abs_z
+        self.min_mom_vol_ratio = min_mom_vol_ratio
+        self.min_distance_bps = min_distance_bps
+        self.min_entry_age = min_entry_age
+        self.entry_deadline = entry_deadline
+        self.confirmations_required = max(1, confirmations_required)
+        self.momentum_window = momentum_window
+        self.max_notional_usdc = max_notional_usdc
+
+    def run(self, records: List[dict], bankroll: float = 10_000) -> ReplayResult:
+        import math
+
+        result = ReplayResult(
+            asset=records[0]["asset"] if records else "?",
+            strategy=self.name,
+            bankroll=bankroll,
+        )
+        result.equity_curve.append(bankroll)
+
+        prices = deque(maxlen=200)
+        current_trade: Optional[ReplayTrade] = None
+        current_slug = None
+        window_outcomes = compute_window_outcomes(records)
+
+        # Confirmation tracking
+        pending_key: Optional[tuple] = None  # (direction, slug)
+        pending_count = 0
+
+        for rec in records:
+            ts = rec["ts"]
+            btc_price = rec["price"]
+            slug = rec["slug"]
+            strike = rec.get("strike", 0)
+            up_sell = rec.get("up_sell", 0) or rec.get("up_mid", 0)
+            down_sell = rec.get("down_sell", 0) or rec.get("down_mid", 0)
+            remaining = rec.get("seconds_remaining", 0)
+            window_age = max(0, 300 - remaining)
+
+            # Window change — settle and reset
+            if slug != current_slug:
+                if current_trade is not None:
+                    settle_trade(current_trade, window_outcomes, result)
+                    current_trade = None
+                current_slug = slug
+                pending_key = None
+                pending_count = 0
+
+            prices.append(btc_price)
+
+            # Already in a trade — hold to settlement
+            if current_trade is not None:
+                continue
+
+            # Need enough price history
+            if len(prices) < self.momentum_window + 1:
+                continue
+
+            # Entry window: after min_entry_age, before entry_deadline
+            if window_age < self.min_entry_age:
+                continue
+            if remaining < self.entry_deadline:
+                continue
+
+            if btc_price <= 0 or strike <= 0:
+                continue
+
+            # Compute momentum and volatility
+            n = min(self.momentum_window, len(prices))
+            price_list = list(prices)
+            momentum = (price_list[-1] - price_list[-n]) / price_list[-n]
+            returns = [(price_list[i] - price_list[i-1]) / price_list[i-1]
+                       for i in range(-n+1, 0)]
+            vol = max((sum(r**2 for r in returns) / len(returns)) ** 0.5, 0.00002) if returns else 0.001
+
+            # Momentum quality filter
+            mom_vol_ratio = abs(momentum) / vol if vol > 0 else 0
+            if mom_vol_ratio < self.min_mom_vol_ratio:
+                continue
+
+            # Z-score from distance to strike
+            # Estimate sample interval (~0.3s for async recorder)
+            sample_interval = 0.3
+            horizon_ticks = max(remaining / sample_interval, 1.0)
+            horizon_sigma = btc_price * vol * math.sqrt(horizon_ticks)
+            distance = btc_price - strike
+            z_score = distance / horizon_sigma if horizon_sigma > 0 else 0
+            distance_bps = abs(distance) / btc_price * 10_000
+
+            if abs(z_score) < self.min_abs_z:
+                continue
+            if distance_bps < self.min_distance_bps:
+                continue
+
+            # Drift adjustment
+            mom_z = max(-2.0, min(2.0, momentum / vol if vol > 0 else 0))
+            adjusted_z = z_score + 0.15 * mom_z
+
+            # Convert to probability
+            fair_prob_up = 0.5 * (1.0 + math.erf(adjusted_z / math.sqrt(2.0)))
+            fair_prob_up = max(1.0 - self.fair_cap, min(self.fair_cap, fair_prob_up))
+
+            # Direction
+            if fair_prob_up > 0.52:
+                direction = "UP"
+                fair = fair_prob_up
+                market_price = up_sell
+            elif fair_prob_up < 0.48:
+                direction = "DOWN"
+                fair = 1 - fair_prob_up
+                market_price = down_sell
+            else:
+                continue
+
+            if market_price <= 0:
+                continue
+
+            # DOWN-specific z gate
+            if direction == "DOWN" and abs(z_score) < self.down_min_abs_z:
+                continue
+
+            # Price band
+            if market_price > self.max_price or market_price < self.min_price:
+                continue
+
+            # Required edge
+            if direction == "DOWN":
+                required_edge = max(self.min_edge + self.down_edge_boost, 0.26)
+            elif direction == "UP" and market_price >= 0.50:
+                required_edge = max(self.min_edge, 0.18)
+            else:
+                required_edge = self.min_edge
+
+            edge = fair - market_price
+            if edge <= 0 or edge < required_edge:
+                continue
+
+            # Confirmation: need N consecutive same-direction signals
+            key = (direction, slug)
+            if key == pending_key:
+                pending_count += 1
+            else:
+                pending_key = key
+                pending_count = 1
+
+            if pending_count < self.confirmations_required:
+                continue
+
+            # Kelly sizing
+            size_usdc = min(
+                kelly_size(fair, market_price, result.bankroll),
+                self.max_notional_usdc,
+            )
+            if size_usdc < 5:
+                continue
+            shares = size_usdc / market_price
+            fee = shares * FEE_RATE * market_price * (1 - market_price)
+
+            current_trade = ReplayTrade(
+                strategy=self.name, window_slug=slug, asset=rec["asset"],
+                direction=direction, entry_price=market_price, fair_value=fair,
+                edge=edge, size_usdc=size_usdc, shares=shares, entry_ts=ts, fee=fee,
+                seconds_remaining=remaining,
+                meta=f"z={z_score:.2f} mom={momentum*100:.3f}% dist={distance_bps:.1f}bps",
+            )
+            # Reset confirmation after entry
+            pending_key = None
+            pending_count = 0
+
+        # Settle final trade
+        if current_trade is not None:
+            settle_trade(current_trade, window_outcomes, result)
+
+        compute_max_drawdown(result)
+        return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Strategy 3: Cross-Asset Lead-Lag
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -690,7 +902,7 @@ def print_report(strategy_name: str, results: dict[str, ReplayResult], params: d
 def main():
     parser = argparse.ArgumentParser(description="Replay backtest on recorded data")
     parser.add_argument("--strategy", type=str, default="oracle",
-                        help="Strategy: oracle, leadlag, convergence, or comma-separated (default: oracle)")
+                        help="Strategy: oracle, momentum, leadlag, convergence, or comma-separated")
     parser.add_argument("--assets", type=str, default="btc,eth,sol,xrp",
                         help="Assets to backtest (default: btc,eth,sol,xrp)")
     parser.add_argument("--data-dir", type=str, default="data_v2",
@@ -719,6 +931,18 @@ def main():
                         help="Lead-lag move threshold bps (default: 5.0)")
     parser.add_argument("--lag-staleness", type=float, default=0.10,
                         help="Lead-lag staleness threshold (default: 0.10)")
+
+    # Momentum params
+    parser.add_argument("--min-edge", type=float, default=0.16,
+                        help="Momentum min edge (default: 0.16)")
+    parser.add_argument("--mom-min-price", type=float, default=0.40,
+                        help="Momentum min entry price (default: 0.40)")
+    parser.add_argument("--fair-cap", type=float, default=0.80,
+                        help="Momentum fair probability cap (default: 0.80)")
+    parser.add_argument("--confirmations", type=int, default=2,
+                        help="Momentum confirmations required (default: 2)")
+    parser.add_argument("--down-edge-boost", type=float, default=0.10,
+                        help="Momentum extra DOWN min edge (default: 0.10)")
 
     # Convergence params
     parser.add_argument("--conv-threshold", type=float, default=0.88,
@@ -771,6 +995,28 @@ def main():
             print_report("Oracle Frontrun", results, {
                 "move_bps": args.move_bps, "staleness": args.staleness,
                 "max_price": args.max_price, "min_price": args.min_price,
+            })
+
+        elif strat_name == "momentum":
+            results = {}
+            for asset in sorted(all_records):
+                recs = all_records[asset]
+                windows = len(set(r["slug"] for r in recs))
+                print(f"[momentum] Replaying {asset.upper()}: {len(recs):,} ticks, {windows} windows...")
+                strategy = MomentumReplayStrategy(
+                    min_edge=args.min_edge,
+                    max_price=args.max_price,
+                    min_price=args.mom_min_price,
+                    fair_cap=args.fair_cap,
+                    confirmations_required=args.confirmations,
+                    down_edge_boost=args.down_edge_boost,
+                    max_notional_usdc=args.max_notional,
+                )
+                results[asset] = strategy.run(recs, bankroll=args.bankroll)
+            print_report("Momentum V2", results, {
+                "min_edge": args.min_edge, "max_price": args.max_price,
+                "min_price": args.mom_min_price, "fair_cap": args.fair_cap,
+                "confirmations": args.confirmations, "down_edge_boost": args.down_edge_boost,
             })
 
         elif strat_name == "leadlag":
