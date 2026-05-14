@@ -29,6 +29,8 @@ BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 ASSET_SYMBOLS = {
     "btc": "BTCUSDT",
     "eth": "ETHUSDT",
+    "sol": "SOLUSDT",
+    "xrp": "XRPUSDT",
 }
 
 

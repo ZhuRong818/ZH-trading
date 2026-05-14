@@ -296,20 +296,32 @@ class TradingSystem:
         """Initialize rolling runner and requested V2 strategies for continuous markets."""
         from strategies.v2.runner import UnifiedRunnerV2
         from data_pipeline.market_provider import RollingProvider
-        from data_pipeline.price_feeds import get_btc_price, get_eth_price
+        from data_pipeline.price_feeds import get_btc_price, get_eth_price, get_sol_price, get_xrp_price
         from strategies.v2.momentum import Momentum
         from strategies.v2.mm import StoikovMM
         from strategies.v2.meanrev import MeanReversion
         from strategies.v2.last_seconds_snipe import LastSecondsSnipe
 
-        price_feeds = {"btc": get_btc_price, "eth": get_eth_price}
+        price_feeds = {
+            "btc": get_btc_price,
+            "eth": get_eth_price,
+            "sol": get_sol_price,
+            "xrp": get_xrp_price,
+        }
         price_feed = price_feeds.get(asset, get_btc_price)
 
         provider = RollingProvider(self.data_feed, asset=asset, interval=interval, price_feed=price_feed)
         self.rolling_runner = UnifiedRunnerV2(provider, self.pipeline, self.ems, oms=self.oms)
 
-        btc_budget_frac = self.config.capital.strategy_budgets.get("btc5m", 0.10)
-        actual_bankroll = self.config.capital.total_capital_usdc * btc_budget_frac
+        default_budget = self.config.capital.strategy_budgets.get("btc5m", 0.10)
+        budget_key = {
+            "btc": "btc5m",
+            "eth": "eth5m",
+            "sol": "sol5m",
+            "xrp": "xrp5m",
+        }.get(asset, "btc5m")
+        budget_frac = self.config.capital.strategy_budgets.get(budget_key, default_budget)
+        actual_bankroll = self.config.capital.total_capital_usdc * budget_frac
         
         if "btc5m" in strategies or "momentum" in strategies:
             mom = Momentum(
@@ -341,25 +353,60 @@ class TradingSystem:
             self.post_analyzer.register_strategy(mr, "v2_rolling_meanrev")
 
         if "snipe" in strategies:
+            snipe_params = {
+                "btc": {
+                    "min_seconds_remaining": self.config.btc5m_snipe_min_seconds,
+                    "min_distance_usd": self.config.btc5m_snipe_min_distance_usd,
+                    "soft_min_distance_usd": self.config.btc5m_snipe_soft_min_distance_usd,
+                    "min_market_odds": self.config.btc5m_snipe_min_market_odds,
+                    "soft_min_market_odds": self.config.btc5m_snipe_soft_min_market_odds,
+                    "max_notional_usdc": self.config.btc5m_snipe_max_notional_usdc,
+                },
+                "eth": {
+                    "min_seconds_remaining": self.config.eth5m_snipe_min_seconds,
+                    "min_distance_usd": self.config.eth5m_snipe_min_distance_usd,
+                    "soft_min_distance_usd": self.config.eth5m_snipe_soft_min_distance_usd,
+                    "min_market_odds": self.config.eth5m_snipe_min_market_odds,
+                    "soft_min_market_odds": self.config.eth5m_snipe_soft_min_market_odds,
+                    "max_notional_usdc": self.config.eth5m_snipe_max_notional_usdc,
+                },
+                "sol": {
+                    "min_seconds_remaining": self.config.sol5m_snipe_min_seconds,
+                    "min_distance_usd": self.config.sol5m_snipe_min_distance_usd,
+                    "soft_min_distance_usd": self.config.sol5m_snipe_soft_min_distance_usd,
+                    "min_market_odds": self.config.sol5m_snipe_min_market_odds,
+                    "soft_min_market_odds": self.config.sol5m_snipe_soft_min_market_odds,
+                    "max_notional_usdc": self.config.sol5m_snipe_max_notional_usdc,
+                },
+                "xrp": {
+                    "min_seconds_remaining": self.config.xrp5m_snipe_min_seconds,
+                    "min_distance_usd": self.config.xrp5m_snipe_min_distance_usd,
+                    "soft_min_distance_usd": self.config.xrp5m_snipe_soft_min_distance_usd,
+                    "min_market_odds": self.config.xrp5m_snipe_min_market_odds,
+                    "soft_min_market_odds": self.config.xrp5m_snipe_soft_min_market_odds,
+                    "max_notional_usdc": self.config.xrp5m_snipe_max_notional_usdc,
+                },
+            }
+            p = snipe_params.get(asset, snipe_params["btc"])
             snipe = LastSecondsSnipe(
                 asset=asset,
                 max_seconds_remaining=self.config.btc5m_snipe_max_seconds,
-                min_seconds_remaining=self.config.btc5m_snipe_min_seconds,
-                min_distance_usd=self.config.btc5m_snipe_min_distance_usd,
+                min_seconds_remaining=p["min_seconds_remaining"],
+                min_distance_usd=p["min_distance_usd"],
                 min_distance_bps=self.config.btc5m_snipe_min_distance_bps,
-                min_market_odds=self.config.btc5m_snipe_min_market_odds,
+                min_market_odds=p["min_market_odds"],
                 min_edge=self.config.btc5m_snipe_min_edge,
                 min_fair=self.config.btc5m_snipe_min_fair,
                 soft_max_seconds_remaining=self.config.btc5m_snipe_soft_max_seconds,
-                soft_min_distance_usd=self.config.btc5m_snipe_soft_min_distance_usd,
+                soft_min_distance_usd=p["soft_min_distance_usd"],
                 soft_min_distance_bps=self.config.btc5m_snipe_soft_min_distance_bps,
-                soft_min_market_odds=self.config.btc5m_snipe_soft_min_market_odds,
+                soft_min_market_odds=p["soft_min_market_odds"],
                 soft_min_edge=self.config.btc5m_snipe_soft_min_edge,
                 soft_min_fair=self.config.btc5m_snipe_soft_min_fair,
                 kelly_frac=self.config.btc5m_snipe_kelly_frac,
                 max_bet_pct=self.config.btc5m_snipe_max_bet_pct,
                 bankroll=actual_bankroll,
-                max_notional_usdc=self.config.btc5m_snipe_max_notional_usdc,
+                max_notional_usdc=p["max_notional_usdc"],
                 max_vwap_slippage=self.config.btc5m_snipe_max_vwap_slippage,
                 cooldown=self.config.btc5m_snipe_cooldown,
             )
@@ -615,12 +662,13 @@ Strategies (comma-separated or 'all'):
   meanrev  Mean reversion — buy dips, sell rips in contested markets
   btc5m    BTC 5-minute rolling markets — momentum (auto)
   rolling  Run strategies on 5-minute rolling markets (momentum + oracle by default)
-  oracle   Oracle front-run — exploit Binance-Polymarket price lag
-    snipe    Last-seconds snipe on BTC 5m markets (high-odds endgame)
+    oracle   Oracle front-run — exploit Binance-Polymarket price lag
+        snipe    Last-seconds snipe on rolling 5m markets (high-odds endgame)
   all      Run all strategies
 
 5-minute rolling market (all strategies on BTC 5m):
-  python main.py --strategy rolling --rolling-asset btc --dry-run --no-learn
+    python main.py --strategy rolling --rolling-asset btc --dry-run --no-learn
+    python main.py --strategy rolling --rolling-asset eth --dry-run --no-learn
 
 Examples:
   python main.py --strategy mm --search "bitcoin" --dry-run
@@ -656,7 +704,7 @@ Examples:
     parser.add_argument("--reconcile-interval", type=float, default=30.0,
                         help="Seconds between position reconciliation (default: 30)")
     parser.add_argument("--rolling-asset", type=str, default="btc",
-                        help="Asset for rolling 5m markets: btc or eth (default: btc)")
+                        help="Asset for rolling 5m markets: btc, eth, sol, xrp (default: btc)")
     parser.add_argument("--no-learn", action="store_true",
                         help="Disable learning from past sessions")
     parser.add_argument("--verbose", action="store_true",
