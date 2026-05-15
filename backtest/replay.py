@@ -18,6 +18,7 @@ Usage:
 """
 
 import argparse
+import copy
 import json
 import logging
 import os
@@ -1003,6 +1004,209 @@ class SnipeReplayStrategy:
 # Data loading
 # ─────────────────────────────────────────────────────────────────────────────
 
+class PortfolioReplayStrategy:
+    """
+    Portfolio layer over replay wrappers.
+
+    The underlying wrappers remain responsible for strategy entry logic. This
+    class only filters, prioritizes, and resizes candidate trades.
+    """
+    name = "portfolio"
+
+    WEIGHTS = {
+        "warmup": {"oracle": 0.50, "leadlag": 0.50},
+        "early_contested": {"momentum": 0.40, "oracle": 0.35, "leadlag": 0.25},
+        "mid_shock": {"oracle": 0.40, "leadlag": 0.40, "momentum": 0.20},
+        "endgame": {"snipe": 0.70, "oracle": 0.15, "leadlag": 0.15},
+        "deadzone": {},
+    }
+    PRIORITY = {"snipe": 4, "oracle": 3, "leadlag": 2, "momentum": 1}
+
+    def __init__(
+        self,
+        move_bps: float = 6.0,
+        staleness: float = 0.15,
+        max_price: float = 0.55,
+        min_price: float = 0.20,
+        max_notional: float = 500,
+        leader: str = "btc",
+        lag_bps: float = 5.0,
+        lag_staleness: float = 0.10,
+        min_edge: float = 0.16,
+        mom_min_price: float = 0.40,
+        fair_cap: float = 0.80,
+        confirmations: int = 2,
+        down_edge_boost: float = 0.10,
+        stop_loss: float = 0.0,
+    ):
+        self.move_bps = move_bps
+        self.staleness = staleness
+        self.max_price = max_price
+        self.min_price = min_price
+        self.max_notional = max_notional
+        self.leader = leader
+        self.lag_bps = lag_bps
+        self.lag_staleness = lag_staleness
+        self.min_edge = min_edge
+        self.mom_min_price = mom_min_price
+        self.fair_cap = fair_cap
+        self.confirmations = confirmations
+        self.down_edge_boost = down_edge_boost
+        self.stop_loss = stop_loss
+
+    def run_multi(self, all_records: Dict[str, List[dict]], bankroll: float = 10_000) -> Dict[str, ReplayResult]:
+        candidates: list[ReplayTrade] = []
+
+        for asset, recs in sorted(all_records.items()):
+            oracle = OracleReplayStrategy(
+                move_threshold_bps=self.move_bps,
+                staleness_threshold=self.staleness,
+                max_price=self.max_price,
+                min_price=self.min_price,
+                max_notional_usdc=self.max_notional,
+            )
+            momentum = MomentumReplayStrategy(
+                min_edge=self.min_edge,
+                max_price=self.max_price,
+                min_price=self.mom_min_price,
+                fair_cap=self.fair_cap,
+                confirmations_required=self.confirmations,
+                down_edge_boost=self.down_edge_boost,
+                max_notional_usdc=self.max_notional,
+            )
+            snipe = SnipeReplayStrategy(max_notional_usdc=self.max_notional, stop_loss_price=self.stop_loss)
+
+            for child_name, result in [
+                ("oracle", oracle.run(recs, bankroll=bankroll)),
+                ("momentum", momentum.run(recs, bankroll=bankroll)),
+                ("snipe", snipe.run(recs, bankroll=bankroll)),
+            ]:
+                candidates.extend(self._tag_trade(t, child_name) for t in result.trades)
+
+        if self.leader in all_records:
+            leadlag = LeadLagReplayStrategy(
+                leader=self.leader,
+                move_threshold_bps=self.lag_bps,
+                staleness_threshold=self.lag_staleness,
+                max_price=self.max_price,
+                min_price=self.min_price,
+                max_notional_usdc=self.max_notional,
+            )
+            for result in leadlag.run_multi(all_records, bankroll=bankroll).values():
+                candidates.extend(self._tag_trade(t, "leadlag") for t in result.trades)
+
+        selected = self._select_candidates(candidates, bankroll)
+        return self._build_results(selected, all_records, bankroll)
+
+    def _select_candidates(self, candidates: List[ReplayTrade], bankroll: float) -> List[ReplayTrade]:
+        by_window = defaultdict(list)
+        for trade in candidates:
+            child = self._meta_value(trade.meta, "child")
+            regime = self._regime(trade.seconds_remaining)
+            if self.WEIGHTS.get(regime, {}).get(child, 0.0) <= 0:
+                continue
+            by_window[(trade.asset, trade.window_slug)].append(trade)
+
+        chosen: List[ReplayTrade] = []
+        for trades in by_window.values():
+            snipe_trades = [t for t in trades if self._meta_value(t.meta, "child") == "snipe"]
+            pool = snipe_trades or trades
+            pool.sort(
+                key=lambda t: (
+                    self.PRIORITY.get(self._meta_value(t.meta, "child"), 0),
+                    t.edge,
+                ),
+                reverse=True,
+            )
+            chosen.append(pool[0])
+
+        chosen.sort(key=lambda t: t.entry_ts)
+        open_positions: list[tuple[float, float]] = []
+        window_used = defaultdict(float)
+        output: List[ReplayTrade] = []
+
+        for trade in chosen:
+            regime = self._regime(trade.seconds_remaining)
+            child = self._meta_value(trade.meta, "child")
+            weights = self.WEIGHTS.get(regime, {})
+            settle_ts = trade.entry_ts + max(trade.seconds_remaining, 0)
+            open_positions = [(ts, n) for ts, n in open_positions if ts > trade.entry_ts]
+            open_notional = sum(n for _ts, n in open_positions)
+
+            sleeve_cap = bankroll * weights.get(child, 0.0)
+            window_cap = bankroll * 0.25
+            total_cap_left = bankroll * 0.60 - open_notional
+            window_key = (trade.asset, trade.window_slug)
+            allowed = min(trade.size_usdc, sleeve_cap, window_cap - window_used[window_key], total_cap_left)
+            if allowed < 5 or trade.size_usdc <= 0:
+                continue
+
+            resized = copy.copy(trade)
+            ratio = allowed / trade.size_usdc
+            resized.size_usdc = allowed
+            resized.shares *= ratio
+            resized.fee *= ratio
+            resized.pnl *= ratio
+            resized.strategy = self.name
+            resized.meta = f"regime={regime} {resized.meta}".strip()
+
+            window_used[window_key] += allowed
+            open_positions.append((settle_ts, allowed))
+            output.append(resized)
+
+        return output
+
+    def _build_results(self, trades: List[ReplayTrade], all_records: Dict[str, List[dict]], bankroll: float) -> Dict[str, ReplayResult]:
+        results = {
+            asset: ReplayResult(asset=asset, strategy=self.name, bankroll=bankroll, equity_curve=[bankroll])
+            for asset in all_records
+        }
+        for trade in trades:
+            result = results.setdefault(
+                trade.asset,
+                ReplayResult(asset=trade.asset, strategy=self.name, bankroll=bankroll, equity_curve=[bankroll]),
+            )
+            result.trades.append(trade)
+            result.total_pnl += trade.pnl
+            result.total_fees += trade.fee
+            result.bankroll += trade.pnl
+            if trade.outcome == "WIN":
+                result.wins += 1
+            else:
+                result.losses += 1
+            result.equity_curve.append(result.bankroll)
+
+        for result in results.values():
+            compute_max_drawdown(result)
+        return results
+
+    @staticmethod
+    def _tag_trade(trade: ReplayTrade, child: str) -> ReplayTrade:
+        tagged = copy.copy(trade)
+        tagged.meta = f"child={child} {tagged.meta}".strip()
+        return tagged
+
+    @staticmethod
+    def _regime(remaining: float) -> str:
+        if remaining < 12:
+            return "deadzone"
+        if remaining <= 60:
+            return "endgame"
+        if remaining <= 180:
+            return "mid_shock"
+        if remaining <= 240:
+            return "early_contested"
+        return "warmup"
+
+    @staticmethod
+    def _meta_value(meta: str, key: str) -> str:
+        prefix = f"{key}="
+        for part in (meta or "").split():
+            if part.startswith(prefix):
+                return part[len(prefix):]
+        return ""
+
+
 def load_records(data_dir: str = "data_v2", file_path: str = None, assets: list = None) -> dict:
     """Load JSONL records grouped by asset."""
     records = defaultdict(list)
@@ -1029,6 +1233,14 @@ def load_records(data_dir: str = "data_v2", file_path: str = None, assets: list 
 # ─────────────────────────────────────────────────────────────────────────────
 # Reporting
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _meta_value(meta: str, key: str) -> str:
+    prefix = f"{key}="
+    for part in (meta or "").split():
+        if part.startswith(prefix):
+            return part[len(prefix):]
+    return ""
+
 
 def print_report(strategy_name: str, results: dict[str, ReplayResult], params: dict):
     """Print backtest results."""
@@ -1071,6 +1283,27 @@ def print_report(strategy_name: str, results: dict[str, ReplayResult], params: d
             avg_edge = sum(t.edge for t in result.trades) / len(result.trades)
             print(f"  Avg entry: {avg_entry:.3f} | Avg edge: {avg_edge:.3f}")
 
+            if any("child=" in (t.meta or "") for t in result.trades):
+                child_counts = defaultdict(lambda: [0, 0, 0.0])
+                regime_counts = defaultdict(lambda: [0, 0, 0.0])
+                for t in result.trades:
+                    child = _meta_value(t.meta, "child") or "?"
+                    regime = _meta_value(t.meta, "regime") or "?"
+                    child_counts[child][0] += 1
+                    child_counts[child][1] += 1 if t.outcome == "WIN" else 0
+                    child_counts[child][2] += t.pnl
+                    regime_counts[regime][0] += 1
+                    regime_counts[regime][1] += 1 if t.outcome == "WIN" else 0
+                    regime_counts[regime][2] += t.pnl
+                child_str = ", ".join(
+                    f"{k}:{v[0]}({v[1]}W ${v[2]:+.0f})" for k, v in sorted(child_counts.items())
+                )
+                regime_str = ", ".join(
+                    f"{k}:{v[0]}({v[1]}W ${v[2]:+.0f})" for k, v in sorted(regime_counts.items())
+                )
+                print(f"  Child: {child_str}")
+                print(f"  Regime: {regime_str}")
+
             print(f"  Trades:")
             for t in result.trades:
                 extra = f" | {t.meta}" if t.meta else ""
@@ -1094,7 +1327,7 @@ def print_report(strategy_name: str, results: dict[str, ReplayResult], params: d
 def main():
     parser = argparse.ArgumentParser(description="Replay backtest on recorded data")
     parser.add_argument("--strategy", type=str, default="oracle",
-                        help="Strategy: oracle, momentum, leadlag, convergence, snipe, or comma-separated")
+                        help="Strategy: oracle, momentum, leadlag, convergence, snipe, portfolio, or comma-separated")
     parser.add_argument("--assets", type=str, default="btc,eth,sol,xrp",
                         help="Assets to backtest (default: btc,eth,sol,xrp)")
     parser.add_argument("--data-dir", type=str, default="data_v2",
@@ -1272,6 +1505,33 @@ def main():
             sl_label = f"stop_loss={args.stop_loss}" if args.stop_loss > 0 else "stop_loss=OFF"
             print_report("Last Seconds Snipe", results, {
                 "strict": "30s/0.98/$25", "soft": "60s/0.90/$50", "stop_loss": sl_label,
+            })
+
+        elif strat_name == "portfolio":
+            strategy = PortfolioReplayStrategy(
+                move_bps=args.move_bps,
+                staleness=args.staleness,
+                max_price=args.max_price,
+                min_price=args.min_price,
+                max_notional=args.max_notional,
+                leader=args.leader,
+                lag_bps=args.lag_bps,
+                lag_staleness=args.lag_staleness,
+                min_edge=args.min_edge,
+                mom_min_price=args.mom_min_price,
+                fair_cap=args.fair_cap,
+                confirmations=args.confirmations,
+                down_edge_boost=args.down_edge_boost,
+                stop_loss=args.stop_loss,
+            )
+            total_ticks = sum(len(r) for r in all_records.values())
+            print(f"[portfolio] Replaying {len(all_records)} assets, {total_ticks:,} ticks...")
+            results = strategy.run_multi(all_records, bankroll=args.bankroll)
+            print_report("Regime Portfolio", results, {
+                "risk": "aggressive",
+                "window_cap": "25%",
+                "total_cap": "60%",
+                "leader": args.leader,
             })
 
         else:
