@@ -817,8 +817,8 @@ class SnipeReplayStrategy:
     Replays last_seconds_snipe logic on recorded data.
 
     Two tiers:
-      - Strict (last 30s): needs price > 0.98, distance > $25
-      - Soft (30-60s): needs price > 0.90, distance > $50
+      - Strict (last 30s): needs 0.82 <= price <= 0.94, distance > $30
+      - Soft (30-45s): needs 0.85 <= price <= 0.93, distance > $45
 
     Direction is determined by BTC price vs strike, then confirmed
     by Polymarket odds alignment.
@@ -831,16 +831,18 @@ class SnipeReplayStrategy:
     def __init__(
         self,
         max_seconds_remaining: float = 30.0,
-        min_seconds_remaining: float = 12.0,
-        min_distance_usd: float = 25.0,
-        min_market_odds: float = 0.98,
-        min_edge: float = 0.005,
+        min_seconds_remaining: float = 15.0,
+        min_distance_usd: float = 30.0,
+        min_market_odds: float = 0.82,
+        max_market_odds: float = 0.94,
+        min_edge: float = 0.04,
         min_fair: float = 0.99,
-        soft_max_seconds_remaining: float = 60.0,
-        soft_min_distance_usd: float = 50.0,
-        soft_min_market_odds: float = 0.90,
-        soft_min_edge: float = 0.02,
-        soft_min_fair: float = 0.95,
+        soft_max_seconds_remaining: float = 45.0,
+        soft_min_distance_usd: float = 45.0,
+        soft_min_market_odds: float = 0.85,
+        soft_max_market_odds: float = 0.93,
+        soft_min_edge: float = 0.05,
+        soft_min_fair: float = 0.98,
         max_notional_usdc: float = 250.0,
         stop_loss_price: float = 0.0,  # 0 = disabled, e.g. 0.70 = sell if mid drops below 0.70
     ):
@@ -848,11 +850,13 @@ class SnipeReplayStrategy:
         self.min_seconds = min_seconds_remaining
         self.min_distance_usd = min_distance_usd
         self.min_market_odds = min_market_odds
+        self.max_market_odds = max_market_odds
         self.min_edge = min_edge
         self.min_fair = min_fair
         self.soft_max_seconds = soft_max_seconds_remaining
         self.soft_min_distance_usd = soft_min_distance_usd
         self.soft_min_market_odds = soft_min_market_odds
+        self.soft_max_market_odds = soft_max_market_odds
         self.soft_min_edge = soft_min_edge
         self.soft_min_fair = soft_min_fair
         self.max_notional_usdc = max_notional_usdc
@@ -940,6 +944,7 @@ class SnipeReplayStrategy:
             tier = "strict" if remaining <= self.max_seconds else "soft"
             min_distance = self.min_distance_usd if tier == "strict" else self.soft_min_distance_usd
             min_odds = self.min_market_odds if tier == "strict" else self.soft_min_market_odds
+            max_odds = self.max_market_odds if tier == "strict" else self.soft_max_market_odds
             min_edge = self.min_edge if tier == "strict" else self.soft_min_edge
             min_fair = self.min_fair if tier == "strict" else self.soft_min_fair
 
@@ -963,6 +968,8 @@ class SnipeReplayStrategy:
 
             # Market odds check
             if market_price < min_odds:
+                continue
+            if market_price > max_odds:
                 continue
 
             # Direction mismatch: opposite side shouldn't be more confident
@@ -1017,7 +1024,7 @@ class PortfolioReplayStrategy:
         "warmup": {"oracle": 0.50, "leadlag": 0.50},
         "early_contested": {"momentum": 0.40, "oracle": 0.35, "leadlag": 0.25},
         "mid_shock": {"oracle": 0.40, "leadlag": 0.40, "momentum": 0.20},
-        "endgame": {"snipe": 0.70, "oracle": 0.15, "leadlag": 0.15},
+        "endgame": {"snipe": 0.50, "oracle": 0.25, "leadlag": 0.25},
         "deadzone": {},
     }
     PRIORITY = {"snipe": 4, "oracle": 3, "leadlag": 2, "momentum": 1}
@@ -1504,7 +1511,9 @@ def main():
                 results[asset] = strategy.run(recs, bankroll=args.bankroll)
             sl_label = f"stop_loss={args.stop_loss}" if args.stop_loss > 0 else "stop_loss=OFF"
             print_report("Last Seconds Snipe", results, {
-                "strict": "30s/0.98/$25", "soft": "60s/0.90/$50", "stop_loss": sl_label,
+                "strict": "15-30s/0.82-0.94/$30",
+                "soft": "30-45s/0.85-0.93/$45",
+                "stop_loss": sl_label,
             })
 
         elif strat_name == "portfolio":

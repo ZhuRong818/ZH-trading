@@ -26,18 +26,20 @@ class LastSecondsSnipe(BaseStrategy):
         self,
         asset: str = "btc",
         max_seconds_remaining: float = 30.0,
-        min_seconds_remaining: float = 12.0,
-        min_distance_usd: float = 25.0,
+        min_seconds_remaining: float = 15.0,
+        min_distance_usd: float = 30.0,
         min_distance_bps: float = 0.0,
-        min_market_odds: float = 0.98,
-        min_edge: float = 0.005,
+        min_market_odds: float = 0.82,
+        max_market_odds: float = 0.94,
+        min_edge: float = 0.04,
         min_fair: float = 0.99,
-        soft_max_seconds_remaining: float = 60.0,
-        soft_min_distance_usd: float = 50.0,
+        soft_max_seconds_remaining: float = 45.0,
+        soft_min_distance_usd: float = 45.0,
         soft_min_distance_bps: float = 0.0,
-        soft_min_market_odds: float = 0.90,
-        soft_min_edge: float = 0.02,
-        soft_min_fair: float = 0.95,
+        soft_min_market_odds: float = 0.85,
+        soft_max_market_odds: float = 0.93,
+        soft_min_edge: float = 0.05,
+        soft_min_fair: float = 0.98,
         kelly_frac: float = 0.10,
         max_bet_pct: float = 0.01,
         bankroll: float = 5_000.0,
@@ -58,12 +60,14 @@ class LastSecondsSnipe(BaseStrategy):
         self.min_distance_usd = min_distance_usd
         self.min_distance_bps = min_distance_bps
         self.min_market_odds = min_market_odds
+        self.max_market_odds = max_market_odds
         self.min_edge = min_edge
         self.min_fair = min_fair
         self.soft_max_seconds_remaining = soft_max_seconds_remaining
         self.soft_min_distance_usd = soft_min_distance_usd
         self.soft_min_distance_bps = soft_min_distance_bps
         self.soft_min_market_odds = soft_min_market_odds
+        self.soft_max_market_odds = soft_max_market_odds
         self.soft_min_edge = soft_min_edge
         self.soft_min_fair = soft_min_fair
         self.max_notional_usdc = max_notional_usdc
@@ -123,6 +127,7 @@ class LastSecondsSnipe(BaseStrategy):
         min_distance = self.min_distance_usd if tier == "strict" else self.soft_min_distance_usd
         min_distance_bps = self.min_distance_bps if tier == "strict" else self.soft_min_distance_bps
         min_market_odds = self.min_market_odds if tier == "strict" else self.soft_min_market_odds
+        max_market_odds = self.max_market_odds if tier == "strict" else self.soft_max_market_odds
         min_edge = self.min_edge if tier == "strict" else self.soft_min_edge
         min_fair = self.min_fair if tier == "strict" else self.soft_min_fair
 
@@ -161,6 +166,13 @@ class LastSecondsSnipe(BaseStrategy):
             log.debug(
                 "SNIPE REJECT market_odds: direction=%s market_price=%.4f min=%.4f up_ask=%.4f down_ask=%.4f current=%.2f price_to_beat=%.2f dist=%.2f",
                 direction, market_price, min_market_odds, up_ctx.best_ask or 0.0, down_ctx.best_ask or 0.0, current, strike, distance,
+            )
+            self.rejected += 1
+            return []
+        if market_price > max_market_odds:
+            log.debug(
+                "SNIPE REJECT expensive_odds: direction=%s market_price=%.4f max=%.4f up_ask=%.4f down_ask=%.4f current=%.2f price_to_beat=%.2f dist=%.2f",
+                direction, market_price, max_market_odds, up_ctx.best_ask or 0.0, down_ctx.best_ask or 0.0, current, strike, distance,
             )
             self.rejected += 1
             return []

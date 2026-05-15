@@ -110,18 +110,20 @@ class SystemConfig:
     btc5m_down_edge_boost: float = 0.10
 
     btc5m_snipe_max_seconds: float = 30.0
-    btc5m_snipe_min_seconds: float = 12.0
-    btc5m_snipe_min_distance_usd: float = 25.0
+    btc5m_snipe_min_seconds: float = 15.0
+    btc5m_snipe_min_distance_usd: float = 30.0
     btc5m_snipe_min_distance_bps: float = 0.0
-    btc5m_snipe_min_market_odds: float = 0.98
-    btc5m_snipe_min_edge: float = 0.005
+    btc5m_snipe_min_market_odds: float = 0.82
+    btc5m_snipe_max_market_odds: float = 0.94
+    btc5m_snipe_min_edge: float = 0.04
     btc5m_snipe_min_fair: float = 0.99
-    btc5m_snipe_soft_max_seconds: float = 60.0
-    btc5m_snipe_soft_min_distance_usd: float = 50.0
+    btc5m_snipe_soft_max_seconds: float = 45.0
+    btc5m_snipe_soft_min_distance_usd: float = 45.0
     btc5m_snipe_soft_min_distance_bps: float = 0.0
-    btc5m_snipe_soft_min_market_odds: float = 0.90
-    btc5m_snipe_soft_min_edge: float = 0.02
-    btc5m_snipe_soft_min_fair: float = 0.95
+    btc5m_snipe_soft_min_market_odds: float = 0.85
+    btc5m_snipe_soft_max_market_odds: float = 0.93
+    btc5m_snipe_soft_min_edge: float = 0.05
+    btc5m_snipe_soft_min_fair: float = 0.98
     btc5m_snipe_kelly_frac: float = 0.10
     btc5m_snipe_max_bet_pct: float = 0.01
     btc5m_snipe_max_notional_usdc: float = 250.0
@@ -131,22 +133,28 @@ class SystemConfig:
     eth5m_snipe_min_seconds: float = 10.0
     eth5m_snipe_min_distance_usd: float = 1.0
     eth5m_snipe_soft_min_distance_usd: float = 0.67
-    eth5m_snipe_min_market_odds: float = 0.97
+    eth5m_snipe_min_market_odds: float = 0.82
+    eth5m_snipe_max_market_odds: float = 0.94
     eth5m_snipe_soft_min_market_odds: float = 0.88
+    eth5m_snipe_soft_max_market_odds: float = 0.93
     eth5m_snipe_max_notional_usdc: float = 200.0
 
     sol5m_snipe_min_seconds: float = 8.0
     sol5m_snipe_min_distance_usd: float = 0.5
     sol5m_snipe_soft_min_distance_usd: float = 0.2
-    sol5m_snipe_min_market_odds: float = 0.95
+    sol5m_snipe_min_market_odds: float = 0.82
+    sol5m_snipe_max_market_odds: float = 0.94
     sol5m_snipe_soft_min_market_odds: float = 0.85
+    sol5m_snipe_soft_max_market_odds: float = 0.93
     sol5m_snipe_max_notional_usdc: float = 100.0
 
     xrp5m_snipe_min_seconds: float = 6.0
     xrp5m_snipe_min_distance_usd: float = 0.001
     xrp5m_snipe_soft_min_distance_usd: float = 0.0005
-    xrp5m_snipe_min_market_odds: float = 0.95
+    xrp5m_snipe_min_market_odds: float = 0.82
+    xrp5m_snipe_max_market_odds: float = 0.94
     xrp5m_snipe_soft_min_market_odds: float = 0.85
+    xrp5m_snipe_soft_max_market_odds: float = 0.93
     xrp5m_snipe_max_notional_usdc: float = 50.0
 
     risk: RiskConfig = field(default_factory=RiskConfig)

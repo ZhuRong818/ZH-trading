@@ -31,7 +31,7 @@ class PortfolioRegimeStrategy(BaseStrategy):
         "warmup": {"oracle": 0.50, "leadlag": 0.50},
         "early_contested": {"momentum": 0.40, "oracle": 0.35, "leadlag": 0.25},
         "mid_shock": {"oracle": 0.40, "leadlag": 0.40, "momentum": 0.20},
-        "endgame": {"snipe": 0.70, "oracle": 0.15, "leadlag": 0.15},
+        "endgame": {"snipe": 0.50, "oracle": 0.25, "leadlag": 0.25},
         "deadzone": {},
     }
     PRIORITY = {"snipe": 4, "oracle": 3, "leadlag": 2, "momentum": 1}
