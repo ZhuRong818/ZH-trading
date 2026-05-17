@@ -1,4 +1,0 @@
-interface:
-  display_name: "BTC5m Momentum Strategy"
-  short_description: "Maintain and tune the ZH-trading BTC 5m momentum strategy."
-  default_prompt: "Use this skill when working on the ZH-trading BTC 5m momentum strategy, its live dry-run behavior, backtests, learner settings, or performance reports."
