@@ -29,6 +29,15 @@ from typing import Dict, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from backtest.rl_env import (
+    ACTIONS,
+    TabularQModel,
+    action_direction,
+    action_fraction,
+    price_for_action,
+    regime as rl_regime,
+)
+
 log = logging.getLogger(__name__)
 
 FEE_RATE = 0.07  # Polymarket parabolic fee rate
@@ -1214,6 +1223,102 @@ class PortfolioReplayStrategy:
         return ""
 
 
+class RLReplayStrategy:
+    """Replay the lightweight tabular RL policy on recorded market ticks."""
+
+    name = "rl"
+
+    def __init__(
+        self,
+        model_path: str = "reports/rl_model.json",
+        model: Optional[TabularQModel] = None,
+        min_price: float = 0.20,
+        max_price: float = 0.95,
+    ):
+        self.model_path = model_path
+        self.model = model
+        self.min_price = min_price
+        self.max_price = max_price
+
+    def run_multi(self, all_records: Dict[str, List[dict]], bankroll: float = 10_000) -> Dict[str, ReplayResult]:
+        if self.model is None:
+            self.model = TabularQModel.load(self.model_path)
+
+        results: Dict[str, ReplayResult] = {}
+        for asset, records in sorted(all_records.items()):
+            results[asset] = self.run(records, bankroll=bankroll)
+        return results
+
+    def run(self, records: List[dict], bankroll: float = 10_000) -> ReplayResult:
+        if self.model is None:
+            self.model = TabularQModel.load(self.model_path)
+
+        result = ReplayResult(
+            asset=records[0]["asset"] if records else "?",
+            strategy=self.name,
+            bankroll=bankroll,
+            equity_curve=[bankroll],
+        )
+        if not records:
+            return result
+
+        outcomes = compute_window_outcomes(records)
+        signaled_windows: set[str] = set()
+        prev_price = 0.0
+
+        for rec in sorted(records, key=lambda r: float(r.get("ts", 0) or 0)):
+            slug = rec.get("slug", "")
+            if slug in signaled_windows:
+                prev_price = float(rec.get("price", 0) or prev_price)
+                continue
+
+            action, q_values, reason = self.model.choose(
+                rec,
+                prev_price=prev_price,
+                min_price=self.min_price,
+                max_price=self.max_price,
+            )
+            prev_price = float(rec.get("price", 0) or prev_price)
+
+            if action == "HOLD" or reason:
+                continue
+
+            outcome = outcomes.get(slug)
+            direction = action_direction(action)
+            entry_price = price_for_action(rec, action)
+            if not outcome or not direction or entry_price <= 0:
+                continue
+
+            size_usdc = result.bankroll * action_fraction(action)
+            if size_usdc < 5:
+                continue
+            shares = size_usdc / entry_price
+            fee = shares * FEE_RATE * entry_price * (1 - entry_price)
+            best_q = max(q_values) if q_values else 0.0
+            q_str = ",".join(f"{ACTIONS[i]}={q_values[i]:.2f}" for i in range(len(ACTIONS)))
+
+            trade = ReplayTrade(
+                strategy=self.name,
+                window_slug=slug,
+                asset=rec.get("asset", result.asset),
+                direction=direction,
+                entry_price=entry_price,
+                fair_value=min(0.999, max(0.0, entry_price + max(best_q / max(size_usdc, 1.0), 0.0))),
+                edge=best_q / max(size_usdc, 1.0),
+                size_usdc=size_usdc,
+                shares=shares,
+                entry_ts=float(rec.get("ts", 0) or 0),
+                fee=fee,
+                seconds_remaining=float(rec.get("seconds_remaining", 0) or 0),
+                meta=f"action={action} regime={rl_regime(float(rec.get('seconds_remaining', 0) or 0))} q={best_q:.2f} {q_str}",
+            )
+            settle_trade(trade, outcomes, result)
+            signaled_windows.add(slug)
+
+        compute_max_drawdown(result)
+        return result
+
+
 def load_records(data_dir: str = "data_v2", file_path: str = None, assets: list = None) -> dict:
     """Load JSONL records grouped by asset."""
     records = defaultdict(list)
@@ -1334,7 +1439,7 @@ def print_report(strategy_name: str, results: dict[str, ReplayResult], params: d
 def main():
     parser = argparse.ArgumentParser(description="Replay backtest on recorded data")
     parser.add_argument("--strategy", type=str, default="oracle",
-                        help="Strategy: oracle, momentum, leadlag, convergence, snipe, portfolio, or comma-separated")
+                        help="Strategy: oracle, momentum, leadlag, convergence, snipe, portfolio, rl, or comma-separated")
     parser.add_argument("--assets", type=str, default="btc,eth,sol,xrp",
                         help="Assets to backtest (default: btc,eth,sol,xrp)")
     parser.add_argument("--data-dir", type=str, default="data_v2",
@@ -1379,6 +1484,13 @@ def main():
     # Snipe params
     parser.add_argument("--stop-loss", type=float, default=0.0,
                         help="Snipe stop-loss price — sell if token mid drops below this (default: 0 = disabled)")
+
+    parser.add_argument("--rl-model", type=str, default="reports/rl_model.json",
+                        help="Path to tabular RL model JSON (default: reports/rl_model.json)")
+    parser.add_argument("--rl-min-price", type=float, default=0.20,
+                        help="RL hard min entry price (default: 0.20)")
+    parser.add_argument("--rl-max-price", type=float, default=0.95,
+                        help="RL hard max entry price (default: 0.95)")
 
     # Convergence params
     parser.add_argument("--conv-threshold", type=float, default=0.88,
@@ -1541,6 +1653,22 @@ def main():
                 "window_cap": "25%",
                 "total_cap": "60%",
                 "leader": args.leader,
+            })
+
+        elif strat_name == "rl":
+            strategy = RLReplayStrategy(
+                model_path=args.rl_model,
+                min_price=args.rl_min_price,
+                max_price=args.rl_max_price,
+            )
+            total_ticks = sum(len(r) for r in all_records.values())
+            print(f"[rl] Replaying {len(all_records)} assets, {total_ticks:,} ticks with {args.rl_model}...")
+            results = strategy.run_multi(all_records, bankroll=args.bankroll)
+            print_report("RL Shadow Policy", results, {
+                "model": args.rl_model,
+                "min_price": args.rl_min_price,
+                "max_price": args.rl_max_price,
+                "mode": "replay",
             })
 
         else:

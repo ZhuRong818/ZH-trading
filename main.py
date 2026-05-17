@@ -303,6 +303,7 @@ class TradingSystem:
         from strategies.v2.meanrev import MeanReversion
         from strategies.v2.last_seconds_snipe import LastSecondsSnipe
         from strategies.v2.portfolio import PortfolioRegimeStrategy
+        from strategies.v2.rl_shadow import RLShadowStrategy
 
         price_feeds = {
             "btc": get_btc_price,
@@ -484,6 +485,18 @@ class TradingSystem:
             runner.add(portfolio)
             self.post_analyzer.register_strategy(portfolio, "v2_portfolio")
 
+        if "rl_shadow" in strategies:
+            rl_shadow = RLShadowStrategy(
+                asset=asset,
+                bankroll=actual_bankroll,
+                model_path=getattr(self.config, "_rl_model", "reports/rl_model.json"),
+                min_price=getattr(self.config, "_rl_min_price", 0.20),
+                max_price=getattr(self.config, "_rl_max_price", 0.95),
+                log_every=getattr(self.config, "_rl_log_every", 1),
+            )
+            runner.add(rl_shadow)
+            self.post_analyzer.register_strategy(rl_shadow, "v2_rl_shadow")
+
         log.info("Rolling runner initialized on %s %s with %d strategies", asset.upper(), interval, len(runner.strategies))
 
     # ---- Heartbeat ----
@@ -552,13 +565,15 @@ class TradingSystem:
             strategies.append("rolling")
         if "portfolio" in strategies and "rolling" not in strategies:
             strategies.append("rolling")
+        if "rl_shadow" in strategies and "rolling" not in strategies:
+            strategies.append("rolling")
 
         asset = getattr(self.config, '_rolling_asset', 'btc')
         assets = getattr(self.config, '_rolling_assets', [asset])
 
         # Setup V2 Rolling Strategies (auto-discovers 5m tokens)
         if "rolling" in strategies:
-            roll_strats = [s for s in strategies if s in ("mm", "meanrev", "btc5m", "momentum", "oracle", "snipe", "portfolio")]
+            roll_strats = [s for s in strategies if s in ("mm", "meanrev", "btc5m", "momentum", "oracle", "snipe", "portfolio", "rl_shadow")]
             if not roll_strats:
                 roll_strats = ["momentum", "oracle"]
             if "portfolio" in roll_strats:
@@ -738,6 +753,7 @@ Strategies (comma-separated or 'all'):
     oracle   Oracle front-run — exploit Binance-Polymarket price lag
         snipe    Last-seconds snipe on rolling 5m markets (high-odds endgame)
         portfolio Regime portfolio wrapper for momentum/oracle/leadlag/snipe
+        rl_shadow Tabular RL shadow policy logger (no orders)
   all      Run all strategies
 
 5-minute rolling market (all strategies on BTC 5m):
@@ -754,7 +770,7 @@ Examples:
         """,
     )
     parser.add_argument("--strategy", type=str, default="mm",
-                        help="Strategy: mm, whale, meanrev, btc5m, rolling, oracle, snipe, portfolio, all (comma-separated)")
+                        help="Strategy: mm, whale, meanrev, btc5m, rolling, oracle, snipe, portfolio, rl_shadow, all (comma-separated)")
     parser.add_argument("--search", type=str, default="",
                         help="Search for market(s) interactively")
     parser.add_argument("--token", type=str,
@@ -781,6 +797,14 @@ Examples:
                         help="Asset for rolling 5m markets: btc, eth, sol, xrp (default: btc)")
     parser.add_argument("--rolling-assets", type=str, default="",
                         help="Comma-separated rolling assets, e.g. btc,eth,sol,xrp")
+    parser.add_argument("--rl-model", type=str, default="reports/rl_model.json",
+                        help="Path to tabular RL model JSON (default: reports/rl_model.json)")
+    parser.add_argument("--rl-min-price", type=float, default=0.20,
+                        help="RL shadow hard min entry price (default: 0.20)")
+    parser.add_argument("--rl-max-price", type=float, default=0.95,
+                        help="RL shadow hard max entry price (default: 0.95)")
+    parser.add_argument("--rl-log-every", type=int, default=1,
+                        help="Log every N RL shadow ticks (default: 1)")
     parser.add_argument("--no-learn", action="store_true",
                         help="Disable learning from past sessions")
     parser.add_argument("--verbose", action="store_true",
@@ -799,6 +823,10 @@ Examples:
         [a.strip().lower() for a in args.rolling_assets.split(",") if a.strip()]
         if args.rolling_assets else [config._rolling_asset]
     )
+    config._rl_model = args.rl_model
+    config._rl_min_price = args.rl_min_price
+    config._rl_max_price = args.rl_max_price
+    config._rl_log_every = args.rl_log_every
     config.market_making.gamma = args.gamma
     config.market_making.spread_k = args.spread_k
     config.market_making.order_size = args.size
