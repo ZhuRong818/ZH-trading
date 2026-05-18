@@ -492,6 +492,13 @@ class TradingSystem:
                 model_path=getattr(self.config, "_rl_model", "reports/rl_model.json"),
                 min_price=getattr(self.config, "_rl_min_price", 0.20),
                 max_price=getattr(self.config, "_rl_max_price", 0.95),
+                min_q=getattr(self.config, "_rl_min_q", 5.0),
+                min_edge=getattr(self.config, "_rl_min_edge", 0.02),
+                max_spread=getattr(self.config, "_rl_max_spread", 0.10),
+                q_scale=getattr(self.config, "_rl_q_scale", 0.0),
+                fee_edge_multiplier=getattr(self.config, "_rl_fee_edge_mult", 0.25),
+                min_depth=getattr(self.config, "_rl_min_depth", 50.0),
+                depth_buffer=getattr(self.config, "_rl_depth_buffer", 1.25),
                 log_every=getattr(self.config, "_rl_log_every", 1),
             )
             runner.add(rl_shadow)
@@ -803,6 +810,20 @@ Examples:
                         help="RL shadow hard min entry price (default: 0.20)")
     parser.add_argument("--rl-max-price", type=float, default=0.95,
                         help="RL shadow hard max entry price (default: 0.95)")
+    parser.add_argument("--rl-min-q", type=float, default=5.0,
+                        help="RL shadow minimum selected action Q/PnL in dollars (default: 5.0)")
+    parser.add_argument("--rl-min-edge", type=float, default=0.02,
+                        help="RL shadow minimum expected edge as Q/notional (default: 0.02)")
+    parser.add_argument("--rl-max-spread", type=float, default=0.10,
+                        help="RL shadow max target-side spread; 0 disables (default: 0.10)")
+    parser.add_argument("--rl-q-scale", type=float, default=0.0,
+                        help="RL shadow Q dollars needed for full size; 0 disables size scaling (default: 0)")
+    parser.add_argument("--rl-fee-edge-mult", type=float, default=0.25,
+                        help="RL shadow extra edge requirement as multiplier of fee/notional (default: 0.25)")
+    parser.add_argument("--rl-min-depth", type=float, default=50.0,
+                        help="RL shadow minimum target-side ask depth in shares (default: 50)")
+    parser.add_argument("--rl-depth-buffer", type=float, default=1.25,
+                        help="RL shadow required ask depth as shares * buffer (default: 1.25)")
     parser.add_argument("--rl-log-every", type=int, default=1,
                         help="Log every N RL shadow ticks (default: 1)")
     parser.add_argument("--no-learn", action="store_true",
@@ -826,6 +847,13 @@ Examples:
     config._rl_model = args.rl_model
     config._rl_min_price = args.rl_min_price
     config._rl_max_price = args.rl_max_price
+    config._rl_min_q = args.rl_min_q
+    config._rl_min_edge = args.rl_min_edge
+    config._rl_max_spread = args.rl_max_spread
+    config._rl_q_scale = args.rl_q_scale
+    config._rl_fee_edge_mult = args.rl_fee_edge_mult
+    config._rl_min_depth = args.rl_min_depth
+    config._rl_depth_buffer = args.rl_depth_buffer
     config._rl_log_every = args.rl_log_every
     config.market_making.gamma = args.gamma
     config.market_making.spread_k = args.spread_k

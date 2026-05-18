@@ -40,6 +40,21 @@ ACTION_SPECS = {
 }
 FEE_RATE = 0.07
 
+ASSET_GATE_MULTIPLIERS = {
+    "btc": {"q": 1.00, "edge": 1.00, "spread": 1.00},
+    "eth": {"q": 1.00, "edge": 1.05, "spread": 0.95},
+    "sol": {"q": 1.05, "edge": 1.05, "spread": 0.95},
+    "xrp": {"q": 1.15, "edge": 1.15, "spread": 0.85},
+}
+
+REGIME_GATE_MULTIPLIERS = {
+    "warmup": {"q": 1.15, "edge": 1.15, "spread": 0.85},
+    "early_contested": {"q": 1.05, "edge": 1.05, "spread": 0.90},
+    "mid_shock": {"q": 0.90, "edge": 0.90, "spread": 1.00},
+    "endgame": {"q": 1.20, "edge": 1.20, "spread": 0.80},
+    "deadzone": {"q": 999.0, "edge": 999.0, "spread": 0.00},
+}
+
 
 def regime(seconds_remaining: float) -> str:
     if seconds_remaining < 12:
@@ -68,6 +83,51 @@ def price_for_action(rec: dict, action: str) -> float:
     if direction == "DOWN":
         return float(rec.get("down_sell", 0) or rec.get("down_ask", 0) or rec.get("down_mid", 0) or 0)
     return 0.0
+
+
+def spread_for_direction(rec: dict, direction: str) -> float:
+    if direction == "UP":
+        return float(rec.get("up_spread", 0) or 0)
+    if direction == "DOWN":
+        return float(rec.get("down_spread", 0) or 0)
+    return 0.0
+
+
+def ask_depth_for_direction(rec: dict, direction: str) -> float:
+    if direction == "UP":
+        return float(rec.get("up_ask_depth", 0) or 0)
+    if direction == "DOWN":
+        return float(rec.get("down_ask_depth", 0) or 0)
+    return 0.0
+
+
+def fee_edge_for_price(price: float) -> float:
+    if price <= 0 or price >= 1:
+        return 1.0
+    return FEE_RATE * (1 - price)
+
+
+def rl_gate_thresholds(
+    rec: dict,
+    price: float,
+    base_min_q: float = 5.0,
+    base_min_edge: float = 0.02,
+    base_max_spread: float = 0.10,
+    fee_edge_multiplier: float = 0.25,
+) -> dict:
+    asset = str(rec.get("asset", "btc")).lower()
+    reg = regime(float(rec.get("seconds_remaining", 0) or 0))
+    asset_mult = ASSET_GATE_MULTIPLIERS.get(asset, {"q": 1.10, "edge": 1.10, "spread": 0.90})
+    regime_mult = REGIME_GATE_MULTIPLIERS.get(reg, {"q": 1.10, "edge": 1.10, "spread": 0.90})
+    fee_edge = fee_edge_for_price(price) * fee_edge_multiplier
+    return {
+        "asset": asset,
+        "regime": reg,
+        "min_q": base_min_q * asset_mult["q"] * regime_mult["q"],
+        "min_edge": base_min_edge * asset_mult["edge"] * regime_mult["edge"] + fee_edge,
+        "max_spread": base_max_spread * asset_mult["spread"] * regime_mult["spread"] if base_max_spread > 0 else 0.0,
+        "fee_edge": fee_edge,
+    }
 
 
 def valid_action_reason(

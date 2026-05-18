@@ -34,8 +34,11 @@ from backtest.rl_env import (
     TabularQModel,
     action_direction,
     action_fraction,
+    ask_depth_for_direction,
     price_for_action,
+    rl_gate_thresholds,
     regime as rl_regime,
+    spread_for_direction,
 )
 
 log = logging.getLogger(__name__)
@@ -1234,11 +1237,27 @@ class RLReplayStrategy:
         model: Optional[TabularQModel] = None,
         min_price: float = 0.20,
         max_price: float = 0.95,
+        min_q: float = 5.0,
+        min_edge: float = 0.02,
+        max_spread: float = 0.10,
+        cooldown_seconds: float = 600.0,
+        q_scale: float = 0.0,
+        fee_edge_multiplier: float = 0.25,
+        min_depth: float = 50.0,
+        depth_buffer: float = 1.25,
     ):
         self.model_path = model_path
         self.model = model
         self.min_price = min_price
         self.max_price = max_price
+        self.min_q = min_q
+        self.min_edge = min_edge
+        self.max_spread = max_spread
+        self.cooldown_seconds = cooldown_seconds
+        self.q_scale = q_scale
+        self.fee_edge_multiplier = fee_edge_multiplier
+        self.min_depth = min_depth
+        self.depth_buffer = depth_buffer
 
     def run_multi(self, all_records: Dict[str, List[dict]], bankroll: float = 10_000) -> Dict[str, ReplayResult]:
         if self.model is None:
@@ -1265,10 +1284,15 @@ class RLReplayStrategy:
         outcomes = compute_window_outcomes(records)
         signaled_windows: set[str] = set()
         prev_price = 0.0
+        last_trade_ts = -1e18
 
         for rec in sorted(records, key=lambda r: float(r.get("ts", 0) or 0)):
+            ts = float(rec.get("ts", 0) or 0)
             slug = rec.get("slug", "")
             if slug in signaled_windows:
+                prev_price = float(rec.get("price", 0) or prev_price)
+                continue
+            if ts - last_trade_ts < self.cooldown_seconds:
                 prev_price = float(rec.get("price", 0) or prev_price)
                 continue
 
@@ -1289,12 +1313,36 @@ class RLReplayStrategy:
             if not outcome or not direction or entry_price <= 0:
                 continue
 
-            size_usdc = result.bankroll * action_fraction(action)
+            action_idx = ACTIONS.index(action)
+            action_q = q_values[action_idx] if action_idx < len(q_values) else 0.0
+            base_size_usdc = result.bankroll * action_fraction(action)
+            edge = action_q / max(base_size_usdc, 1.0)
+            spread = spread_for_direction(rec, direction)
+            thresholds = rl_gate_thresholds(
+                rec,
+                price=entry_price,
+                base_min_q=self.min_q,
+                base_min_edge=self.min_edge,
+                base_max_spread=self.max_spread,
+                fee_edge_multiplier=self.fee_edge_multiplier,
+            )
+            if action_q < thresholds["min_q"]:
+                continue
+            if edge < thresholds["min_edge"]:
+                continue
+            if thresholds["max_spread"] > 0 and spread > thresholds["max_spread"]:
+                continue
+
+            size_multiplier = 1.0 if self.q_scale <= 0 else min(1.0, max(0.25, action_q / self.q_scale))
+            size_usdc = base_size_usdc * size_multiplier
             if size_usdc < 5:
                 continue
             shares = size_usdc / entry_price
+            depth = ask_depth_for_direction(rec, direction)
+            required_depth = max(self.min_depth, shares * self.depth_buffer)
+            if depth < required_depth:
+                continue
             fee = shares * FEE_RATE * entry_price * (1 - entry_price)
-            best_q = max(q_values) if q_values else 0.0
             q_str = ",".join(f"{ACTIONS[i]}={q_values[i]:.2f}" for i in range(len(ACTIONS)))
 
             trade = ReplayTrade(
@@ -1303,21 +1351,26 @@ class RLReplayStrategy:
                 asset=rec.get("asset", result.asset),
                 direction=direction,
                 entry_price=entry_price,
-                fair_value=min(0.999, max(0.0, entry_price + max(best_q / max(size_usdc, 1.0), 0.0))),
-                edge=best_q / max(size_usdc, 1.0),
+                fair_value=min(0.999, max(0.0, entry_price + max(edge, 0.0))),
+                edge=edge,
                 size_usdc=size_usdc,
                 shares=shares,
-                entry_ts=float(rec.get("ts", 0) or 0),
+                entry_ts=ts,
                 fee=fee,
                 seconds_remaining=float(rec.get("seconds_remaining", 0) or 0),
-                meta=f"action={action} regime={rl_regime(float(rec.get('seconds_remaining', 0) or 0))} q={best_q:.2f} {q_str}",
+                meta=(
+                    f"action={action} regime={rl_regime(float(rec.get('seconds_remaining', 0) or 0))} "
+                    f"q={action_q:.2f} edge={edge:.4f} min_edge={thresholds['min_edge']:.4f} "
+                    f"fee_edge={thresholds['fee_edge']:.4f} spread={spread:.4f} max_spread={thresholds['max_spread']:.4f} "
+                    f"depth={depth:.1f} req_depth={required_depth:.1f} size_mult={size_multiplier:.2f} {q_str}"
+                ),
             )
             settle_trade(trade, outcomes, result)
             signaled_windows.add(slug)
+            last_trade_ts = ts
 
         compute_max_drawdown(result)
         return result
-
 
 def load_records(data_dir: str = "data_v2", file_path: str = None, assets: list = None) -> dict:
     """Load JSONL records grouped by asset."""
@@ -1491,6 +1544,22 @@ def main():
                         help="RL hard min entry price (default: 0.20)")
     parser.add_argument("--rl-max-price", type=float, default=0.95,
                         help="RL hard max entry price (default: 0.95)")
+    parser.add_argument("--rl-min-q", type=float, default=5.0,
+                        help="RL minimum selected action Q/PnL in dollars (default: 5.0)")
+    parser.add_argument("--rl-min-edge", type=float, default=0.02,
+                        help="RL minimum expected edge as Q/notional (default: 0.02)")
+    parser.add_argument("--rl-max-spread", type=float, default=0.10,
+                        help="RL max target-side spread; 0 disables (default: 0.10)")
+    parser.add_argument("--rl-cooldown", type=float, default=600.0,
+                        help="RL cooldown seconds per asset after an entry (default: 600)")
+    parser.add_argument("--rl-q-scale", type=float, default=0.0,
+                        help="RL Q dollars needed for full size; 0 disables size scaling (default: 0)")
+    parser.add_argument("--rl-fee-edge-mult", type=float, default=0.25,
+                        help="RL extra edge requirement as multiplier of fee/notional (default: 0.25)")
+    parser.add_argument("--rl-min-depth", type=float, default=50.0,
+                        help="RL minimum target-side ask depth in shares (default: 50)")
+    parser.add_argument("--rl-depth-buffer", type=float, default=1.25,
+                        help="RL required ask depth as shares * buffer (default: 1.25)")
 
     # Convergence params
     parser.add_argument("--conv-threshold", type=float, default=0.88,
@@ -1660,6 +1729,14 @@ def main():
                 model_path=args.rl_model,
                 min_price=args.rl_min_price,
                 max_price=args.rl_max_price,
+                min_q=args.rl_min_q,
+                min_edge=args.rl_min_edge,
+                max_spread=args.rl_max_spread,
+                cooldown_seconds=args.rl_cooldown,
+                q_scale=args.rl_q_scale,
+                fee_edge_multiplier=args.rl_fee_edge_mult,
+                min_depth=args.rl_min_depth,
+                depth_buffer=args.rl_depth_buffer,
             )
             total_ticks = sum(len(r) for r in all_records.values())
             print(f"[rl] Replaying {len(all_records)} assets, {total_ticks:,} ticks with {args.rl_model}...")
@@ -1668,6 +1745,13 @@ def main():
                 "model": args.rl_model,
                 "min_price": args.rl_min_price,
                 "max_price": args.rl_max_price,
+                "min_q": args.rl_min_q,
+                "min_edge": args.rl_min_edge,
+                "max_spread": args.rl_max_spread,
+                "cooldown": args.rl_cooldown,
+                "fee_edge_mult": args.rl_fee_edge_mult,
+                "min_depth": args.rl_min_depth,
+                "depth_buffer": args.rl_depth_buffer,
                 "mode": "replay",
             })
 

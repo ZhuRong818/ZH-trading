@@ -15,9 +15,13 @@ from backtest.rl_env import (
     TabularQModel,
     action_direction,
     action_fraction,
+    ask_depth_for_direction,
     feature_key,
+    price_for_action,
     regime,
+    rl_gate_thresholds,
     state_summary,
+    spread_for_direction,
 )
 from data_pipeline.market_provider import MarketContext
 from pipeline.signal import TradingSignal
@@ -36,6 +40,13 @@ class RLShadowStrategy(BaseStrategy):
         model_path: str = "reports/rl_model.json",
         min_price: float = 0.20,
         max_price: float = 0.95,
+        min_q: float = 5.0,
+        min_edge: float = 0.02,
+        max_spread: float = 0.10,
+        q_scale: float = 0.0,
+        fee_edge_multiplier: float = 0.25,
+        min_depth: float = 50.0,
+        depth_buffer: float = 1.25,
         log_every: int = 1,
     ):
         self.asset = asset
@@ -43,6 +54,13 @@ class RLShadowStrategy(BaseStrategy):
         self.model_path = model_path
         self.min_price = min_price
         self.max_price = max_price
+        self.min_q = min_q
+        self.min_edge = min_edge
+        self.max_spread = max_spread
+        self.q_scale = q_scale
+        self.fee_edge_multiplier = fee_edge_multiplier
+        self.min_depth = min_depth
+        self.depth_buffer = depth_buffer
         self.log_every = max(1, int(log_every))
         self.model: Optional[TabularQModel] = None
         self._last_price = 0.0
@@ -73,22 +91,56 @@ class RLShadowStrategy(BaseStrategy):
         )
         summary = state_summary(rec, prev_price=self._last_price)
         direction = action_direction(action)
-        intended_notional = self.bankroll * action_fraction(action)
-        best_q = max(q_values) if q_values else 0.0
+        action_idx = ACTIONS.index(action) if action in ACTIONS else 0
+        action_q = q_values[action_idx] if q_values and action_idx < len(q_values) else 0.0
+        base_notional = self.bankroll * action_fraction(action)
+        edge = action_q / max(base_notional, 1.0)
+        entry_price = price_for_action(rec, action)
+        spread = spread_for_direction(rec, direction)
+        thresholds = rl_gate_thresholds(
+            rec,
+            price=entry_price,
+            base_min_q=self.min_q,
+            base_min_edge=self.min_edge,
+            base_max_spread=self.max_spread,
+            fee_edge_multiplier=self.fee_edge_multiplier,
+        )
+        shares = base_notional / entry_price if entry_price > 0 else 0.0
+        depth = ask_depth_for_direction(rec, direction)
+        required_depth = max(self.min_depth, shares * self.depth_buffer) if action != "HOLD" else 0.0
+        gate_reason = reason or self._gate_reason(
+            action, action_q, edge, spread, depth, required_depth, thresholds
+        )
+        if gate_reason:
+            size_multiplier = 0.0
+        elif self.q_scale <= 0:
+            size_multiplier = 1.0
+        else:
+            size_multiplier = min(1.0, max(0.25, action_q / self.q_scale))
+        intended_notional = base_notional * size_multiplier
         q_map = ",".join(f"{ACTIONS[i]}={q_values[i]:.2f}" for i in range(len(ACTIONS)))
 
         if self._ticks % self.log_every == 0:
             log.info(
                 "RL_SHADOW: asset=%s window=%s regime=%s action=%s direction=%s notional=$%.2f "
-                "q=%.2f reason=%s rem=%.1f price=%.2f strike=%.2f dist=%.2f dist_bps=%.1f q_values=%s",
+                "q=%.2f edge=%.4f min_edge=%.4f fee_edge=%.4f spread=%.4f max_spread=%.4f "
+                "depth=%.1f req_depth=%.1f size_mult=%.2f reason=%s rem=%.1f price=%.2f strike=%.2f dist=%.2f dist_bps=%.1f q_values=%s",
                 self.asset.upper(),
                 str(rec.get("slug", ""))[:32],
                 summary["regime"],
                 action,
                 direction or "-",
                 intended_notional,
-                best_q,
-                reason or "model",
+                action_q,
+                edge,
+                thresholds["min_edge"],
+                thresholds["fee_edge"],
+                spread,
+                thresholds["max_spread"],
+                depth,
+                required_depth,
+                size_multiplier,
+                gate_reason or "model",
                 summary["remaining"],
                 summary["price"],
                 summary["strike"],
@@ -109,6 +161,28 @@ class RLShadowStrategy(BaseStrategy):
             "load_error": self._load_error,
             "ticks": self._ticks,
         }
+
+    def _gate_reason(
+        self,
+        action: str,
+        action_q: float,
+        edge: float,
+        spread: float,
+        depth: float,
+        required_depth: float,
+        thresholds: dict,
+    ) -> str:
+        if action == "HOLD":
+            return ""
+        if action_q < thresholds["min_q"]:
+            return "min_q"
+        if edge < thresholds["min_edge"]:
+            return "min_edge"
+        if thresholds["max_spread"] > 0 and spread > thresholds["max_spread"]:
+            return "spread"
+        if depth < required_depth:
+            return "depth"
+        return ""
 
     def _load_model(self) -> None:
         try:
@@ -155,5 +229,9 @@ class RLShadowStrategy(BaseStrategy):
             "down_buy": down_ctx.best_bid,
             "up_sell": up_ctx.best_ask,
             "down_sell": down_ctx.best_ask,
+            "up_spread": up_ctx.spread,
+            "down_spread": down_ctx.spread,
+            "up_ask_depth": up_ctx.book.depth("BUY", levels=5) if up_ctx.book else 0.0,
+            "down_ask_depth": down_ctx.book.depth("BUY", levels=5) if down_ctx.book else 0.0,
             "regime": regime(remaining),
         }
