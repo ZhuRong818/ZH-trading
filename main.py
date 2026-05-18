@@ -21,7 +21,7 @@ Usage:
     python main.py --strategy mm --token TOKEN1,TOKEN2,TOKEN3 --dry-run
 
     # Live trading (requires POLYMARKET_PRIVATE_KEY env var)
-    python main.py --strategy mm --token TOKEN_ID
+    python main.py --strategy rolling,snipe --rolling-asset btc --live --i-understand-live-risk
 """
 
 import argparse
@@ -155,9 +155,20 @@ class TradingSystem:
             log.info("DRY RUN mode — no authentication needed")
             return
 
+        if not self.config.live_ack:
+            raise RuntimeError(
+                "Live trading requires --live and --i-understand-live-risk. "
+                "Run with --dry-run for paper trading."
+            )
+
         if not self.config.private_key:
             raise RuntimeError(
                 "Set POLYMARKET_PRIVATE_KEY env var for live trading"
+            )
+        if self.config.sig_type in (1, 2, 3) and not self.config.funder:
+            raise RuntimeError(
+                "Set POLYMARKET_FUNDER to your Polymarket proxy/deposit wallet "
+                "when using signature type 1, 2, or 3"
             )
 
         self.auth = ClobAuth(
@@ -167,18 +178,89 @@ class TradingSystem:
             funder=self.config.funder,
         )
         self.auth.derive_api_creds()
+        self.auth.ensure_sdk_client()
+
+        self._preflight_live_account()
+
         self.ems = ExecutionEngine(
             auth=self.auth, dry_run=False,
             data_feed=self.data_feed,
             capital_allocator=self.capital_allocator,
         )
+        self.ems.live_max_order_usdc = self.config.live_max_order_usdc
+        self.ems.live_force_order_type = self.config.live_force_order_type
+        self.ems.live_poll_interval = self.config.live_poll_interval
         self.ems.on_fill(self._on_fill)
         self.ems.on_fill(self.trade_log.record_fill)
         self.ems.on_fill(self.post_analyzer.on_fill)
         # Rebuild SOR and risk with new EMS
         self.sor = SyntheticEqualitySOR(self.data_feed, self.ems)
         self.risk.ems = self.ems
+        self.pipeline = PipelineEngine(
+            risk_engine=self.risk,
+            capital_allocator=self.capital_allocator,
+            ems=self.ems,
+            oms=self.oms,
+            trade_log=self.trade_log,
+            performance=self.performance,
+        )
         log.info("Authenticated and ready for live trading")
+
+    @staticmethod
+    def _normalize_usdc(value) -> float:
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        # CLOB balance endpoints often return 6-decimal integer units.
+        if amount > 1_000_000:
+            return amount / 1_000_000
+        return amount
+
+    def _preflight_live_account(self):
+        """Fail fast if the live account looks unsafe or unfunded."""
+        log.info("=" * 60)
+        log.info("LIVE TRADING PREFLIGHT")
+        log.info("  signer: %s", self.auth.address)
+        log.info("  funder: %s", self.auth.funder)
+        log.info("  signature type: %s", self.auth.sig_type)
+        log.info("  max order: $%.2f", self.config.live_max_order_usdc)
+        log.info("  forced order type: %s", self.config.live_force_order_type or "strategy")
+
+        try:
+            self.auth.update_balance_allowance("COLLATERAL")
+            balances = self.auth.get_balance_allowance("COLLATERAL")
+            balance = self._normalize_usdc(
+                balances.get("balance")
+                or balances.get("collateral")
+                or balances.get("available")
+                or balances.get("usdc")
+                or 0
+            )
+            allowance = self._normalize_usdc(balances.get("allowance") or balances.get("approved") or 0)
+            log.info("  collateral balance: %.2f USDC", balance)
+            if allowance:
+                log.info("  collateral allowance: %.2f USDC", allowance)
+            if balance < self.config.live_min_balance_usdc:
+                raise RuntimeError(
+                    f"Live balance too low: {balance:.2f} USDC "
+                    f"< required {self.config.live_min_balance_usdc:.2f} USDC"
+                )
+        except RuntimeError:
+            raise
+        except Exception as e:
+            log.warning("  balance check failed: %s", e)
+
+        if self.config.live_cancel_open_orders_on_start:
+            try:
+                open_orders = self.auth.get_open_orders()
+                if open_orders:
+                    log.warning("  cancelling %d existing open order(s) before start", len(open_orders))
+                    self.auth.cancel_all_orders()
+            except Exception as e:
+                log.warning("  open-order cleanup failed: %s", e)
+
+        log.info("=" * 60)
 
     # ---- Market Selection ----
 
@@ -511,7 +593,7 @@ class TradingSystem:
     def _heartbeat_loop(self):
         while self.running and self.auth:
             try:
-                self.auth.post("/heartbeat", {"heartbeat_id": ""})
+                self.auth.post_heartbeat("")
             except Exception:
                 pass
             time.sleep(self.config.heartbeat_interval)
@@ -531,6 +613,12 @@ class TradingSystem:
         funder = self.auth.funder
         if funder:
             self.oms.sync_from_api(funder)
+
+    def _poll_live_fills(self):
+        """Poll CLOB for accepted live-order fills."""
+        if self.config.dry_run or not self.ems:
+            return
+        self.ems.check_live_fills()
 
     # ---- Strategy Steps (V2) ----
 
@@ -634,6 +722,9 @@ class TradingSystem:
                 # Live position reconciliation
                 self._reconcile_positions()
 
+                # Live fill polling — order acceptance is not a fill.
+                self._poll_live_fills()
+
                 # Collect market/strategy snapshots for post-session analysis
                 self.post_analyzer.collect_snapshots()
 
@@ -700,6 +791,28 @@ class TradingSystem:
                 sell_price = book.mid
             else:
                 sell_price = pos.cur_price if pos.cur_price > 0 else pos.avg_price
+
+            if not self.config.dry_run:
+                order_id = self.ems.place_order(
+                    token_id=pos.token_id,
+                    side="SELL",
+                    price=sell_price,
+                    size=pos.size,
+                    order_type=self.config.live_force_order_type or "FAK",
+                    source="shutdown_close",
+                )
+                if order_id:
+                    log.info(
+                        "LIVE CLOSE SUBMITTED: %s %.1f @ %.4f id=%s",
+                        pos.token_id[:16], pos.size, sell_price, order_id[:16],
+                    )
+                    self.ems.check_live_fills(force=True)
+                else:
+                    log.warning(
+                        "LIVE CLOSE FAILED: %s %.1f @ %.4f; position may remain open",
+                        pos.token_id[:16], pos.size, sell_price,
+                    )
+                continue
 
             # Emit a sell fill directly (bypass simulator — we're shutting down)
             from oms.position_manager import Fill
@@ -773,6 +886,7 @@ Examples:
   python main.py --strategy whale --dry-run
   python main.py --strategy rolling --dry-run --no-learn
   python main.py --strategy rolling,oracle --dry-run --no-learn
+  python main.py --strategy rolling,snipe --rolling-asset btc --live --i-understand-live-risk --max-position 25
   python main.py --strategy all --search "election" --dry-run
         """,
     )
@@ -784,6 +898,22 @@ Examples:
                         help="Token ID(s) to trade (comma-separated for multi-market)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Paper trading mode (no real orders)")
+    parser.add_argument("--live", action="store_true",
+                        help="Real-money live trading mode. Requires --i-understand-live-risk")
+    parser.add_argument("--i-understand-live-risk", action="store_true",
+                        help="Required acknowledgement for --live")
+    parser.add_argument("--live-max-order-usdc", type=float, default=None,
+                        help="Hard cap per live order in USDC (default: env or 25)")
+    parser.add_argument("--live-min-balance-usdc", type=float, default=None,
+                        help="Minimum live collateral balance required at startup")
+    parser.add_argument("--live-order-type", type=str, default=None,
+                        help="Force live order type, e.g. FAK, FOK, GTC. Default: env or FAK")
+    parser.add_argument("--allow-live-gtc", action="store_true",
+                        help="Allow strategy order types in live mode instead of forcing FAK")
+    parser.add_argument("--keep-open-orders", action="store_true",
+                        help="Do not cancel existing CLOB open orders at live startup")
+    parser.add_argument("--live-check-only", action="store_true",
+                        help="Authenticate and run live preflight, then exit without trading")
     parser.add_argument("--gamma", type=float, default=0.5,
                         help="Stoikov risk aversion (default: 0.5)")
     parser.add_argument("--spread-k", type=float, default=1.5,
@@ -835,9 +965,27 @@ Examples:
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    if args.live and args.dry_run:
+        parser.error("--live and --dry-run cannot be used together")
+    if args.live and not args.i_understand_live_risk:
+        parser.error("--live requires --i-understand-live-risk")
+    if args.live_check_only and not args.live:
+        parser.error("--live-check-only requires --live")
+
     # Build config
     config = SystemConfig.from_env()
-    config.dry_run = args.dry_run
+    config.dry_run = not args.live
+    config.live_ack = args.i_understand_live_risk
+    if args.live_max_order_usdc is not None:
+        config.live_max_order_usdc = args.live_max_order_usdc
+    if args.live_min_balance_usdc is not None:
+        config.live_min_balance_usdc = args.live_min_balance_usdc
+    if args.live_order_type is not None:
+        config.live_force_order_type = args.live_order_type.upper()
+    if args.allow_live_gtc:
+        config.live_force_order_type = ""
+    if args.keep_open_orders:
+        config.live_cancel_open_orders_on_start = False
     config.no_learn = args.no_learn
     config._rolling_asset = args.rolling_asset.lower()
     config._rolling_assets = (
@@ -887,8 +1035,12 @@ Examples:
             system.select_markets_interactive(args.search, multi=multi)
 
     # Connect for live trading
-    if not args.dry_run:
+    if args.live:
         system.connect()
+        if args.live_check_only:
+            log.info("Live preflight complete; exiting without starting strategies")
+            system.trade_log.close()
+            return
 
     # Run
     system.run(strategies)

@@ -154,7 +154,13 @@ python -m pip install --upgrade pip
 python -m pip install requests numpy eth-account
 ```
 
-There is no `requirements.txt` yet. The install command above reflects the imports used by the current code.
+For live trading, also install the official Polymarket v2 CLOB client:
+
+```powershell
+python -m pip install py-clob-client-v2
+```
+
+There is no `requirements.txt` yet. The install commands above reflect the imports used by the current code.
 
 ## Environment
 
@@ -164,14 +170,16 @@ Live mode reads credentials from shell environment variables:
 
 ```powershell
 $env:POLYMARKET_PRIVATE_KEY="your_private_key"
-$env:POLYMARKET_FUNDER="your_polymarket_proxy_or_funder_wallet"
-$env:POLYMARKET_SIG_TYPE="1"
+$env:POLYMARKET_FUNDER="your_polymarket_proxy_or_deposit_wallet"
+$env:POLYMARKET_SIG_TYPE="3"
+$env:POLYMARKET_LIVE_MAX_ORDER_USDC="25"
 ```
 
 `POLYMARKET_SIG_TYPE` defaults to `1`.
 
 - `0`: direct EOA wallet
 - `1`: Polymarket proxy wallet account
+- `3`: Polymarket deposit wallet / `POLY_1271`
 
 `.env.example` is only a reference. The code currently does not auto-load `.env`, so variables must be present in the process environment before live startup.
 
@@ -262,6 +270,11 @@ Important flags:
 | `--search` | Search markets interactively by keyword |
 | `--token` | Comma-separated CLOB token IDs; skips market search |
 | `--dry-run` | Paper mode; no real orders |
+| `--live` | Real-money mode; requires `--i-understand-live-risk` |
+| `--live-max-order-usdc` | Hard per-order live notional cap |
+| `--live-order-type` | Force live order type; defaults to `FAK` |
+| `--allow-live-gtc` | Let strategies place GTC live orders instead of forcing `FAK` |
+| `--live-check-only` | Authenticate and run live preflight without starting strategies |
 | `--gamma` | Stoikov risk aversion |
 | `--spread-k` | Stoikov spread scaling |
 | `--size` | Base order size in shares |
@@ -383,9 +396,12 @@ Dry-run mode:
 Live mode:
 
 - Derives or creates CLOB API credentials.
-- Signs CLOB auth messages and EIP-712 orders with `eth-account`.
-- Posts signed orders to `/order`.
-- Tracks open order IDs and can cancel individual orders or all known orders.
+- Requires `--live --i-understand-live-risk`; the default is dry-run even if `--dry-run` is omitted.
+- Requires the official `py-clob-client-v2` package for live order creation.
+- Runs a startup preflight for signer, funder, balance/allowance, max order size, and existing open orders.
+- Forces `FAK` live orders by default to avoid stale GTC exposure. Use `--allow-live-gtc` only after validating maker-order handling.
+- Tracks accepted order IDs and polls CLOB order status for real matched size before recording fills.
+- Cancels known open orders on shutdown and submits real close orders for tracked positions instead of emitting synthetic fills.
 
 The EMS checks depth, price ticks, and a per-second rate limit before submitting orders. Capital allocation is handled by the pipeline's CapitalGate (not the EMS) to avoid double-booking.
 
@@ -463,13 +479,30 @@ The terminal log also prints an enhanced report on shutdown with all of the abov
 
 ## Live Trading
 
-After setting environment variables, omit `--dry-run`:
+After setting environment variables, use explicit live flags:
 
 ```powershell
-python main.py --strategy mm --token TOKEN_ID
+python main.py `
+  --live `
+  --i-understand-live-risk `
+  --live-check-only
 ```
 
-Live mode submits real Polymarket CLOB orders. Validate in dry-run first, confirm token IDs and wallet/proxy configuration, and start with small sizes.
+Then start with a small live cap:
+
+```powershell
+python main.py `
+  --strategy rolling,snipe `
+  --rolling-asset btc `
+  --live `
+  --i-understand-live-risk `
+  --live-max-order-usdc 10 `
+  --max-position 25 `
+  --max-drawdown 2 `
+  --no-learn
+```
+
+Live mode submits real Polymarket CLOB orders. Validate in dry-run first, confirm token IDs and wallet/proxy/deposit-wallet configuration, and start with a small dedicated wallet. Rolling-market live settlement is not synthetically marked to PnL; rely on Polymarket account reconciliation/redemption for final cash balances.
 
 ## V2 Strategy Interface
 

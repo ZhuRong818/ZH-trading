@@ -138,6 +138,15 @@ class UnifiedRunnerV2:
 
             # 6. Feed fill results back and track for settlement
             if result.was_executed:
+                if not self.ems.dry_run:
+                    log.info(
+                        "LIVE ORDER ACCEPTED [%s]: %s %s %.1f @ %.4f id=%s; waiting for real fill poll",
+                        result.strategy, result.side, result.token_id[:12],
+                        result.size, result.price,
+                        result.order_id[:16] if result.order_id else "",
+                    )
+                    continue
+
                 fill = Fill(
                     token_id=result.token_id,
                     side=result.side,
@@ -249,6 +258,14 @@ class UnifiedRunnerV2:
 
             log.info("Settlement: prev_strike=$%.2f → %s (oracle)",
                      prev_strike, outcome)
+
+            if not self.ems.dry_run:
+                log.info(
+                    "Live mode: settlement outcome observed, but no synthetic payout fill will be recorded. "
+                    "Use Polymarket account reconciliation/redemption for real balances."
+                )
+                self._open_entries.clear()
+                return
 
             # Settle each open position
             for entry in self._open_entries:

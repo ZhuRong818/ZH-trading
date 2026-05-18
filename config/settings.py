@@ -94,6 +94,12 @@ class SystemConfig:
     funder: str = ""
     sig_type: int = 1
     dry_run: bool = True
+    live_ack: bool = False
+    live_max_order_usdc: float = 25.0
+    live_min_balance_usdc: float = 1.0
+    live_force_order_type: str = "FAK"
+    live_cancel_open_orders_on_start: bool = True
+    live_poll_interval: float = 2.0
     no_learn: bool = False
     heartbeat_interval: float = 5.0
     btc5m_min_edge: float = 0.16
@@ -169,4 +175,9 @@ class SystemConfig:
             private_key=os.environ.get("POLYMARKET_PRIVATE_KEY", ""),
             funder=os.environ.get("POLYMARKET_FUNDER", ""),
             sig_type=int(os.environ.get("POLYMARKET_SIG_TYPE", "1")),
+            live_max_order_usdc=float(os.environ.get("POLYMARKET_LIVE_MAX_ORDER_USDC", "25")),
+            live_min_balance_usdc=float(os.environ.get("POLYMARKET_LIVE_MIN_BALANCE_USDC", "1")),
+            live_force_order_type=os.environ.get("POLYMARKET_LIVE_FORCE_ORDER_TYPE", "FAK").upper(),
+            live_cancel_open_orders_on_start=os.environ.get("POLYMARKET_CANCEL_OPEN_ON_START", "1") != "0",
+            live_poll_interval=float(os.environ.get("POLYMARKET_LIVE_POLL_INTERVAL", "2")),
         )
