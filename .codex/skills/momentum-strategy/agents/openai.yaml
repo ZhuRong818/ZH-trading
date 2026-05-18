@@ -1,0 +1,4 @@
+interface:
+  display_name: "Momentum Strategy"
+  short_description: "Maintain and tune the rolling 5-minute momentum strategy."
+  default_prompt: "Use this when working on the ZH-trading rolling momentum strategy, BTC5M wiring, diagnostics, or replay tuning."

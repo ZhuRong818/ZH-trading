@@ -1,0 +1,4 @@
+interface:
+  display_name: "RL Shadow Strategy"
+  short_description: "Maintain and evaluate the tabular RL shadow policy."
+  default_prompt: "Use this when working on the ZH-trading RL shadow strategy, RL replay environment, or RL training workflow."
