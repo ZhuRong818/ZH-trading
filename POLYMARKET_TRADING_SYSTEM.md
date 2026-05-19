@@ -1112,3 +1112,4 @@ polymarket-trading-system/
 ---
 
 *Built to paper-trade first. Graduate to live only after the paper KPIs are met. Every module is independently testable — develop them in isolation and integrate via Kafka.*
+

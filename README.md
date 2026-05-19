@@ -271,7 +271,7 @@ Important flags:
 | `--token` | Comma-separated CLOB token IDs; skips market search |
 | `--dry-run` | Paper mode; no real orders |
 | `--live` | Real-money mode; requires `--i-understand-live-risk` |
-| `--live-max-order-usdc` | Hard per-order live notional cap |
+| `--live-max-order-usdc` | Per-order live notional cap; oversized signals are resized before risk/execution |
 | `--live-order-type` | Force live order type; defaults to `FAK` |
 | `--allow-live-gtc` | Let strategies place GTC live orders instead of forcing `FAK` |
 | `--live-check-only` | Authenticate and run live preflight without starting strategies |

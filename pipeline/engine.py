@@ -58,11 +58,35 @@ class PipelineEngine:
         self._capital = capital_allocator
         self._ems = ems
 
+    def _apply_live_order_cap(self, signal: TradingSignal) -> TradingSignal:
+        """
+        Live per-order caps are sizing constraints, not strategy vetoes.
+        Apply them before risk/capital so those gates evaluate the actual order size.
+        """
+        if signal.was_rejected or self._ems.dry_run or signal.side != "BUY":
+            return signal
+
+        cap = float(getattr(self._ems, "live_max_order_usdc", 0.0) or 0.0)
+        if cap <= 0 or signal.price <= 0 or signal.notional <= cap:
+            return signal
+
+        old_size = signal.size
+        old_notional = signal.notional
+        signal.size = cap / signal.price
+        log.info(
+            "Live cap resized signal: %s %s %.4f -> %.4f @ %.4f "
+            "notional=$%.2f -> $%.2f",
+            signal.strategy, signal.side, old_size, signal.size, signal.price,
+            old_notional, signal.notional,
+        )
+        return signal
+
     def submit(self, signal: TradingSignal) -> TradingSignal:
         """
         Submit a signal through the full pipeline.
         Returns the signal with pipeline state filled in.
         """
+        signal = self._apply_live_order_cap(signal)
         signal = self.risk_gate.process(signal)
         signal = self.capital_gate.process(signal)
         signal = self.executor.process(signal)

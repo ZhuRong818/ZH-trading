@@ -422,6 +422,26 @@ class ExecutionEngine:
         for cb in self._fill_callbacks:
             cb(fill)
 
+    def _apply_live_order_cap(
+        self, side: str, price: float, size: float, source: str = "",
+    ) -> float:
+        """Clamp live order size to the configured USDC cap."""
+        cap = float(self.live_max_order_usdc or 0.0)
+        if self.dry_run or side != "BUY" or cap <= 0 or price <= 0 or size <= 0:
+            return size
+
+        notional = size * price
+        if notional <= cap:
+            return size
+
+        resized = cap / price
+        log.info(
+            "Live order capped by EMS: %s %s %.4f -> %.4f @ %.4f "
+            "notional=$%.2f -> $%.2f",
+            source or "EMS", side, size, resized, price, notional, cap,
+        )
+        return resized
+
     def check_pending_dry_run(self):
         """Process pending GTC orders in dry-run simulator. Call each loop iteration."""
         if self._simulator:
@@ -456,12 +476,8 @@ class ExecutionEngine:
         if not self.dry_run:
             if self.live_force_order_type:
                 order_type = self.live_force_order_type
-            notional = size * price
-            if self.live_max_order_usdc > 0 and notional > self.live_max_order_usdc:
-                log.warning(
-                    "Live order rejected by EMS cap: %s %s %.1f @ %.4f notional=$%.2f > $%.2f",
-                    source or "EMS", side, size, price, notional, self.live_max_order_usdc,
-                )
+            size = self._apply_live_order_cap(side, price, size, source)
+            if size <= 0:
                 return None
 
         if not self.rate_limiter.check_rate():
@@ -507,6 +523,11 @@ class ExecutionEngine:
                     log.info("Depth-limited %s %s: %.1f → %.1f (depth=%.1f)",
                              source, side, size, fillable, fillable)
                     size = fillable
+
+        if not self.dry_run:
+            size = self._apply_live_order_cap(side, price, size, source)
+            if size <= 0:
+                return None
 
         # ── Execute single order ──────────────────────────────────────
         return self._execute_single_order(
