@@ -1,147 +1,108 @@
 # ZH Trading
 
-Updated: 2026-05-11 (v5 — executable pricing via best_ask, equity-based drawdown, enhanced debugging)
+Updated: 2026-05-21
 
-ZH Trading is a lightweight Python trading pipeline for Polymarket. It discovers markets, polls live order books, runs strategy modules, applies portfolio and capital controls, routes orders through a shared execution layer, and tracks fills, positions, logs, and basic performance in memory.
+ZH Trading is a lightweight Python trading pipeline for Polymarket. It discovers markets, polls CLOB order books, runs strategy modules, sends all strategy output through a shared risk/capital/execution pipeline, and records fills, positions, logs, reports, and replay data.
 
-This README documents the code that exists in this repository today. `POLYMARKET_TRADING_SYSTEM.md` is the larger target architecture; it describes components such as Kafka, Redis, TimescaleDB, WebSockets, a signing server, and LLM sentiment that are not implemented in this local pipeline yet.
+`POLYMARKET_TRADING_SYSTEM.md` is the larger target architecture. This README describes the local code that exists in this repository today.
 
 ## Current Capabilities
 
 - Market discovery and filtering through the Polymarket Gamma API.
 - Order book polling through the Polymarket CLOB API.
-- In-memory market state, midpoint history, volatility, and regime classification.
-- **Executable pricing via best_ask/best_bid**: Strategies now use actual order book depths for order entry, not mid-prices.
-- Dry-run execution with book-aware VWAP fills, pending GTC orders, and FOK/FAK behavior.
-- Live CLOB order signing and submission with EIP-712 order signatures and CLOB API authentication.
-- Shared OMS for fills, positions, realized PnL, unrealized PnL, and live position reconciliation.
-- Capital allocation by strategy budget, market concentration, reserve, and locked collateral.
-- **Equity-based risk controls**: Portfolio drawdown now calculated as (peak_equity - current_equity) / peak_equity, where equity = initial_capital + cumulative_pnL. Default max drawdown: 1%.
-- Per-position stop losses, volatility pauses, and kill switch shutdown.
-- Strategy modules for Stoikov market making, whale copy trading, mean reversion, BTC momentum, and oracle front-run.
-- Modular pipeline with enforced stages: Risk Gate, Capital Gate, Executor, Tracker, Logger.
-- Persistent JSONL trade logs plus runtime performance reports and heuristic tuning suggestions.
-- **Enhanced debugging**: `--verbose` flag provides detailed execution logs for signal generation, price resolution, and risk gate decisions.
+- Static long-dated market trading by token ID or interactive search.
+- Rolling 5-minute crypto markets for `btc`, `eth`, `sol`, and `xrp`.
+- Shared `MarketContext -> BaseStrategy.step() -> TradingSignal` strategy interface.
+- Book-aware dry-run execution with VWAP fills, FOK/FAK/GTC handling, and pending GTC simulation.
+- Live CLOB order signing/submission with explicit live-risk acknowledgement.
+- Shared OMS for fills, positions, realized PnL, unrealized PnL, and live reconciliation.
+- Capital allocation by system reserve, strategy budget, market concentration, and locked collateral.
+- Risk gates for exposure, drawdown, per-position stops, volatility pauses, and kill switch shutdown.
+- Runtime JSONL trade logs plus post-session JSON/CSV analysis reports.
+- Replay tooling for recorded rolling-market data, including oracle, momentum, lead-lag, convergence, snipe, portfolio, and RL replay modes.
+- Tabular RL training and live `rl_shadow` logging mode.
 
-## Pipeline Flow
+## Pipeline
 
 ```text
-┌─────────────────────────────────────────────────────────────┐
-│                     DATA SOURCES                             │
-│  Polymarket CLOB API │ Gamma API │ Data API │ Binance BTC   │
-└───────────────────────────┬──────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│              DATA PIPELINE  (data_pipeline/)                 │
-│  Book snapshots, VWAP pricing, midpoint history,            │
-│  volatility, staleness checks, regime classification        │
-└───────────────────────────┬──────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│              STRATEGIES  (strategies/)                        │
-│  Stoikov MM │ Whale Copy │ Mean Rev │ Momentum │ Oracle    │
-│                                                              │
-│  Each strategy emits → TradingSignal                        │
-└───────────────────────────┬──────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│              PIPELINE ENGINE  (pipeline/)                     │
-│                                                              │
-│  ┌──────────┐  ┌──────────┐  ┌───────────┐                 │
-│  │ 1. RISK  │→ │2. CAPITAL│→ │3. EXECUTOR│                 │
-│  │   GATE   │  │   GATE   │  │           │                 │
-│  │Drawdown? │  │Budget OK?│  │VWAP fill  │                 │
-│  │Stop-loss?│  │Reserve?  │  │Depth check│                 │
-│  │Circuit?  │  │Concentr? │  │Sim / Live │                 │
-│  └──────────┘  └──────────┘  └─────┬─────┘                 │
-│                                    │                        │
-│  ┌──────────┐  ┌──────────┐        │                        │
-│  │5. LOGGER │← │4. TRACKER│← ─────┘                        │
-│  │Trade log │  │OMS update│                                 │
-│  │Perf stats│  │P&L calc  │                                 │
-│  │Fill rate │  │Collateral│                                 │
-│  └──────────┘  └──────────┘                                 │
-└───────────────────────────┬──────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│              ANALYTICS  (analytics/)                         │
-│  JSONL trade log │ Sharpe/drawdown │ Parameter tuner        │
-└──────────────────────────────────────────────────────────────┘
+Polymarket Gamma/CLOB + external price feeds
+        |
+data_pipeline/
+        |
+MarketProvider -> MarketContext[]
+        |
+strategies/v2/* -> TradingSignal[]
+        |
+PipelineEngine
+  RiskGate -> CapitalGate -> Executor -> Tracker -> Logger
+        |
+OMS / analytics / logs / reports
 ```
 
-Every signal flows through: **Risk Gate → Capital Gate → Executor → Tracker → Logger**. No strategy can bypass a stage. If any stage rejects, the signal stops and the rejection reason is logged.
-
-The pipeline tracks fill rate, rejection breakdown, and per-strategy signal stats. On shutdown it prints a full report including top rejection reasons.
+Strategies never place orders directly. They only return `TradingSignal` objects. The pipeline decides whether a signal is allowed, sized, executed, tracked, and logged.
 
 ## Repository Layout
 
 ```text
 .
-|-- main.py                              # Main multi-strategy runner
-|-- search.py                            # Market search and MM candidate ranking
-|-- POLYMARKET_TRADING_SYSTEM.md         # Aspirational architecture/spec
-|-- .gitignore                           # Git ignore rules
-|-- .env.example                         # Live-trading env var reference
+|-- main.py                         # Main runner and CLI wiring
+|-- search.py                       # Market search and MM candidate ranking
+|-- STRATEGY_GUIDE.md               # Extra strategy notes
+|-- POLYMARKET_TRADING_SYSTEM.md    # Aspirational architecture/spec
+|-- .env.example                    # Live-trading env var reference
 |-- config/
-|   `-- settings.py                      # API URLs and config dataclasses
+|   `-- settings.py                 # Config dataclasses and API constants
 |-- data_pipeline/
-|   |-- market_data.py                   # Gamma/CLOB polling and market state
-|   |-- market_provider.py               # MarketContext, StaticProvider, RollingProvider
-|   |-- price_feeds.py                   # Binance BTC/ETH price feeds
-|   `-- oracle.py                        # Chainlink oracle integration
+|   |-- market_data.py              # CLOB/Gamma data feed and book snapshots
+|   |-- market_provider.py          # StaticProvider, RollingProvider, MarketContext
+|   |-- price_feeds.py              # BTC/ETH/SOL/XRP price feeds
+|   `-- oracle.py                   # Rolling-window settlement oracle
 |-- ems/
-|   |-- execution.py                     # Auth, live orders, rate limit, SOR
-|   |-- dry_run_sim.py                   # Book-aware dry-run fill simulator
-|   `-- leg_handler.py                   # Leg execution helper
+|   |-- execution.py                # Dry-run/live execution, auth, rate limits, SOR
+|   `-- dry_run_sim.py              # Book-aware dry-run simulator
 |-- pipeline/
-|   |-- signal.py                        # TradingSignal — universal message
-|   |-- stages.py                        # RiskGate, CapitalGate, Executor, Tracker, Logger
-|   `-- engine.py                        # PipelineEngine — chains all stages
+|   |-- signal.py                   # TradingSignal contract
+|   |-- stages.py                   # Risk, capital, execution, tracking, logging stages
+|   `-- engine.py                   # PipelineEngine
 |-- oms/
-|   |-- position_manager.py              # Fills, positions, PnL, reconciliation
-|   `-- capital_allocator.py             # Cross-strategy capital budgets
+|   |-- position_manager.py         # Fills, positions, PnL, reconciliation
+|   `-- capital_allocator.py        # Strategy budgets and capital locks
 |-- risk/
-|   `-- risk_engine.py                   # Limits, stops, kill switch
+|   `-- risk_engine.py              # Exposure, drawdown, stops, kill switch
 |-- analytics/
-|   |-- models.py                        # TradeRecord, MarketSnapshot, StrategySnapshot
-|   |-- trade_log.py                     # Daily JSONL fill logs
-|   |-- trade_recorder.py               # Round-trip trade builder from fills
-|   |-- snapshot_collector.py            # Periodic market/strategy state capture
-|   |-- performance.py                   # PnL, drawdown, Sharpe, win rate
-|   |-- tuner.py                         # Human-review tuning suggestions
-|   |-- learner.py                       # Auto-learner (reads past reports, adjusts params)
-|   |-- post_session.py                  # PostSessionAnalyzer orchestrator
-|   |-- strategy_analyzers/
-|   |   |-- base.py                      # Universal trade metrics
-|   |   `-- analyzers.py                 # Per-strategy analyzers (MM, whale, etc.)
-|   `-- reporters/
-|       |-- json_reporter.py             # Full structured JSON dump
-|       |-- csv_reporter.py              # Per-trade CSV export
-|       `-- log_reporter.py              # Enhanced terminal report
+|   |-- trade_log.py                # Runtime JSONL fill logs
+|   |-- performance.py              # PnL, drawdown, Sharpe, win-rate stats
+|   |-- post_session.py             # Post-session analysis orchestration
+|   |-- reporters/                  # JSON, CSV, terminal reporters
+|   `-- strategy_analyzers/         # Per-strategy diagnostics
+|-- backtest/
+|   |-- recorder.py                 # Live rolling-market JSONL recorder
+|   |-- replay.py                   # Replay engine and replay strategies
+|   |-- rl_env.py                   # Tabular RL environment/model helpers
+|   `-- rl_train.py                 # Train tabular RL model from recorded data
 |-- strategies/
-|   |-- base.py                          # BaseStrategy interface (step → TradingSignal)
-|   |-- kelly.py                         # Fractional Kelly helper
-|   |-- unified_runner.py               # Legacy runner for rolling markets
-|   |-- v2/                              # Unified strategies (all same interface)
-|   |   |-- mm.py                        # Stoikov market making
-|   |   |-- meanrev.py                   # Mean reversion
-|   |   |-- whale.py                     # Whale copy trading
-|   |   |-- momentum.py                  # BTC/ETH momentum (5m markets)
-|   |   |-- oracle_frontrun.py           # Oracle front-run (5m markets)
-|   |   `-- runner.py                    # UnifiedRunnerV2 — runs all strategies
-|   |-- arbitrage/                       # Legacy (removed from active use)
-|   |-- btc_5m/btc_5m.py                 # Legacy BTC 5-minute runner
-|   |-- market_making/stoikov_model.py   # Legacy Stoikov market maker
-|   |-- mean_reversion/mean_reversion.py # Legacy mean reversion
-|   |-- resolution_fade/resolution_fade.py  # Legacy resolution fade
-|   `-- whale_tracking/whale_tracker.py  # Legacy whale tracker
-|-- logs/                                # Runtime JSONL trade logs
-`-- reports/                             # Post-session JSON, CSV, and analysis reports
+|   |-- base.py                     # BaseStrategy interface
+|   |-- kelly.py                    # Fractional Kelly helper
+|   |-- v2/                         # Active unified strategies
+|   |   |-- mm.py                   # Stoikov market making
+|   |   |-- meanrev.py              # Mean reversion
+|   |   |-- whale.py                # Whale copy trading
+|   |   |-- momentum.py             # Rolling 5m momentum
+|   |   |-- oracle_frontrun.py      # Binance/Polymarket lag strategy
+|   |   |-- leadlag.py              # Cross-asset lead-lag
+|   |   |-- last_seconds_snipe.py   # Final-window high-odds snipe
+|   |   |-- portfolio.py            # Regime portfolio wrapper
+|   |   |-- rl_shadow.py            # Observational RL policy logger
+|   |   |-- skills.py               # Shared strategy helpers
+|   |   `-- runner.py               # UnifiedRunnerV2
+|   `-- ...                         # Legacy/reference strategies
+|-- data/                           # Recorder output JSONL files
+|-- logs/                           # Runtime trade logs
+|-- reports/                        # Analysis and RL model outputs
+`-- .codex/skills/                  # Repo-specific Codex skills
 ```
+
+Legacy strategies outside `strategies/v2/` are kept for reference. `main.py` uses the v2 interface.
 
 ## Setup
 
@@ -151,7 +112,7 @@ Use Python 3.10+.
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install requests numpy eth-account
+python -m pip install requests numpy aiohttp eth-account
 ```
 
 For live trading, also install the official Polymarket v2 CLOB client:
@@ -160,19 +121,19 @@ For live trading, also install the official Polymarket v2 CLOB client:
 python -m pip install py-clob-client-v2
 ```
 
-There is no `requirements.txt` yet. The install commands above reflect the imports used by the current code.
+There is no `requirements.txt` yet.
 
 ## Environment
 
-Dry-run mode does not require private keys.
-
-Live mode reads credentials from shell environment variables:
+Dry-run mode does not require private keys. Live mode reads credentials from process environment variables:
 
 ```powershell
 $env:POLYMARKET_PRIVATE_KEY="your_private_key"
 $env:POLYMARKET_FUNDER="your_polymarket_proxy_or_deposit_wallet"
 $env:POLYMARKET_SIG_TYPE="3"
 $env:POLYMARKET_LIVE_MAX_ORDER_USDC="25"
+$env:POLYMARKET_LIVE_MIN_BALANCE_USDC="1"
+$env:POLYMARKET_LIVE_FORCE_ORDER_TYPE="FAK"
 ```
 
 `POLYMARKET_SIG_TYPE` defaults to `1`.
@@ -181,305 +142,212 @@ $env:POLYMARKET_LIVE_MAX_ORDER_USDC="25"
 - `1`: Polymarket proxy wallet account
 - `3`: Polymarket deposit wallet / `POLY_1271`
 
-`.env.example` is only a reference. The code currently does not auto-load `.env`, so variables must be present in the process environment before live startup.
+`.env.example` is only a reference. The code does not auto-load `.env`.
 
 ## Market Search
 
-List high-volume active markets:
-
 ```powershell
 python search.py
-```
-
-Search by keyword:
-
-```powershell
 python search.py bitcoin
 python search.py iran --min-volume 100000
-```
-
-Rank market-making candidates:
-
-```powershell
 python search.py --mm --limit 10
 ```
 
-`search.py --mm` scores markets by contested price, 24-hour volume, liquidity, and time to resolution. It filters out tail prices, low volume, near-expiry markets, and markets without usable outcome prices.
+`search.py --mm` ranks market-making candidates by contested price, volume, liquidity, and time to resolution.
 
 ## Main Runner
 
-`main.py` wires together the shared pipeline:
+Common dry-run examples:
 
 ```powershell
-python main.py --strategy mm --search bitcoin --dry-run
-```
-
-Common examples:
-
-```powershell
-# Interactive market making search
+# Static market making through interactive search
 python main.py --strategy mm --search bitcoin --dry-run
 
-# Trade known token IDs without interactive search
-python main.py --strategy mm --token TOKEN_ID --dry-run
+# Static token IDs
+python main.py --strategy mm --token TOKEN1,TOKEN2 --dry-run
 
-# Multi-market market making
-python main.py --strategy mm --token TOKEN1,TOKEN2,TOKEN3 --dry-run
-
-# Mean reversion on selected markets
+# Static mean reversion on searched markets
 python main.py --strategy meanrev --search bitcoin --dry-run
 
-# Whale copy-trading dry-run
+# Whale copy trading
 python main.py --strategy whale --dry-run
 
-# BTC 5m momentum strategy with executable pricing
-python main.py --strategy btc5m --rolling-asset btc --dry-run --verbose
+# Rolling 5m default: momentum + oracle
+python main.py --strategy rolling --rolling-asset btc --dry-run --no-learn
 
-# Oracle front-run strategy (exploit Binance-Polymarket lag)
-python main.py --strategy rolling,oracle --rolling-asset btc --dry-run --verbose
+# Rolling strategy combinations
+python main.py --strategy rolling,momentum --rolling-asset eth --dry-run --no-learn --verbose
+python main.py --strategy rolling,oracle --rolling-asset btc --dry-run --no-learn
+python main.py --strategy rolling,snipe --rolling-asset sol --dry-run --no-learn
+python main.py --strategy rolling,portfolio --rolling-assets btc,eth,sol,xrp --dry-run --no-learn
+python main.py --strategy rolling,rl_shadow --rolling-asset btc --dry-run --no-learn
 
-# All 5m strategies (momentum + oracle front-run)
-python main.py --strategy rolling --dry-run --verbose
-
-# Run all strategies
-python main.py --strategy all --search election --dry-run
+# Alias for rolling momentum
+python main.py --strategy btc5m --rolling-asset btc --dry-run --no-learn
 ```
-
-### Debugging Pricing and Risk Decisions
-
-Use `--verbose` to see detailed logs for each signal:
-
-```powershell
-# View signal prices, execution prices, and risk gate decisions
-python main.py --strategy btc5m --dry-run --verbose
-```
-
-Verbose output includes:
-- Signal generation price (from best_ask/best_bid)
-- Risk gate checks (drawdown %, current equity, peak equity)
-- Capital gate allocation
-- Execution fill prices and slippage
 
 Important flags:
 
 | Flag | Purpose |
 | --- | --- |
-| `--strategy` | `mm`, `whale`, `meanrev`, `btc5m`, `rolling`, `oracle`, `all`, or comma-separated |
-| `--rolling-asset` | Asset for rolling 5m markets: `btc` or `eth` (default: `btc`) |
-| `--no-learn` | Disable auto-learner (skip loading past reports) |
+| `--strategy` | `mm`, `whale`, `meanrev`, `btc5m`, `rolling`, `oracle`, `snipe`, `portfolio`, `rl_shadow`, `all`, or comma-separated |
 | `--search` | Search markets interactively by keyword |
 | `--token` | Comma-separated CLOB token IDs; skips market search |
 | `--dry-run` | Paper mode; no real orders |
 | `--live` | Real-money mode; requires `--i-understand-live-risk` |
-| `--live-max-order-usdc` | Per-order live notional cap; oversized signals are resized before risk/execution |
-| `--live-order-type` | Force live order type; defaults to `FAK` |
-| `--allow-live-gtc` | Let strategies place GTC live orders instead of forcing `FAK` |
-| `--live-check-only` | Authenticate and run live preflight without starting strategies |
-| `--gamma` | Stoikov risk aversion |
-| `--spread-k` | Stoikov spread scaling |
-| `--size` | Base order size in shares |
-| `--levels` | Quote levels per side |
-| `--interval` | Main loop refresh interval in seconds |
-| `--max-position` | Max position size per market in USDC |
-| `--max-drawdown` | Portfolio drawdown percentage before kill switch (default: 1%) |
-| `--reconcile-interval` | Live position reconciliation interval |
-| `--verbose` | Debug logging (see signal prices, execution prices, risk gate decisions) |
-
-## BTC 5-Minute / Rolling Markets
-
-BTC 5-minute is now integrated into `main.py` via the `rolling` strategy and `RollingProvider`. It auto-discovers rolling 5-minute markets, rotates tokens every window, and settles positions when windows expire.
-
-Strategies use **best_ask** for order entry, ensuring executable prices aligned with actual order book depth.
-
-```bash
-# BTC 5m momentum only (shows executable pricing in --verbose mode)
-python main.py --strategy btc5m --dry-run --no-learn --verbose
-
-# Default rolling (momentum + oracle front-run)
-python main.py --strategy rolling --dry-run --no-learn
-
-# Oracle front-run only
-python main.py --strategy rolling,oracle --dry-run --no-learn
-
-# Oracle + momentum
-python main.py --strategy rolling,oracle,momentum --dry-run --no-learn
-
-# ETH 5m instead of BTC
-python main.py --strategy rolling --rolling-asset eth --dry-run --no-learn
-```
-
-Rolling-specific flags:
-
-| Flag | Purpose |
-| --- | --- |
-| `--rolling-asset` | Asset for rolling markets: `btc` or `eth` (default: `btc`) |
-
-## Fee Configuration
-
-The system applies different fees based on market type, configured via `FeeConfig` in `config/settings.py`:
-
-| Market Type | Fee |
-|---|---|
-| Standard markets (maker) | 0% |
-| Standard markets (taker) | 1% (100 bps) |
-| Crypto 5-minute markets | 7.2% (720 bps) |
-
-The BTC 5-minute strategy fee of 7.2% is **not yet deducted** from dry-run PnL calculations — keep this in mind when evaluating simulated results.
+| `--rolling-asset` | One rolling asset: `btc`, `eth`, `sol`, or `xrp` |
+| `--rolling-assets` | Multiple rolling assets, e.g. `btc,eth,sol,xrp` |
+| `--no-learn` | Disable auto-learner |
+| `--verbose` | Debug logging |
+| `--max-position` | Max position per market in USDC |
+| `--max-drawdown` | Drawdown percentage before kill switch |
+| `--live-max-order-usdc` | Hard cap per live order |
+| `--live-order-type` | Force live order type; default is `FAK` |
+| `--allow-live-gtc` | Allow strategy order types in live mode |
+| `--live-check-only` | Authenticate and run live preflight, then exit |
+| `--rl-*` | Configure `rl_shadow` model path and gates |
 
 ## Strategies
 
-All v2 strategies (`strategies/v2/`) share the same interface and work on both long-dated and 5-minute rolling markets.
+All active strategies inherit from `strategies/base.py`:
 
-### Market Making (`strategies/v2/mm.py`)
+```python
+class BaseStrategy:
+    name: str = "base"
 
-- Posts bid/ask quotes around a Stoikov reservation price.
-- Skews quotes based on inventory to reduce directional risk.
-- Adjusts spread by regime (wider in tail, tighter in contested).
-- Filters bait orders when computing midpoint.
-- Works on long-dated (static tokens) and 5m rolling markets.
+    def step(self, contexts: list[MarketContext]) -> list[TradingSignal]:
+        raise NotImplementedError
 
-### Mean Reversion (`strategies/v2/meanrev.py`)
+    def on_fill(self, fill: Fill):
+        pass
 
-- Buys when price drops 1%+ below moving average, sells when it reverts.
-- Only trades in the 0.20-0.80 price range.
-- Stop-loss at 2x entry deviation, 120s cooldown after stop.
-- Sizes with fractional Kelly (0.25x).
-- On 5m markets: uses shorter lookback (20 vs 30) and tighter threshold.
+    def on_cancel(self):
+        pass
 
-### Whale Copy (`strategies/v2/whale.py`)
+    def snapshot(self) -> dict:
+        return {}
+```
 
-- Monitors Polymarket leaderboard for top traders.
-- First poll snapshots only (no false signals from empty baseline).
-- Max 3 signals per whale, max 10 per cycle (prevents rate limit flood).
-- Win rate threshold: 60%+ to copy.
+`MarketContext` includes token IDs, best bid/ask, spread, book snapshot, seconds remaining, regime, volatility, condition ID, question, external price, and rolling-window strike. `TradingSignal` includes token, side, price, size, strategy name, order type, edge, confidence, fair value, and direction.
 
-### BTC Momentum (`strategies/v2/momentum.py`)
+Active v2 strategies:
 
-- Trades BTC 5-minute Up/Down markets using short-term momentum.
-- Z-score model: distance-to-strike + momentum drift + volatility.
-- **Uses best_ask price for DOWN bets, best_ask for UP bets**: Ensures order placement at executable levels, not theoretical mid-prices.
-- Risk/reward gate: won't buy above $0.65.
-- Positive edge required before trading.
+| Strategy | File | CLI use | Notes |
+| --- | --- | --- | --- |
+| Stoikov MM | `strategies/v2/mm.py` | `mm` | Passive bid/ask quotes, inventory skew, static or rolling |
+| Mean Reversion | `strategies/v2/meanrev.py` | `meanrev` | Contested-market dip/reversion logic |
+| Whale Copy | `strategies/v2/whale.py` | `whale` | Leaderboard polling and copy signals |
+| Momentum | `strategies/v2/momentum.py` | `btc5m`, `rolling,momentum` | Rolling 5m z-score/momentum entries |
+| Oracle Front-Run | `strategies/v2/oracle_frontrun.py` | `rolling,oracle` | Trades stale Polymarket odds after external price moves |
+| Lead-Lag | `strategies/v2/leadlag.py` | via `portfolio` live, direct in replay | BTC-led follower asset signals |
+| Last Seconds Snipe | `strategies/v2/last_seconds_snipe.py` | `rolling,snipe` | Late-window high-odds UP/DOWN entries |
+| Portfolio | `strategies/v2/portfolio.py` | `rolling,portfolio` | Regime wrapper over momentum/oracle/leadlag/snipe |
+| RL Shadow | `strategies/v2/rl_shadow.py` | `rolling,rl_shadow` | Logs tabular RL intended actions; emits no orders |
 
-### Oracle Front-Run (`strategies/v2/oracle_frontrun.py`)
+When `--strategy rolling` is used without a child strategy, `main.py` defaults to rolling `momentum` plus `oracle`.
 
-- Exploits the 1-3 second lag between Binance BTC price and Polymarket 5m odds.
-- Detects sharp BTC moves (>3 bps) on Binance, checks if Polymarket is stale.
-- If Polymarket hasn't adjusted: buys the underpriced side before it catches up.
-- **Uses best_ask price for order entry**: Trades at the actual order book depth, ensuring fills occur at executable levels.
-- Not a prediction — trades on something that already happened but isn't priced in yet.
-- Risk/reward gate: won't buy above $0.60, 10-second cooldown between trades.
-- Tracks stale vs already-priced signal ratio in snapshot.
+## Rolling 5-Minute Markets
 
-### Strategy Suitability by Market Type
+`RollingProvider` auto-discovers the current 5-minute market for each asset, refreshes both UP and DOWN books, attaches external spot price and strike price, and rotates windows. `UnifiedRunnerV2` handles window roll, cancels stale orders, and in dry-run mode settles rolling positions using `SettlementOracle`.
 
-| Strategy | Long-dated markets | 5-minute rolling |
-|---|---|---|
-| **MM** | Best fit — passive quoting, spread collection | Poor — token price trends, not oscillates |
-| **Mean Reversion** | Good — price oscillates around fair value | Poor — price trends toward 0 or 1 |
-| **Whale Copy** | Good — follows conviction bets | Poor — detection lag vs 5m window |
-| **Momentum** | N/A | Good — follows BTC direction |
-| **Oracle Front-Run** | N/A | Best — exploits price lag, highest expected win rate |
+Examples:
+
+```powershell
+python main.py --strategy rolling --rolling-asset btc --dry-run --no-learn
+python main.py --strategy rolling,snipe --rolling-asset xrp --dry-run --no-learn --verbose
+python main.py --strategy rolling,portfolio --rolling-assets btc,eth,sol,xrp --dry-run --no-learn
+```
 
 ## Execution Model
-
-`ExecutionEngine` supports dry-run and live modes.
 
 Dry-run mode:
 
 - Uses `DryRunSimulator` when a data feed is attached.
-- Walks the current book for VWAP-style fills.
-- Supports FOK, FAK, and GTC behavior.
+- Walks current book depth for VWAP-style fills.
+- Supports `FOK`, `FAK`, and `GTC`.
 - Keeps unfilled GTC orders pending for later loop iterations.
-- Falls back to immediate fills only if no simulator/data feed is available.
+- Settles rolling-market positions at window roll.
 
 Live mode:
 
-- Derives or creates CLOB API credentials.
-- Requires `--live --i-understand-live-risk`; the default is dry-run even if `--dry-run` is omitted.
-- Requires the official `py-clob-client-v2` package for live order creation.
-- Runs a startup preflight for signer, funder, balance/allowance, max order size, and existing open orders.
-- Forces `FAK` live orders by default to avoid stale GTC exposure. Use `--allow-live-gtc` only after validating maker-order handling.
-- Tracks accepted order IDs and polls CLOB order status for real matched size before recording fills.
-- Cancels known open orders on shutdown and submits real close orders for tracked positions instead of emitting synthetic fills.
+- Requires `--live --i-understand-live-risk`.
+- Requires `POLYMARKET_PRIVATE_KEY`; proxy/deposit wallets also require `POLYMARKET_FUNDER`.
+- Runs startup preflight for signer, funder, balance/allowance, order size, and open orders.
+- Forces `FAK` by default to avoid stale GTC exposure.
+- Polls accepted live orders for real fills before recording them.
+- Cancels known open orders on shutdown and attempts real close orders for tracked positions.
 
-The EMS checks depth, price ticks, and a per-second rate limit before submitting orders. Capital allocation is handled by the pipeline's CapitalGate (not the EMS) to avoid double-booking.
+## Capital And Risk
 
-## OMS, Capital, And Risk
-
-The OMS stores fills and positions in memory. It updates average price, realized PnL, unrealized PnL, portfolio exposure, and can reconcile live positions against the Polymarket Data API by proxy wallet.
-
-The capital allocator enforces:
+`CapitalAllocator` enforces:
 
 - 20% system reserve by default.
 - Per-strategy budgets from `CapitalConfig.strategy_budgets`.
-- 10% max capital per market by default.
-- Locked collateral accounting for short-side trades.
+- Per-market concentration limits.
+- Locked collateral accounting.
 
-The risk engine enforces:
+`RiskEngine` enforces:
 
 - Max portfolio exposure.
-- **Equity-based max drawdown kill switch**: Drawdown = (peak_equity - current_equity) / peak_equity × 100%, where equity = initial_capital + cumulative_PnL. Default threshold: 1%. This ensures risk is measured relative to the actual account size, not cumulative losses alone.
+- Equity-based drawdown kill switch.
 - Per-position stop losses.
-- Per-market position-size checks for whale copy trades.
-- Volatility circuit breakers that pause a token.
+- Per-market position-size checks.
+- Volatility circuit breakers.
 
-When the kill switch fires, the EMS cancels known orders and attempts to close open positions using current best bid liquidity.
+Drawdown is measured from peak equity, where equity is initial capital plus cumulative realized PnL.
 
-### Drawdown Tracking
+## Backtesting, Recording, And RL
 
-`risk_engine.py` now tracks:
-- **peak_equity**: Highest account value reached (starting with initial_capital)
-- **current_equity**: initial_capital + cumulative_PnL
-- **drawdown**: (peak_equity - current_equity) / peak_equity
+Record live rolling-market data:
 
-When a drawdown breach occurs, the log shows:
-```
-DRAWDOWN BREACH: X.X% > 1.0% | peak_eq=$Y current_eq=$Z pnl=$W
+```powershell
+python -m backtest.recorder
+python -m backtest.recorder --assets btc,eth,sol,xrp --interval 0.5
 ```
 
-Example: With initial_capital=$100k, if cumulative_PnL swings from +$5k to -$1k, equity drops from $105k to $99k, drawdown is (105-99)/105 = 5.7%, which breaches the 1% threshold and triggers shutdown.
+Replay collected JSONL data. `backtest.replay` and `backtest.rl_train` default to `data_v2`, while `backtest.recorder` writes to `data/`, so pass `--data-dir data` when replaying recorder output:
 
-## Logs And Analytics
+```powershell
+python -m backtest.replay --strategy oracle --assets btc,eth,sol,xrp --data-dir data
+python -m backtest.replay --strategy momentum --assets btc --data-dir data
+python -m backtest.replay --strategy leadlag --assets btc,eth,sol,xrp --data-dir data
+python -m backtest.replay --strategy convergence --conv-threshold 0.88 --conv-window 45 --data-dir data
+python -m backtest.replay --strategy snipe --assets btc,eth,sol,xrp --data-dir data
+python -m backtest.replay --strategy portfolio --assets btc,eth,sol,xrp --data-dir data
+python -m backtest.replay --strategy rl --assets btc,eth,sol,xrp --data-dir data --rl-model reports/rl_model.json
+```
 
-### Runtime Logging
+Train the tabular RL model:
 
-`analytics/trade_log.py` writes daily JSONL files during the session:
+```powershell
+python -m backtest.rl_train --assets btc,eth,sol,xrp --data-dir data --model-out reports/rl_model.json
+```
+
+## Logs And Reports
+
+Runtime fills are written to:
 
 ```text
 logs/trades_YYYY-MM-DD.jsonl
 ```
 
-`analytics/performance.py` tracks total PnL, equity, trade count, drawdown, Sharpe ratio, and per-strategy win/PnL stats in memory. `analytics/tuner.py` logs human-review parameter suggestions every 10 minutes; it does not auto-change strategy settings.
-
-### Post-Session Analysis
-
-On shutdown, `PostSessionAnalyzer` runs a full diagnostic across all strategies and generates reports:
+Post-session analysis writes:
 
 ```text
-reports/analysis_YYYY-MM-DD_HH-MM-SS.json    # Full structured analysis
-reports/trades_YYYY-MM-DD_HH-MM-SS.csv       # Per-trade CSV for spreadsheets
+reports/analysis_YYYY-MM-DD_HH-MM-SS.json
+reports/trades_YYYY-MM-DD_HH-MM-SS.csv
 ```
 
-The analysis includes:
+RL training writes, by default:
 
-- **Session summary**: duration, total trades, PnL, Sharpe, max drawdown, win rate.
-- **Per-strategy breakdown** with strategy-specific KPIs:
-  - Market Making: spread captured, round-trip fill rate, inventory accumulation.
-  - Arbitrage: expected vs actual profit, multi-leg unwind rate.
-  - Whale Copy: per-whale win rate, best/worst whale identified.
-  - Mean Reversion: reversion accuracy, stop-loss trigger rate, hold time distribution.
-  - Resolution Fade: per-sub-strategy PnL, days-to-resolution vs outcome.
-  - BTC 5m: up/down direction accuracy, edge magnitude vs win rate.
-- **Regime analysis**: PnL per market regime (tail/contested/trending).
-- **Top and worst trades** ranked by PnL with full context.
-- **Market snapshots** captured during the session for replay analysis.
-
-The terminal log also prints an enhanced report on shutdown with all of the above.
+```text
+reports/rl_model.json
+reports/rl_training_report.json
+```
 
 ## Live Trading
 
-After setting environment variables, use explicit live flags:
+Run a live preflight first:
 
 ```powershell
 python main.py `
@@ -488,7 +356,7 @@ python main.py `
   --live-check-only
 ```
 
-Then start with a small live cap:
+Then start small:
 
 ```powershell
 python main.py `
@@ -502,71 +370,23 @@ python main.py `
   --no-learn
 ```
 
-Live mode submits real Polymarket CLOB orders. Validate in dry-run first, confirm token IDs and wallet/proxy/deposit-wallet configuration, and start with a small dedicated wallet. Rolling-market live settlement is not synthetically marked to PnL; rely on Polymarket account reconciliation/redemption for final cash balances.
-
-## V2 Strategy Interface
-
-All strategies in `strategies/v2/` implement the same `BaseStrategy` interface:
-
-```python
-class BaseStrategy:
-    def step(self, contexts: List[MarketContext]) -> List[TradingSignal]
-    def on_fill(self, fill: Fill)
-    def snapshot(self) -> dict
-```
-
-Every strategy receives the same input (`MarketContext` with token, price, spread, time remaining, volatility, regime) and returns the same output (`TradingSignal` with token, side, price, size, edge). No strategy touches the EMS directly — all signals go through the pipeline.
-
-This makes strategies flexible across market types:
-- Long-dated markets use `StaticProvider` (fixed tokens)
-- 5-minute rolling markets use `RollingProvider` (auto-rotating tokens)
-- Same strategy code works on both
-
-```bash
-# 5-minute rolling market (all strategies)
-python main.py --strategy rolling,btc5m --dry-run --no-learn
-
-# Long-dated market
-python main.py --strategy mm,meanrev,whale --token TOKEN --dry-run --no-learn
-```
-
-`main.py` now uses v2 strategies exclusively. Legacy strategies in `strategies/` (outside `v2/`) are kept for reference.
-
-## Auto-Learner
-
-On startup, the learner reads past `reports/analysis_*.json` files and adjusts parameters:
-- Widens spreads if spread capture is low
-- Raises whale quality threshold if copy trades are losing
-- Disables strategies with 3+ consecutive negative sessions
-- Adjusts within ±30% of defaults, needs 10+ trades before acting
-
-Disable with `--no-learn`. Clear old data with `rm reports/analysis_*.json`.
-
-## Shutdown Behavior
-
-On Ctrl+C, the system:
-1. Cancels all open orders.
-2. Closes all open positions at current best bid (sells everything).
-3. Settles any rolling market positions (BTC 5m windows).
-4. Runs post-session analysis and generates reports.
-5. Prints pipeline stats (signals, executed, rejected, fill rate, rejection reasons).
-6. Logs tuner suggestions.
+Live mode submits real Polymarket CLOB orders. Validate in dry-run first, use a small dedicated wallet, and confirm wallet/proxy/deposit-wallet configuration.
 
 ## Current Limitations
 
-- Dry-run simulator rejects most passive limit orders (MM quotes) because it can't model queue-based fills. Live mode would work correctly.
-- Whale copy signals fire for markets the bot doesn't have book data for — these fail at the executor in dry-run mode.
-- Legacy strategies in `strategies/` (outside v2/) are kept for reference but no longer used by main.py.
+- No `requirements.txt` or automated test suite.
 - No persistent database for positions, market state, or performance.
 - No automatic `.env` loader.
-- No `requirements.txt` or automated test suite.
-- Market data is REST-polled instead of streamed over WebSockets.
-- In-memory state is lost on restart except for JSONL trade logs.
-- The target architecture document includes Kafka, Redis, TimescaleDB, LLM sentiment, and a signing server, but those are not implemented in this lightweight path.
+- REST polling is used instead of WebSockets.
+- In-memory OMS/risk state is lost on restart except for logs/reports.
+- Dry-run passive maker fills are only an approximation; queue position is not modeled.
+- Some replay modes use separate replay wrappers rather than the exact live strategy class.
+- The target architecture document includes Kafka, Redis, TimescaleDB, LLM sentiment, and a signing server; those are not implemented in this lightweight path.
 
-## V2 Roadmap
+## Useful Validation Commands
 
-1. **Risk-adjusted threshold**: Replace static edge threshold with a signal scoring system that weighs edge, confidence, downside risk, liquidity, and portfolio correlation.
-2. **Regime-based strategy analysis**: Use post-session trade data tagged with market regime to determine when each strategy works best.
-3. **Queue position model**: Estimate queue depth at each price level, expected time-to-fill from historical flow. Requires WebSocket data.
-4. **WebSocket data feed**: Replace REST polling with persistent WebSocket connections for real-time order book updates.
+```powershell
+python -m py_compile main.py config/settings.py data_pipeline/market_provider.py pipeline/signal.py strategies/base.py strategies/v2/runner.py
+python -m py_compile strategies/v2/mm.py strategies/v2/meanrev.py strategies/v2/whale.py strategies/v2/momentum.py strategies/v2/oracle_frontrun.py strategies/v2/leadlag.py strategies/v2/last_seconds_snipe.py strategies/v2/portfolio.py strategies/v2/rl_shadow.py
+python -m py_compile backtest/replay.py backtest/recorder.py backtest/rl_env.py backtest/rl_train.py
+```

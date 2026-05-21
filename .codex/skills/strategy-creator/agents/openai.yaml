@@ -1,0 +1,4 @@
+interface:
+  display_name: "Strategy Creator"
+  short_description: "Create new ZH-trading v2 strategies"
+  default_prompt: "Use $strategy-creator to add a new strategy under strategies/v2 that fits this repo's runner, signal, config, and replay interfaces."
