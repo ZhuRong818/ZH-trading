@@ -1,0 +1,39 @@
+run_id: default_research
+data_dir: data
+assets: [btc, eth, sol, xrp]
+bankroll: 10000
+
+gates:
+  min_trades: 1
+  min_signals: 100
+  max_drawdown: 0.25
+  min_profit_factor: 1.0
+  min_accuracy: 0.52
+  max_brier: 0.25
+
+experiments:
+  - name: momentum_default
+    mode: replay
+    strategy: momentum
+    tags: [baseline, rolling]
+    params:
+      min_edge: 0.16
+      mom_min_price: 0.40
+      fair_cap: 0.80
+      confirmations: 2
+
+  - name: volconv_default
+    mode: replay
+    strategy: volconv
+    tags: [candidate, rolling]
+    params:
+      vc_min_range_bps: 8.0
+      vc_max_distance_bps: 20.0
+      vc_min_edge: 0.04
+
+  - name: signal_momentum
+    mode: signal_eval
+    strategy: momentum
+    tags: [forecast, rolling]
+    params:
+      sample_seconds: 30

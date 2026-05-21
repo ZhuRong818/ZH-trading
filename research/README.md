@@ -1,9 +1,10 @@
-# Research Signal Evaluation
+# Research Evaluation And Orchestration
 
 This package is intentionally separate from the live trading pipeline, EMS/OMS,
-and `backtest.replay`. It reads recorded JSONL snapshots from `data_v2`, emits
-standardized probability signals, and scores them after each 5-minute window is
-labeled.
+and strategy deployment. It contains two report-only research tools:
+
+- `signal_eval.py` reads recorded JSONL snapshots, emits standardized probability signals, and scores them after each 5-minute window is labeled.
+- `orchestrator.py` runs batches of replay and/or signal-evaluation experiments from a spec, normalizes metrics, applies gates, ranks variants, and writes summaries.
 
 ## Signal Schema
 
@@ -65,3 +66,41 @@ python -m research.signal_eval \
   --file data_v2/market_data_2026-05-15.jsonl \
   --strategies baseline_market_mid,momentum,oracle,leadlag
 ```
+
+## Orchestrator
+
+Run the default report-only experiment loop:
+
+```bash
+python -m research.orchestrator --spec research/experiments.yaml
+```
+
+Run a quick mechanics check with a record cap:
+
+```bash
+python -m research.orchestrator --spec research/experiments.yaml --max-records 5000
+```
+
+The experiment spec supports:
+
+- `run_id`
+- `data_dir` or `file`
+- `assets`
+- `bankroll`
+- `gates`
+- `experiments` with `name`, `mode`, `strategy`, `params`, and `tags`
+
+Supported experiment modes:
+
+- `replay`: calls `python -m backtest.replay --out-json ...`
+- `signal_eval`: calls `python -m research.signal_eval --out-metrics ...`
+
+Outputs are written to:
+
+```text
+reports/research_runs/<run_id>/summary.json
+reports/research_runs/<run_id>/summary.md
+reports/research_runs/<run_id>/<mode>_<experiment>.json
+```
+
+The orchestrator is report-only. It may recommend `promote_candidate`, `keep_testing`, or `reject`, but it does not modify `config/settings.py` or strategy code.

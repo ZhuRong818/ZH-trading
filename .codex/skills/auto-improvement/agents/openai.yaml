@@ -1,0 +1,4 @@
+interface:
+  display_name: "Auto Improvement"
+  short_description: "Run report-only research loops over strategy variants."
+  default_prompt: "Use $auto-improvement to iterate strategy experiment variants until the research gates pass."

@@ -25,7 +25,7 @@ import math
 import os
 import sys
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1610,9 +1610,10 @@ class VolConvexityReplayStrategy:
             time_edge = self.min_edge + (remaining - near) * slope
         return max(base_edge, time_edge)
 
-def load_records(data_dir: str = "data_v2", file_path: str = None, assets: list = None) -> dict:
+def load_records(data_dir: str = "data_v2", file_path: str = None, assets: list = None, max_records: int = 0) -> dict:
     """Load JSONL records grouped by asset."""
     records = defaultdict(list)
+    loaded = 0
 
     if file_path:
         files = [file_path]
@@ -1629,6 +1630,9 @@ def load_records(data_dir: str = "data_v2", file_path: str = None, assets: list 
                 if assets and asset not in assets:
                     continue
                 records[asset].append(rec)
+                loaded += 1
+                if max_records and loaded >= max_records:
+                    return dict(records)
 
     return dict(records)
 
@@ -1727,6 +1731,75 @@ def print_report(strategy_name: str, results: dict[str, ReplayResult], params: d
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _profit_factor(trades: List[ReplayTrade]) -> float:
+    gross_profit = sum(t.pnl for t in trades if t.pnl > 0)
+    gross_loss = abs(sum(t.pnl for t in trades if t.pnl < 0))
+    if gross_loss > 0:
+        return gross_profit / gross_loss
+    return 999.0 if gross_profit > 0 else 0.0
+
+
+def replay_summary(results: dict[str, ReplayResult]) -> dict:
+    """Return aggregate metrics for machine-readable replay output."""
+    trades = [trade for result in results.values() for trade in result.trades]
+    wins = sum(result.wins for result in results.values())
+    losses = sum(result.losses for result in results.values())
+    total = wins + losses
+    return {
+        "trades": len(trades),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": wins / total if total else 0.0,
+        "total_pnl": sum(result.total_pnl for result in results.values()),
+        "fees": sum(result.total_fees for result in results.values()),
+        "profit_factor": _profit_factor(trades),
+        "max_drawdown": max((result.max_drawdown for result in results.values()), default=0.0),
+        "assets": sorted(results),
+    }
+
+
+def replay_results_payload(
+    strategy_name: str,
+    display_name: str,
+    results: dict[str, ReplayResult],
+    params: dict,
+    args: argparse.Namespace,
+) -> dict:
+    """Serialize one replay run without changing the human terminal report."""
+    return {
+        "strategy": strategy_name,
+        "display_name": display_name,
+        "params": params,
+        "bankroll": args.bankroll,
+        "data_dir": args.data_dir,
+        "file": args.file,
+        "summary": replay_summary(results),
+        "assets": {
+            asset: {
+                "summary": replay_summary({asset: result}),
+                "trades": [asdict(trade) for trade in result.trades],
+                "equity_curve": result.equity_curve,
+            }
+            for asset, result in sorted(results.items())
+        },
+    }
+
+
+def write_replay_json(path: str, runs: list[dict], args: argparse.Namespace) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "command": sys.argv,
+        "data_dir": args.data_dir,
+        "file": args.file,
+        "assets": [a.strip() for a in args.assets.split(",") if a.strip()],
+        "max_records": args.max_records,
+        "runs": runs,
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Replay backtest on recorded data")
     parser.add_argument("--strategy", type=str, default="oracle",
@@ -1739,6 +1812,10 @@ def main():
                         help="Specific JSONL file to replay")
     parser.add_argument("--bankroll", type=float, default=10_000,
                         help="Starting bankroll (default: 10000)")
+    parser.add_argument("--max-records", type=int, default=0,
+                        help="Optional cap on loaded records for smoke tests")
+    parser.add_argument("--out-json", type=str, default="",
+                        help="Optional structured JSON path for replay results")
 
     # Oracle params
     parser.add_argument("--move-bps", type=float, default=6.0,
@@ -1837,13 +1914,19 @@ def main():
     )
 
     assets = [a.strip() for a in args.assets.split(",")]
-    all_records = load_records(data_dir=args.data_dir, file_path=args.file, assets=assets)
+    all_records = load_records(
+        data_dir=args.data_dir,
+        file_path=args.file,
+        assets=assets,
+        max_records=args.max_records,
+    )
 
     if not all_records:
         print("No data found!")
         sys.exit(1)
 
     strategies = [s.strip() for s in args.strategy.split(",")]
+    structured_runs = []
 
     for strat_name in strategies:
         if strat_name == "oracle":
@@ -1871,6 +1954,10 @@ def main():
                 "move_bps": args.move_bps, "staleness": args.staleness,
                 "max_price": args.max_price, "min_price": args.min_price,
             })
+            structured_runs.append(replay_results_payload("oracle", "Oracle Frontrun", results, {
+                "move_bps": args.move_bps, "staleness": args.staleness,
+                "max_price": args.max_price, "min_price": args.min_price,
+            }, args))
 
         elif strat_name == "momentum":
             results = {}
@@ -1893,6 +1980,11 @@ def main():
                 "min_price": args.mom_min_price, "fair_cap": args.fair_cap,
                 "confirmations": args.confirmations, "down_edge_boost": args.down_edge_boost,
             })
+            structured_runs.append(replay_results_payload("momentum", "Momentum V2", results, {
+                "min_edge": args.min_edge, "max_price": args.max_price,
+                "min_price": args.mom_min_price, "fair_cap": args.fair_cap,
+                "confirmations": args.confirmations, "down_edge_boost": args.down_edge_boost,
+            }, args))
 
         elif strat_name == "leadlag":
             strategy = LeadLagReplayStrategy(
@@ -1912,6 +2004,10 @@ def main():
                 "leader": args.leader, "move_bps": args.lag_bps,
                 "staleness": args.lag_staleness, "max_price": args.max_price,
             })
+            structured_runs.append(replay_results_payload("leadlag", "Cross-Asset Lead-Lag", results, {
+                "leader": args.leader, "move_bps": args.lag_bps,
+                "staleness": args.lag_staleness, "max_price": args.max_price,
+            }, args))
 
         elif strat_name == "convergence":
             strategy = ConvergenceReplayStrategy(
@@ -1936,6 +2032,10 @@ def main():
                 "threshold": args.conv_threshold, "window_sec": args.conv_window,
                 "confirm_ticks": args.conv_confirm,
             })
+            structured_runs.append(replay_results_payload("convergence", "Settlement Convergence", results, {
+                "threshold": args.conv_threshold, "window_sec": args.conv_window,
+                "confirm_ticks": args.conv_confirm,
+            }, args))
 
         elif strat_name == "snipe":
             results = {}
@@ -1954,6 +2054,11 @@ def main():
                 "soft": "30-45s/0.85-0.93/$45",
                 "stop_loss": sl_label,
             })
+            structured_runs.append(replay_results_payload("snipe", "Last Seconds Snipe", results, {
+                "strict": "15-30s/0.82-0.94/$30",
+                "soft": "30-45s/0.85-0.93/$45",
+                "stop_loss": sl_label,
+            }, args))
 
         elif strat_name == "volconv":
             results = {}
@@ -1985,6 +2090,16 @@ def main():
                 "max_notional": args.vc_max_notional,
                 "window": f"{args.vc_min_seconds}-{args.vc_max_seconds}s",
             })
+            structured_runs.append(replay_results_payload("volconv", "Volatility Convexity", results, {
+                "range_bps": args.vc_min_range_bps,
+                "distance_bps": args.vc_max_distance_bps,
+                "edge": args.vc_min_edge,
+                "far_edge": args.vc_far_edge,
+                "alt_edge": args.vc_alt_min_edge,
+                "depth_mult": args.vc_depth_mult,
+                "max_notional": args.vc_max_notional,
+                "window": f"{args.vc_min_seconds}-{args.vc_max_seconds}s",
+            }, args))
 
         elif strat_name == "portfolio":
             strategy = PortfolioReplayStrategy(
@@ -2012,6 +2127,12 @@ def main():
                 "total_cap": "60%",
                 "leader": args.leader,
             })
+            structured_runs.append(replay_results_payload("portfolio", "Regime Portfolio", results, {
+                "risk": "aggressive",
+                "window_cap": "25%",
+                "total_cap": "60%",
+                "leader": args.leader,
+            }, args))
 
         elif strat_name == "rl":
             strategy = RLReplayStrategy(
@@ -2043,10 +2164,27 @@ def main():
                 "depth_buffer": args.rl_depth_buffer,
                 "mode": "replay",
             })
+            structured_runs.append(replay_results_payload("rl", "RL Shadow Policy", results, {
+                "model": args.rl_model,
+                "min_price": args.rl_min_price,
+                "max_price": args.rl_max_price,
+                "min_q": args.rl_min_q,
+                "min_edge": args.rl_min_edge,
+                "max_spread": args.rl_max_spread,
+                "cooldown": args.rl_cooldown,
+                "fee_edge_mult": args.rl_fee_edge_mult,
+                "min_depth": args.rl_min_depth,
+                "depth_buffer": args.rl_depth_buffer,
+                "mode": "replay",
+            }, args))
 
         else:
             print(f"Unknown strategy: {strat_name}")
             sys.exit(1)
+
+    if args.out_json:
+        write_replay_json(args.out_json, structured_runs, args)
+        print(f"Structured replay JSON: {args.out_json}")
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ ZH Trading is a lightweight Python trading pipeline for Polymarket. It discovers
 - Risk gates for exposure, drawdown, per-position stops, volatility pauses, and kill switch shutdown.
 - Runtime JSONL trade logs plus post-session JSON/CSV analysis reports.
 - Replay tooling for recorded rolling-market data, including oracle, momentum, lead-lag, convergence, snipe, portfolio, and RL replay modes.
+- Report-only research orchestration for replay/signal experiments, gates, rankings, and promotion recommendations.
 - Tabular RL training and live `rl_shadow` logging mode.
 
 ## Pipeline
@@ -77,9 +78,13 @@ Strategies never place orders directly. They only return `TradingSignal` objects
 |   `-- strategy_analyzers/         # Per-strategy diagnostics
 |-- backtest/
 |   |-- recorder.py                 # Live rolling-market JSONL recorder
-|   |-- replay.py                   # Replay engine and replay strategies
+|   |-- replay.py                   # Replay engine, replay strategies, structured JSON output
 |   |-- rl_env.py                   # Tabular RL environment/model helpers
 |   `-- rl_train.py                 # Train tabular RL model from recorded data
+|-- research/
+|   |-- signal_eval.py              # Standardized probability forecast evaluation
+|   |-- orchestrator.py             # Report-only experiment orchestration
+|   `-- experiments.yaml            # Default research experiment spec
 |-- strategies/
 |   |-- base.py                     # BaseStrategy interface
 |   |-- kelly.py                    # Fractional Kelly helper
@@ -317,6 +322,21 @@ python -m backtest.replay --strategy portfolio --assets btc,eth,sol,xrp --data-d
 python -m backtest.replay --strategy rl --assets btc,eth,sol,xrp --data-dir data --rl-model reports/rl_model.json
 ```
 
+Write machine-readable replay output for research orchestration:
+
+```powershell
+python -m backtest.replay --strategy volconv --assets btc,eth --data-dir data --out-json reports/tmp_replay.json
+```
+
+Run report-only research orchestration. The orchestrator reads `research/experiments.yaml`, runs replay and/or `research.signal_eval` experiments, applies gates, ranks variants, and writes summaries without changing live config or strategy code:
+
+```powershell
+python -m research.orchestrator --spec research/experiments.yaml
+
+# Quick mechanics check
+python -m research.orchestrator --spec research/experiments.yaml --max-records 5000
+```
+
 Train the tabular RL model:
 
 ```powershell
@@ -344,6 +364,19 @@ RL training writes, by default:
 reports/rl_model.json
 reports/rl_training_report.json
 ```
+
+Research orchestration writes:
+
+```text
+reports/research_runs/<run_id>/summary.json
+reports/research_runs/<run_id>/summary.md
+reports/research_runs/<run_id>/<mode>_<experiment>.json
+```
+
+Repo-specific Codex skills:
+
+- `strategy-creator`: create and wire candidate strategies under the v2 architecture.
+- `auto-improvement`: report-only research loop that reads orchestration summaries, creates the next experiment variants, runs `research.orchestrator`, and recommends `promote_candidate`, `keep_testing`, or `reject`.
 
 ## Live Trading
 
