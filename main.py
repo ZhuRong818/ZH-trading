@@ -533,6 +533,11 @@ class TradingSystem:
                 min_price=self.config.volconv_min_price,
                 max_price=self.config.volconv_max_price,
                 min_edge=self.config.volconv_min_edge,
+                far_edge=self.config.volconv_far_edge,
+                far_seconds=self.config.volconv_far_seconds,
+                near_seconds=self.config.volconv_near_seconds,
+                alt_min_edge=self.config.volconv_alt_min_edge,
+                depth_notional_mult=self.config.volconv_depth_notional_mult,
                 max_spread=self.config.volconv_max_spread,
                 max_notional_usdc=self.config.volconv_max_notional_usdc,
                 max_vwap_slippage=self.config.volconv_max_vwap_slippage,
@@ -986,6 +991,12 @@ Examples:
                         help="Vol convexity max distance from strike in bps")
     parser.add_argument("--volconv-min-edge", type=float, default=None,
                         help="Vol convexity min net edge after fee/slippage")
+    parser.add_argument("--volconv-far-edge", type=float, default=None,
+                        help="Vol convexity edge required at far_seconds")
+    parser.add_argument("--volconv-alt-min-edge", type=float, default=None,
+                        help="Vol convexity minimum edge floor for SOL/XRP")
+    parser.add_argument("--volconv-depth-mult", type=float, default=None,
+                        help="Vol convexity required book depth as notional multiple")
     parser.add_argument("--volconv-max-notional", type=float, default=None,
                         help="Vol convexity max notional per trade in USDC")
     parser.add_argument("--volconv-min-seconds", type=float, default=None,
@@ -1045,6 +1056,12 @@ Examples:
         config.volconv_max_distance_bps = args.volconv_max_distance_bps
     if args.volconv_min_edge is not None:
         config.volconv_min_edge = args.volconv_min_edge
+    if args.volconv_far_edge is not None:
+        config.volconv_far_edge = args.volconv_far_edge
+    if args.volconv_alt_min_edge is not None:
+        config.volconv_alt_min_edge = args.volconv_alt_min_edge
+    if args.volconv_depth_mult is not None:
+        config.volconv_depth_notional_mult = args.volconv_depth_mult
     if args.volconv_max_notional is not None:
         config.volconv_max_notional_usdc = args.volconv_max_notional
     if args.volconv_min_seconds is not None:

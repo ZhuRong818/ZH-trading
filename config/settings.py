@@ -171,6 +171,11 @@ class SystemConfig:
     volconv_min_price: float = 0.20
     volconv_max_price: float = 0.55
     volconv_min_edge: float = 0.04
+    volconv_far_edge: float = 0.15
+    volconv_far_seconds: float = 120.0
+    volconv_near_seconds: float = 40.0
+    volconv_alt_min_edge: float = 0.08
+    volconv_depth_notional_mult: float = 3.0
     volconv_max_spread: float = 0.08
     volconv_max_notional_usdc: float = 150.0
     volconv_max_vwap_slippage: float = 0.015

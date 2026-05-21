@@ -1389,12 +1389,17 @@ class VolConvexityReplayStrategy:
         min_price: float = 0.20,
         max_price: float = 0.55,
         min_edge: float = 0.04,
+        far_edge: float = 0.15,
+        far_seconds: float = 120.0,
+        near_seconds: float = 40.0,
+        alt_min_edge: float = 0.08,
         max_spread: float = 0.08,
         max_notional_usdc: float = 150.0,
         max_bet_pct: float = 0.01,
         kelly_frac: float = 0.20,
         slippage_buffer: float = 0.015,
         depth_buffer: float = 1.0,
+        depth_notional_mult: float = 3.0,
     ):
         self.lookback_seconds = lookback_seconds
         self.min_range_bps = min_range_bps
@@ -1404,12 +1409,17 @@ class VolConvexityReplayStrategy:
         self.min_price = min_price
         self.max_price = max_price
         self.min_edge = min_edge
+        self.far_edge = far_edge
+        self.far_seconds = far_seconds
+        self.near_seconds = near_seconds
+        self.alt_min_edge = alt_min_edge
         self.max_spread = max_spread
         self.max_notional_usdc = max_notional_usdc
         self.max_bet_pct = max_bet_pct
         self.kelly_frac = kelly_frac
         self.slippage_buffer = slippage_buffer
         self.depth_buffer = depth_buffer
+        self.depth_notional_mult = depth_notional_mult
 
     def run(self, records: List[dict], bankroll: float = 10_000) -> ReplayResult:
         result = ReplayResult(
@@ -1473,7 +1483,8 @@ class VolConvexityReplayStrategy:
                 continue
 
             cand = max(candidates, key=lambda c: c["net_edge"])
-            if cand["net_edge"] < self.min_edge:
+            required_edge = self._required_edge(rec.get("asset", ""), remaining)
+            if cand["net_edge"] < required_edge:
                 continue
 
             size_usdc = kelly_size(
@@ -1488,6 +1499,8 @@ class VolConvexityReplayStrategy:
                 continue
 
             shares = size_usdc / cand["entry_price"]
+            if cand["ask_depth"] * cand["entry_price"] < size_usdc * self.depth_notional_mult:
+                continue
             if cand["ask_depth"] < shares * self.depth_buffer:
                 continue
 
@@ -1510,6 +1523,7 @@ class VolConvexityReplayStrategy:
                 meta=(
                     f"range_bps={range_bps:.1f} distance_bps={distance_bps:.1f} "
                     f"remaining={remaining:.1f} sigma={sigma:.8f} "
+                    f"required_edge={required_edge:.4f} "
                     f"fee_edge={cand['fee_drag']:.4f} spread={cand['spread']:.4f} "
                     f"depth={cand['ask_depth']:.1f}"
                 ),
@@ -1582,6 +1596,19 @@ class VolConvexityReplayStrategy:
         z = (spot - strike) / denom
         fair = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
         return max(0.001, min(0.999, fair))
+
+    def _required_edge(self, asset: str, remaining: float) -> float:
+        base_edge = self.alt_min_edge if str(asset).lower() in ("sol", "xrp") else self.min_edge
+        near = max(0.0, self.near_seconds)
+        far = max(self.far_seconds, near + 1e-6)
+        if remaining <= near:
+            time_edge = self.min_edge
+        elif remaining >= far:
+            time_edge = self.far_edge
+        else:
+            slope = (self.far_edge - self.min_edge) / (far - near)
+            time_edge = self.min_edge + (remaining - near) * slope
+        return max(base_edge, time_edge)
 
 def load_records(data_dir: str = "data_v2", file_path: str = None, assets: list = None) -> dict:
     """Load JSONL records grouped by asset."""
@@ -1787,6 +1814,12 @@ def main():
                         help="Vol convexity max distance from strike in bps")
     parser.add_argument("--vc-min-edge", type=float, default=0.04,
                         help="Vol convexity min net edge after fee/slippage")
+    parser.add_argument("--vc-far-edge", type=float, default=0.15,
+                        help="Vol convexity edge required at far end of time window")
+    parser.add_argument("--vc-alt-min-edge", type=float, default=0.08,
+                        help="Vol convexity min edge floor for SOL/XRP")
+    parser.add_argument("--vc-depth-mult", type=float, default=3.0,
+                        help="Vol convexity required ask depth as notional multiple")
     parser.add_argument("--vc-max-notional", type=float, default=150.0,
                         help="Vol convexity max notional per trade in USDC")
     parser.add_argument("--vc-min-seconds", type=float, default=20.0,
@@ -1932,6 +1965,9 @@ def main():
                     min_range_bps=args.vc_min_range_bps,
                     max_distance_bps=args.vc_max_distance_bps,
                     min_edge=args.vc_min_edge,
+                    far_edge=args.vc_far_edge,
+                    alt_min_edge=args.vc_alt_min_edge,
+                    depth_notional_mult=args.vc_depth_mult,
                     max_notional_usdc=args.vc_max_notional,
                     min_seconds=args.vc_min_seconds,
                     max_seconds=args.vc_max_seconds,
@@ -1943,6 +1979,9 @@ def main():
                 "range_bps": args.vc_min_range_bps,
                 "distance_bps": args.vc_max_distance_bps,
                 "edge": args.vc_min_edge,
+                "far_edge": args.vc_far_edge,
+                "alt_edge": args.vc_alt_min_edge,
+                "depth_mult": args.vc_depth_mult,
                 "max_notional": args.vc_max_notional,
                 "window": f"{args.vc_min_seconds}-{args.vc_max_seconds}s",
             })

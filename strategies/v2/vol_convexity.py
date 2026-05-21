@@ -37,6 +37,11 @@ class VolatilityConvexityArb(BaseStrategy):
         min_price: float = 0.20,
         max_price: float = 0.55,
         min_edge: float = 0.04,
+        far_edge: float = 0.15,
+        far_seconds: float = 120.0,
+        near_seconds: float = 40.0,
+        alt_min_edge: float = 0.08,
+        depth_notional_mult: float = 3.0,
         max_spread: float = 0.08,
         max_notional_usdc: float = 150.0,
         max_bet_pct: float = 0.01,
@@ -54,6 +59,11 @@ class VolatilityConvexityArb(BaseStrategy):
         self.min_price = min_price
         self.max_price = max_price
         self.min_edge = min_edge
+        self.far_edge = far_edge
+        self.far_seconds = far_seconds
+        self.near_seconds = near_seconds
+        self.alt_min_edge = alt_min_edge
+        self.depth_notional_mult = depth_notional_mult
         self.max_spread = max_spread
         self.max_notional_usdc = max_notional_usdc
         self.max_bet_pct = max_bet_pct
@@ -137,10 +147,11 @@ class VolatilityConvexityArb(BaseStrategy):
             return self._reject("candidate")
 
         candidate = max(candidates, key=lambda c: c["net_edge"])
-        if candidate["net_edge"] < self.min_edge:
+        required_edge = self._required_edge(remaining)
+        if candidate["net_edge"] < required_edge:
             return self._reject("edge")
 
-        signal = self._build_signal(candidate, range_bps, distance_bps, remaining)
+        signal = self._build_signal(candidate, range_bps, distance_bps, remaining, required_edge)
         if signal is None:
             return []
 
@@ -163,6 +174,7 @@ class VolatilityConvexityArb(BaseStrategy):
             "last_range_bps": self.last_range_bps,
             "last_distance_bps": self.last_distance_bps,
             "last_fair_up": self.last_fair_up,
+            "required_edge": self._required_edge(0.0),
             "has_position": self._has_position,
         }
 
@@ -241,12 +253,14 @@ class VolatilityConvexityArb(BaseStrategy):
             return None
         fee_drag = CRYPTO_FEE_RATE * ask * (1.0 - ask)
         net_edge = fair - ask - fee_drag - self.max_vwap_slippage
+        ask_depth = ctx.book.depth("BUY") if ctx.book else 0.0
         return {
             "direction": direction,
             "ctx": ctx,
             "ask": ask,
             "fair": fair,
             "fee_drag": fee_drag,
+            "ask_depth": ask_depth,
             "net_edge": net_edge,
         }
 
@@ -256,6 +270,7 @@ class VolatilityConvexityArb(BaseStrategy):
         range_bps: float,
         distance_bps: float,
         remaining: float,
+        required_edge: float,
     ) -> Optional[TradingSignal]:
         ctx = candidate["ctx"]
         ask = candidate["ask"]
@@ -267,11 +282,15 @@ class VolatilityConvexityArb(BaseStrategy):
             bankroll=self.bankroll,
             kelly_fraction=self.kelly_frac,
             max_bet_pct=self.max_bet_pct,
-            min_edge=self.min_edge,
+            min_edge=required_edge,
         )
         notional = min(self.max_notional_usdc, sizing.size_usdc)
         if notional < 5.0 or ask <= 0:
             self._reject("size")
+            return None
+
+        if candidate["ask_depth"] * ask < notional * self.depth_notional_mult:
+            self._reject("depth_guard")
             return None
 
         size = notional / ask
@@ -291,11 +310,11 @@ class VolatilityConvexityArb(BaseStrategy):
 
         fee_drag = CRYPTO_FEE_RATE * vwap * (1.0 - vwap)
         net_edge = fair - vwap - fee_drag - self.max_vwap_slippage
-        if net_edge < self.min_edge:
+        if net_edge < required_edge:
             self._reject("edge_vwap")
             return None
 
-        confidence = min(max(net_edge / max(self.min_edge * 3.0, 1e-6), 0.0), 1.0)
+        confidence = min(max(net_edge / max(required_edge * 3.0, 1e-6), 0.0), 1.0)
         return TradingSignal(
             token_id=ctx.token_id,
             side="BUY",
@@ -310,3 +329,16 @@ class VolatilityConvexityArb(BaseStrategy):
             fair_value=fair,
             direction=candidate["direction"],
         )
+
+    def _required_edge(self, remaining: float) -> float:
+        base_edge = self.alt_min_edge if self.asset.lower() in ("sol", "xrp") else self.min_edge
+        near = max(0.0, self.near_seconds)
+        far = max(self.far_seconds, near + 1e-6)
+        if remaining <= near:
+            time_edge = self.min_edge
+        elif remaining >= far:
+            time_edge = self.far_edge
+        else:
+            slope = (self.far_edge - self.min_edge) / (far - near)
+            time_edge = self.min_edge + (remaining - near) * slope
+        return max(base_edge, time_edge)
