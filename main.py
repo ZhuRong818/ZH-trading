@@ -386,6 +386,7 @@ class TradingSystem:
         from strategies.v2.last_seconds_snipe import LastSecondsSnipe
         from strategies.v2.portfolio import PortfolioRegimeStrategy
         from strategies.v2.rl_shadow import RLShadowStrategy
+        from strategies.v2.vol_convexity import VolatilityConvexityArb
 
         price_feeds = {
             "btc": get_btc_price,
@@ -519,6 +520,25 @@ class TradingSystem:
             )
             runner.add(oracle)
             self.post_analyzer.register_strategy(oracle, "v2_oracle_frontrun")
+
+        if "volconv" in strategies:
+            volconv = VolatilityConvexityArb(
+                asset=asset,
+                bankroll=actual_bankroll,
+                lookback_seconds=self.config.volconv_lookback_seconds,
+                min_range_bps=self.config.volconv_min_range_bps,
+                max_distance_bps=self.config.volconv_max_distance_bps,
+                min_seconds=self.config.volconv_min_seconds,
+                max_seconds=self.config.volconv_max_seconds,
+                min_price=self.config.volconv_min_price,
+                max_price=self.config.volconv_max_price,
+                min_edge=self.config.volconv_min_edge,
+                max_spread=self.config.volconv_max_spread,
+                max_notional_usdc=self.config.volconv_max_notional_usdc,
+                max_vwap_slippage=self.config.volconv_max_vwap_slippage,
+            )
+            runner.add(volconv)
+            self.post_analyzer.register_strategy(volconv, "v2_vol_convexity")
 
         if "portfolio" in strategies:
             snipe_params = {
@@ -662,13 +682,15 @@ class TradingSystem:
             strategies.append("rolling")
         if "rl_shadow" in strategies and "rolling" not in strategies:
             strategies.append("rolling")
+        if "volconv" in strategies and "rolling" not in strategies:
+            strategies.append("rolling")
 
         asset = getattr(self.config, '_rolling_asset', 'btc')
         assets = getattr(self.config, '_rolling_assets', [asset])
 
         # Setup V2 Rolling Strategies (auto-discovers 5m tokens)
         if "rolling" in strategies:
-            roll_strats = [s for s in strategies if s in ("mm", "meanrev", "btc5m", "momentum", "oracle", "snipe", "portfolio", "rl_shadow")]
+            roll_strats = [s for s in strategies if s in ("mm", "meanrev", "btc5m", "momentum", "oracle", "snipe", "portfolio", "rl_shadow", "volconv")]
             if not roll_strats:
                 roll_strats = ["momentum", "oracle"]
             if "portfolio" in roll_strats:
@@ -872,6 +894,7 @@ Strategies (comma-separated or 'all'):
   rolling  Run strategies on 5-minute rolling markets (momentum + oracle by default)
     oracle   Oracle front-run — exploit Binance-Polymarket price lag
         snipe    Last-seconds snipe on rolling 5m markets (high-odds endgame)
+        volconv  Volatility convexity arbitrage near strike
         portfolio Regime portfolio wrapper for momentum/oracle/leadlag/snipe
         rl_shadow Tabular RL shadow policy logger (no orders)
   all      Run all strategies
@@ -886,12 +909,13 @@ Examples:
   python main.py --strategy whale --dry-run
   python main.py --strategy rolling --dry-run --no-learn
   python main.py --strategy rolling,oracle --dry-run --no-learn
+  python main.py --strategy rolling,volconv --rolling-asset btc --dry-run --no-learn
   python main.py --strategy rolling,snipe --rolling-asset btc --live --i-understand-live-risk --max-position 25
   python main.py --strategy all --search "election" --dry-run
         """,
     )
     parser.add_argument("--strategy", type=str, default="mm",
-                        help="Strategy: mm, whale, meanrev, btc5m, rolling, oracle, snipe, portfolio, rl_shadow, all (comma-separated)")
+                        help="Strategy: mm, whale, meanrev, btc5m, rolling, oracle, snipe, volconv, portfolio, rl_shadow, all (comma-separated)")
     parser.add_argument("--search", type=str, default="",
                         help="Search for market(s) interactively")
     parser.add_argument("--token", type=str,
@@ -956,6 +980,18 @@ Examples:
                         help="RL shadow required ask depth as shares * buffer (default: 1.25)")
     parser.add_argument("--rl-log-every", type=int, default=1,
                         help="Log every N RL shadow ticks (default: 1)")
+    parser.add_argument("--volconv-min-range-bps", type=float, default=None,
+                        help="Vol convexity min short-window realized range bps")
+    parser.add_argument("--volconv-max-distance-bps", type=float, default=None,
+                        help="Vol convexity max distance from strike in bps")
+    parser.add_argument("--volconv-min-edge", type=float, default=None,
+                        help="Vol convexity min net edge after fee/slippage")
+    parser.add_argument("--volconv-max-notional", type=float, default=None,
+                        help="Vol convexity max notional per trade in USDC")
+    parser.add_argument("--volconv-min-seconds", type=float, default=None,
+                        help="Vol convexity minimum seconds remaining")
+    parser.add_argument("--volconv-max-seconds", type=float, default=None,
+                        help="Vol convexity maximum seconds remaining")
     parser.add_argument("--no-learn", action="store_true",
                         help="Disable learning from past sessions")
     parser.add_argument("--verbose", action="store_true",
@@ -1003,6 +1039,18 @@ Examples:
     config._rl_min_depth = args.rl_min_depth
     config._rl_depth_buffer = args.rl_depth_buffer
     config._rl_log_every = args.rl_log_every
+    if args.volconv_min_range_bps is not None:
+        config.volconv_min_range_bps = args.volconv_min_range_bps
+    if args.volconv_max_distance_bps is not None:
+        config.volconv_max_distance_bps = args.volconv_max_distance_bps
+    if args.volconv_min_edge is not None:
+        config.volconv_min_edge = args.volconv_min_edge
+    if args.volconv_max_notional is not None:
+        config.volconv_max_notional_usdc = args.volconv_max_notional
+    if args.volconv_min_seconds is not None:
+        config.volconv_min_seconds = args.volconv_min_seconds
+    if args.volconv_max_seconds is not None:
+        config.volconv_max_seconds = args.volconv_max_seconds
     config.market_making.gamma = args.gamma
     config.market_making.spread_k = args.spread_k
     config.market_making.order_size = args.size

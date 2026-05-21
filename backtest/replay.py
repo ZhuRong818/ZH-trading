@@ -21,6 +21,7 @@ import argparse
 import copy
 import json
 import logging
+import math
 import os
 import sys
 from collections import defaultdict, deque
@@ -1372,6 +1373,216 @@ class RLReplayStrategy:
         compute_max_drawdown(result)
         return result
 
+
+class VolConvexityReplayStrategy:
+    """Replay volatility convexity arbitrage on recorded rolling market data."""
+
+    name = "volconv"
+
+    def __init__(
+        self,
+        lookback_seconds: float = 30.0,
+        min_range_bps: float = 8.0,
+        max_distance_bps: float = 20.0,
+        min_seconds: float = 20.0,
+        max_seconds: float = 120.0,
+        min_price: float = 0.20,
+        max_price: float = 0.55,
+        min_edge: float = 0.04,
+        max_spread: float = 0.08,
+        max_notional_usdc: float = 150.0,
+        max_bet_pct: float = 0.01,
+        kelly_frac: float = 0.20,
+        slippage_buffer: float = 0.015,
+        depth_buffer: float = 1.0,
+    ):
+        self.lookback_seconds = lookback_seconds
+        self.min_range_bps = min_range_bps
+        self.max_distance_bps = max_distance_bps
+        self.min_seconds = min_seconds
+        self.max_seconds = max_seconds
+        self.min_price = min_price
+        self.max_price = max_price
+        self.min_edge = min_edge
+        self.max_spread = max_spread
+        self.max_notional_usdc = max_notional_usdc
+        self.max_bet_pct = max_bet_pct
+        self.kelly_frac = kelly_frac
+        self.slippage_buffer = slippage_buffer
+        self.depth_buffer = depth_buffer
+
+    def run(self, records: List[dict], bankroll: float = 10_000) -> ReplayResult:
+        result = ReplayResult(
+            asset=records[0]["asset"] if records else "?",
+            strategy=self.name,
+            bankroll=bankroll,
+        )
+        result.equity_curve.append(bankroll)
+
+        outcomes = compute_window_outcomes(records)
+        prices = deque(maxlen=500)
+        current_slug = None
+        current_trade: Optional[ReplayTrade] = None
+        signaled_window = False
+
+        for rec in records:
+            ts = float(rec.get("ts", 0) or 0)
+            slug = rec.get("slug", "")
+            spot = float(rec.get("price", 0) or 0)
+            strike = float(rec.get("strike", 0) or 0)
+            remaining = float(rec.get("seconds_remaining", 0) or 0)
+
+            if slug != current_slug:
+                if current_trade is not None:
+                    settle_trade(current_trade, outcomes, result)
+                    current_trade = None
+                current_slug = slug
+                signaled_window = False
+
+            if spot > 0 and ts > 0:
+                prices.append((ts, spot))
+                self._trim_prices(prices, ts)
+
+            if current_trade is not None or signaled_window:
+                continue
+            if remaining < self.min_seconds or remaining > self.max_seconds:
+                continue
+            if spot <= 0 or strike <= 0:
+                continue
+
+            distance_bps = abs(spot - strike) / spot * 10_000
+            if distance_bps > self.max_distance_bps:
+                continue
+
+            up_mid = float(rec.get("up_mid", 0) or 0)
+            down_mid = float(rec.get("down_mid", 0) or 0)
+            if not (0.40 <= up_mid <= 0.60 or 0.40 <= down_mid <= 0.60):
+                continue
+
+            range_bps, sigma = self._realized_vol(prices, ts)
+            if range_bps < self.min_range_bps or sigma <= 0:
+                continue
+
+            fair_up = self._digital_fair_up(spot, strike, sigma, remaining)
+            candidates = [
+                self._candidate(rec, "UP", fair_up),
+                self._candidate(rec, "DOWN", 1.0 - fair_up),
+            ]
+            candidates = [c for c in candidates if c is not None]
+            if not candidates:
+                continue
+
+            cand = max(candidates, key=lambda c: c["net_edge"])
+            if cand["net_edge"] < self.min_edge:
+                continue
+
+            size_usdc = kelly_size(
+                fair=cand["fair"],
+                market_price=cand["entry_price"],
+                bankroll=result.bankroll,
+                kelly_frac=self.kelly_frac,
+                max_bet_pct=self.max_bet_pct,
+            )
+            size_usdc = min(size_usdc, self.max_notional_usdc)
+            if size_usdc < 5:
+                continue
+
+            shares = size_usdc / cand["entry_price"]
+            if cand["ask_depth"] < shares * self.depth_buffer:
+                continue
+
+            fee = shares * FEE_RATE * cand["entry_price"] * (1.0 - cand["entry_price"])
+            current_trade = ReplayTrade(
+                strategy=self.name,
+                window_slug=slug,
+                asset=rec["asset"],
+                direction=cand["direction"],
+                entry_price=cand["entry_price"],
+                fair_value=cand["fair"],
+                edge=cand["net_edge"],
+                size_usdc=size_usdc,
+                shares=shares,
+                entry_ts=ts,
+                move_bps=range_bps,
+                staleness=distance_bps,
+                fee=fee,
+                seconds_remaining=remaining,
+                meta=(
+                    f"range_bps={range_bps:.1f} distance_bps={distance_bps:.1f} "
+                    f"remaining={remaining:.1f} sigma={sigma:.8f} "
+                    f"fee_edge={cand['fee_drag']:.4f} spread={cand['spread']:.4f} "
+                    f"depth={cand['ask_depth']:.1f}"
+                ),
+            )
+            signaled_window = True
+
+        if current_trade is not None:
+            settle_trade(current_trade, outcomes, result)
+
+        compute_max_drawdown(result)
+        return result
+
+    def _candidate(self, rec: dict, direction: str, fair: float) -> Optional[dict]:
+        prefix = "up" if direction == "UP" else "down"
+        entry_price = float(rec.get(f"{prefix}_sell", 0) or rec.get(f"{prefix}_mid", 0) or 0)
+        spread = float(rec.get(f"{prefix}_spread", 0) or 0)
+        ask_depth = float(rec.get(f"{prefix}_ask_depth", 0) or 0)
+        if entry_price < self.min_price or entry_price > self.max_price:
+            return None
+        if spread < 0 or spread > self.max_spread:
+            return None
+        if ask_depth <= 0:
+            return None
+        fee_drag = FEE_RATE * entry_price * (1.0 - entry_price)
+        net_edge = fair - entry_price - fee_drag - self.slippage_buffer
+        return {
+            "direction": direction,
+            "entry_price": entry_price,
+            "fair": fair,
+            "spread": spread,
+            "ask_depth": ask_depth,
+            "fee_drag": fee_drag,
+            "net_edge": net_edge,
+        }
+
+    def _trim_prices(self, prices: deque, ts: float):
+        cutoff = ts - self.lookback_seconds
+        while prices and prices[0][0] < cutoff:
+            prices.popleft()
+
+    def _realized_vol(self, prices: deque, ts: float) -> tuple[float, float]:
+        self._trim_prices(prices, ts)
+        items = list(prices)
+        if len(items) < 3:
+            return 0.0, 0.0
+        values = [p for _, p in items if p > 0]
+        if len(values) < 3:
+            return 0.0, 0.0
+        last = values[-1]
+        range_bps = (max(values) - min(values)) / last * 10_000 if last > 0 else 0.0
+
+        variance_sum = 0.0
+        dt_sum = 0.0
+        prev_t, prev_p = items[0]
+        for t, p in items[1:]:
+            dt = max(t - prev_t, 1e-6)
+            if prev_p > 0 and p > 0:
+                ret = math.log(p / prev_p)
+                variance_sum += ret * ret
+                dt_sum += dt
+            prev_t, prev_p = t, p
+        sigma = math.sqrt(variance_sum / dt_sum) if dt_sum > 0 else 0.0
+        return range_bps, sigma
+
+    @staticmethod
+    def _digital_fair_up(spot: float, strike: float, sigma: float, seconds_remaining: float) -> float:
+        denom = spot * sigma * math.sqrt(max(seconds_remaining, 1e-6))
+        if denom <= 0:
+            return 0.5
+        z = (spot - strike) / denom
+        fair = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+        return max(0.001, min(0.999, fair))
+
 def load_records(data_dir: str = "data_v2", file_path: str = None, assets: list = None) -> dict:
     """Load JSONL records grouped by asset."""
     records = defaultdict(list)
@@ -1492,7 +1703,7 @@ def print_report(strategy_name: str, results: dict[str, ReplayResult], params: d
 def main():
     parser = argparse.ArgumentParser(description="Replay backtest on recorded data")
     parser.add_argument("--strategy", type=str, default="oracle",
-                        help="Strategy: oracle, momentum, leadlag, convergence, snipe, portfolio, rl, or comma-separated")
+                        help="Strategy: oracle, momentum, leadlag, convergence, snipe, volconv, portfolio, rl, or comma-separated")
     parser.add_argument("--assets", type=str, default="btc,eth,sol,xrp",
                         help="Assets to backtest (default: btc,eth,sol,xrp)")
     parser.add_argument("--data-dir", type=str, default="data_v2",
@@ -1568,6 +1779,20 @@ def main():
                         help="Convergence max seconds remaining (default: 45)")
     parser.add_argument("--conv-confirm", type=int, default=3,
                         help="Convergence consecutive confirm ticks (default: 3)")
+
+    # Volatility convexity params
+    parser.add_argument("--vc-min-range-bps", type=float, default=8.0,
+                        help="Vol convexity min short-window realized range bps")
+    parser.add_argument("--vc-max-distance-bps", type=float, default=20.0,
+                        help="Vol convexity max distance from strike in bps")
+    parser.add_argument("--vc-min-edge", type=float, default=0.04,
+                        help="Vol convexity min net edge after fee/slippage")
+    parser.add_argument("--vc-max-notional", type=float, default=150.0,
+                        help="Vol convexity max notional per trade in USDC")
+    parser.add_argument("--vc-min-seconds", type=float, default=20.0,
+                        help="Vol convexity minimum seconds remaining")
+    parser.add_argument("--vc-max-seconds", type=float, default=120.0,
+                        help="Vol convexity maximum seconds remaining")
 
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -1695,6 +1920,31 @@ def main():
                 "strict": "15-30s/0.82-0.94/$30",
                 "soft": "30-45s/0.85-0.93/$45",
                 "stop_loss": sl_label,
+            })
+
+        elif strat_name == "volconv":
+            results = {}
+            for asset in sorted(all_records):
+                recs = all_records[asset]
+                windows = len(set(r["slug"] for r in recs))
+                print(f"[volconv] Replaying {asset.upper()}: {len(recs):,} ticks, {windows} windows...")
+                strategy = VolConvexityReplayStrategy(
+                    min_range_bps=args.vc_min_range_bps,
+                    max_distance_bps=args.vc_max_distance_bps,
+                    min_edge=args.vc_min_edge,
+                    max_notional_usdc=args.vc_max_notional,
+                    min_seconds=args.vc_min_seconds,
+                    max_seconds=args.vc_max_seconds,
+                    min_price=args.min_price,
+                    max_price=args.max_price,
+                )
+                results[asset] = strategy.run(recs, bankroll=args.bankroll)
+            print_report("Volatility Convexity", results, {
+                "range_bps": args.vc_min_range_bps,
+                "distance_bps": args.vc_max_distance_bps,
+                "edge": args.vc_min_edge,
+                "max_notional": args.vc_max_notional,
+                "window": f"{args.vc_min_seconds}-{args.vc_max_seconds}s",
             })
 
         elif strat_name == "portfolio":

@@ -163,6 +163,18 @@ class SystemConfig:
     xrp5m_snipe_soft_max_market_odds: float = 0.93
     xrp5m_snipe_max_notional_usdc: float = 50.0
 
+    volconv_lookback_seconds: float = 30.0
+    volconv_min_range_bps: float = 8.0
+    volconv_max_distance_bps: float = 20.0
+    volconv_min_seconds: float = 20.0
+    volconv_max_seconds: float = 120.0
+    volconv_min_price: float = 0.20
+    volconv_max_price: float = 0.55
+    volconv_min_edge: float = 0.04
+    volconv_max_spread: float = 0.08
+    volconv_max_notional_usdc: float = 150.0
+    volconv_max_vwap_slippage: float = 0.015
+
     risk: RiskConfig = field(default_factory=RiskConfig)
     fees: FeeConfig = field(default_factory=FeeConfig)
     capital: CapitalConfig = field(default_factory=CapitalConfig)
