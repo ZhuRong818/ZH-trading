@@ -1,0 +1,9 @@
+name: crypto-signal-agent
+domains:
+  - Crypto price
+  - Crypto regulation
+skills:
+  - predictive-tweet-extraction
+  - spam-bot-filtering
+  - backtest-scoring
+

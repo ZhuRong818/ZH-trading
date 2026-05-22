@@ -1,0 +1,25 @@
+kol_quality:
+  prediction_quality:
+    min: 0
+    max: 5
+    description: Specificity and usefulness of the forecast.
+  falsifiability:
+    min: 0
+    max: 5
+    description: Whether the claim can resolve against a clear event outcome.
+  probability_thinking:
+    min: 0
+    max: 5
+    description: Use of odds, probabilities, confidence, or calibrated language.
+  market_relevance:
+    min: 0
+    max: 5
+    description: Fit to Polymarket-style markets.
+  noise_penalty:
+    min: -5
+    max: 0
+    description: Penalty for spam, copied news, vague takes, or automated summaries.
+signal_quality:
+  minimum_signal_score: 3
+  high_signal_score: 7
+

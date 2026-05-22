@@ -1,0 +1,72 @@
+prediction_market:
+  latest:
+    - '"Polymarket" ("will" OR "odds" OR "chance" OR "probability")'
+    - '"Polymarket" ("YES" OR "NO" OR "buy YES" OR "buy NO")'
+    - '"Polymarket" ("resolve" OR "resolution" OR "market")'
+    - '"Kalshi" "Polymarket" ("odds" OR "market")'
+  top:
+    - '"Polymarket" ("prediction" OR "forecast" OR "odds")'
+politics/election:
+  latest:
+    - '("Polymarket" OR "Kalshi") ("election" OR "senate" OR "president") ("odds" OR "will")'
+    - '("Trump" OR "Biden" OR "Harris") ("Polymarket" OR "odds") ("will" OR "chance")'
+    - '("poll" OR "election") ("buy YES" OR "buy NO" OR "priced")'
+  top:
+    - '("election odds" OR "Polymarket election")'
+crypto:
+  latest:
+    - '("Polymarket" OR "Kalshi") ("BTC" OR "Bitcoin" OR "ETH" OR "Ethereum") ("will" OR "odds")'
+    - '("bitcoin" OR "ethereum") ("above" OR "below" OR "over" OR "under") "Polymarket"'
+  top:
+    - '"crypto prediction market" ("odds" OR "will")'
+crypto_predictive:
+  latest:
+    - '("BTC" OR "Bitcoin") ("will" OR "target" OR "forecast" OR "expect") ("support" OR "resistance" OR "breakout" OR "close above" OR "close below") -airdrop -giveaway -referral'
+    - '("ETH" OR "Ethereum") ("will" OR "target" OR "forecast" OR "expect") ("support" OR "resistance" OR "breakout" OR "close above" OR "close below") -airdrop -giveaway -referral'
+    - '("SOL" OR "Solana") ("will" OR "target" OR "forecast" OR "expect") ("support" OR "resistance" OR "breakout" OR "close above" OR "close below") -airdrop -giveaway -referral'
+    - '("funding rates" OR "open interest" OR "liquidity") ("BTC" OR "ETH" OR "SOL") ("bullish" OR "bearish" OR "breakout" OR "squeeze") -news -airdrop -referral'
+    - '("ETF flows" OR "spot ETF" OR "GBTC" OR "IBIT") ("BTC" OR "ETH") ("will" OR "likely" OR "catalyst" OR "target") -news -airdrop -referral'
+    - '("altcoins" OR "DeFi tokens" OR "memecoins") ("will" OR "target" OR "setup" OR "breakout") ("bullish" OR "bearish" OR "catalyst") -airdrop -giveaway -referral'
+    - '("onchain" OR "on-chain") ("BTC" OR "ETH" OR "SOL") ("accumulation" OR "distribution" OR "liquidity" OR "signal") ("will" OR "likely") -news -airdrop -referral'
+    - '("crypto trader" OR "onchain analyst" OR "market forecaster") ("BTC" OR "ETH" OR "SOL") ("target" OR "forecast" OR "setup") -airdrop -giveaway -referral'
+  top:
+    - '("BTC" OR "ETH" OR "SOL") ("target" OR "forecast" OR "price prediction") -airdrop -giveaway -referral'
+sports:
+  latest:
+    - '("Polymarket" OR "Kalshi") ("spread" OR "win" OR "game" OR "match")'
+    - '("buy YES" OR "buy NO") ("NBA" OR "NFL" OR "MLB" OR "UFC" OR "soccer")'
+  top:
+    - '"sports betting" "Polymarket"'
+geopolitics:
+  latest:
+    - '("Polymarket" OR "Kalshi") ("Iran" OR "Israel" OR "Russia" OR "Ukraine" OR "China") ("will" OR "odds")'
+    - '("ceasefire" OR "sanctions" OR "airspace" OR "war") ("Polymarket" OR "odds")'
+  top:
+    - '"geopolitics" "Polymarket"'
+macro:
+  latest:
+    - '("Fed" OR "CPI" OR "inflation" OR "rates") ("Polymarket" OR "Kalshi" OR "odds")'
+    - '("rate cut" OR "rate hike") ("will" OR "odds" OR "priced")'
+  top:
+    - '"macro" "prediction market"'
+pandemic:
+  latest:
+    - '("pandemic" OR "outbreak" OR "epidemic") ("will" OR "odds" OR "risk" OR "forecast")'
+    - '("H5N1" OR "bird flu" OR "avian flu" OR "mpox" OR "COVID") ("will" OR "odds" OR "risk" OR "forecast")'
+    - '("WHO" OR "CDC" OR "FDA") ("pandemic" OR "outbreak" OR "vaccine" OR "variant") ("will" OR "risk" OR "forecast")'
+    - '("hospitalization" OR "case surge" OR "variant") ("COVID" OR "flu" OR "virus") ("will" OR "risk" OR "forecast")'
+  top:
+    - '("pandemic risk" OR "outbreak forecast" OR "H5N1 risk" OR "bird flu pandemic")'
+health/pandemic:
+  latest:
+    - '("pandemic" OR "outbreak" OR "epidemic") ("will" OR "odds" OR "risk" OR "forecast")'
+    - '("H5N1" OR "bird flu" OR "avian flu" OR "mpox" OR "COVID") ("will" OR "odds" OR "risk" OR "forecast")'
+    - '("WHO" OR "CDC" OR "FDA") ("pandemic" OR "outbreak" OR "vaccine" OR "variant") ("will" OR "risk" OR "forecast")'
+  top:
+    - '("pandemic risk" OR "outbreak forecast" OR "H5N1 risk" OR "bird flu pandemic")'
+company/events:
+  latest:
+    - '("earnings" OR "revenue" OR "guidance") ("Polymarket" OR "odds" OR "will")'
+    - '("Tesla" OR "Nvidia" OR "Apple" OR "OpenAI") ("will" OR "odds") "Polymarket"'
+  top:
+    - '"company" "Polymarket" "odds"'

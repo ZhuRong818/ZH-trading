@@ -1,0 +1,8 @@
+name: election-kol-ranker
+domains:
+  - Politics / election
+skills:
+  - predictive-tweet-extraction
+  - market-outcome-classification
+  - kol-quality-scoring
+

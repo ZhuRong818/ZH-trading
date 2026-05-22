@@ -1,0 +1,30 @@
+name: prediction-market-kol-intelligence
+version: 0.1.0
+description: Extract, score, and rank prediction-market signals from KOL tweets.
+default_inputs:
+  tweet_jsonl:
+    - path/to/tweets.jsonl
+outputs:
+  signals_jsonl: ../reports/kol_intelligence/signals.jsonl
+  leaderboard_csv: ../reports/kol_intelligence/leaderboard.csv
+  signal_feed_csv: ../reports/kol_intelligence/signal_feed.csv
+  labeling_sample_jsonl: ../reports/kol_intelligence/labeling_sample.jsonl
+  rejected_spam_samples_jsonl: ../reports/kol_intelligence/rejected_spam_samples.jsonl
+skills:
+  - x-kol-discovery
+  - kol-quality-scoring
+  - predictive-tweet-extraction
+  - market-outcome-classification
+  - spam-bot-filtering
+  - backtest-scoring
+datasets:
+  - datasets/scoring_rubric.yaml
+  - datasets/kol_seed_list.csv
+  - datasets/labeled_predictive_tweets.jsonl
+  - datasets/resolved_market_examples.jsonl
+  - datasets/spam_examples.jsonl
+agents:
+  - election-kol-ranker
+  - crypto-signal-agent
+  - geo-event-agent
+  - company-event-agent

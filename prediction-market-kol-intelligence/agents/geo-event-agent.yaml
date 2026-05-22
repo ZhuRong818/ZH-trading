@@ -1,0 +1,8 @@
+name: geo-event-agent
+domains:
+  - Geopolitics / war / sanctions
+  - Macro / Fed / CPI / rates
+skills:
+  - predictive-tweet-extraction
+  - market-outcome-classification
+

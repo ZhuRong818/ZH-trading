@@ -1,0 +1,8 @@
+name: company-event-agent
+domains:
+  - Company earnings/performance
+skills:
+  - predictive-tweet-extraction
+  - market-outcome-classification
+  - backtest-scoring
+
