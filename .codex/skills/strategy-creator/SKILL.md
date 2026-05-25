@@ -317,6 +317,78 @@ Key differences from the minimal pattern:
 - **Kelly sizing with hard caps** — quarter Kelly, max 2.5% of bankroll, max notional cap, $5 minimum.
 - **snapshot() returns rejection breakdown** — use `dict(self.rejected)` to see which gate fires most often.
 
+## Strategy Archetypes
+
+When building a new strategy, match the closest archetype and follow its patterns.
+
+### 1. Propagation Delay (leadlag / oracle_frontrun)
+
+Detect moves that already happened on a faster venue, then trade the stale Polymarket price before it reprices.
+
+```
+Binance price poll (~500ms) → detect sharp move over N ticks →
+check staleness on Polymarket → if lag > threshold → emit signal
+```
+
+**Shared parameters:**
+| Param | leadlag | oracle_frontrun | Purpose |
+|-------|---------|-----------------|---------|
+| `lookback_ticks` | 5 | 5 | Ticks to compare (~2.5s window) |
+| `move_threshold_bps` | 5.0 | 6.0 | Minimum move to trigger |
+| `staleness_threshold` | 0.10 | 0.15 | Minimum Polytmarket lag (probability space) |
+| `correlation_discount` | 0.90 | none | Cross-asset dampening; same-asset = no discount |
+
+**Fair value model:**
+```python
+prob_shift = min(move_bps / 50.0, 0.35) * correlation_discount  # cap at 35pp
+fair_up = 0.50 + prob_shift  # if UP move
+staleness = fair_up - market_price
+if staleness >= staleness_threshold:
+    # signal with edge = staleness - fee_drag
+```
+
+**Key differentiator:** Edge comes from **latency**, not from predicting direction. The signal fires when the move already happened elsewhere and Polymarket hasn't caught up.
+
+**Implementation checklist:**
+- Poll `BTCPriceFeed` every ~500ms for the leader asset
+- Store last N prices (200 minimum for momentum/volatility computations)
+- On every move above `move_threshold_bps`, check current Polymarket prices
+- `correlation_discount = 1.0` for same-asset oracle frontrun; `0.85-0.90` for cross-asset leadlag
+- Lock immediately on signal emission (one position at a time)
+- Cooldown = 10-15s between trades
+
+### 2. Convexity Arbitrage (vol_convexity)
+
+When spot is near strike late in a 5-minute window, the digital option's fair value becomes highly convex — small spot changes cause large probability swings. If market makers lag the convexity, buy the underpriced side.
+
+```python
+# Realized volatility from 30s of tick data
+sigma = sqrt(variance_sum / dt_sum)
+z = (spot - strike) / (spot * sigma * sqrt(seconds_remaining))
+fair = 0.5 * (1 + erf(z / sqrt(2)))
+edge = fair - ask - fee_drag
+required_edge = interpolate(min_edge=0.04, far_edge=0.15, t=seconds_remaining)
+```
+
+**Key differentiator:** Edge requirement scales with time. Early window: 4pp. Late window: 15pp. More time = lower bar because convexity has room to play out.
+
+### 3. Statistical Momentum (momentum)
+
+Use rolling price history to detect drift: compute momentum (20-tick), volatility, z-score, then size with Kelly. This is the most gated archetype — 10+ gates — and the best reference for the full gate checklist.
+
+**Key differentiator:** `confirmations_required = 2` — the same signal must survive two consecutive polls.
+
+### Archetype Selection Guide
+
+| If the strategy... | Use archetype |
+|---|---|
+| Trades on speed / stale prices | Propagation delay |
+| Exploits option math near expiry | Convexity arbitrage |
+| Detects drift from price history | Statistical momentum |
+| Copies another trader's entries | Whale tracking (see `whale.py`) |
+| Provides two-sided quotes | Market making (see `mm.py`) |
+| Bets on price returning to mean | Mean reversion (see `meanrev.py`) |
+
 ## MarketContext Rules
 
 For static markets, expect fixed token contexts from `StaticProvider`.

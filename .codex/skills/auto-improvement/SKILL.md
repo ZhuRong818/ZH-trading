@@ -50,6 +50,41 @@ Choose variants from the observed failure mode:
 - Poor signal accuracy/Brier/log loss: compare against `baseline_market_mid`, reduce confidence, or test a simpler probability transform.
 - Asset instability: split variants by `btc`, `eth`, `sol`, `xrp` before recommending a portfolio-wide setting.
 
+## Edge Model Validation
+
+The most important question after any research run is not "did it make money?" but **"is the edge model real?"** The `BTC5mAnalyzer` already computes this:
+
+```
+high_edge_win_rate = win rate for trades where |edge| > 0.05
+low_edge_win_rate  = win rate for trades where |edge| <= 0.05
+```
+
+### How to validate
+
+1. After each research run, open the generated `reports/research_runs/<id>/summary.json`.
+2. Check `btc5m_high_edge_win_rate_pct` vs `btc5m_low_edge_win_rate_pct`.
+3. If high-edge trades outperform low-edge trades: the edge model has signal. Continue tuning parameters.
+4. If high-edge trades do NOT outperform (or underperform): **the fair value model is miscalibrated**. Stop tuning parameters — hand back to `strategy-creator` to fix the edge computation.
+
+### When gates pass but edge is dead
+
+A strategy can pass all gates (`min_accuracy >= 0.52`, `min_profit_factor >= 1.0`, `max_brier <= 0.25`) with a broken edge model if it got lucky on a small sample. Look for:
+
+- Edge-to-outcome correlation is weak or inverted
+- Win rate is near 50% but Brier is high (> 0.22)
+- Performance is concentrated in one asset or one direction (e.g., only UP trades win)
+
+These patterns mean the strategy is noise-fitting, not edge-trading. Recommend `reject` or `hand_back_to_strategy_creator` — never `promote_candidate`.
+
+### Promotion criteria
+
+Only recommend `promote_candidate` when ALL of these hold:
+
+- All gates pass (accuracy, profit factor, Brier, drawdown, min trades)
+- `high_edge_win_rate_pct > low_edge_win_rate_pct` (edge model is real)
+- Performance is consistent across at least 2 assets
+- Sample size is adequate (min_trades >= 20 for rolling strategies)
+
 ## Hand-Off To Strategy Creator
 
 Use `strategy-creator` when the next step requires code:
