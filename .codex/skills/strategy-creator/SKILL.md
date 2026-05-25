@@ -335,7 +335,7 @@ check staleness on Polymarket → if lag > threshold → emit signal
 |-------|---------|-----------------|---------|
 | `lookback_ticks` | 5 | 5 | Ticks to compare (~2.5s window) |
 | `move_threshold_bps` | 5.0 | 6.0 | Minimum move to trigger |
-| `staleness_threshold` | 0.10 | 0.15 | Minimum Polytmarket lag (probability space) |
+| `staleness_threshold` | 0.10 | 0.15 | Minimum Polymarket lag (probability space) |
 | `correlation_discount` | 0.90 | none | Cross-asset dampening; same-asset = no discount |
 
 **Fair value model:**
@@ -351,8 +351,8 @@ if staleness >= staleness_threshold:
 
 **Implementation checklist:**
 - Poll `BTCPriceFeed` every ~500ms for the leader asset
-- Store last N prices (200 minimum for momentum/volatility computations)
-- On every move above `move_threshold_bps`, check current Polymarket prices
+- `BTCPriceFeed` stores up to 200 prices (shared with momentum/volatility strategies)
+- On every move above `move_threshold_bps` (checked over `lookback_ticks`), compare current Polymarket prices
 - `correlation_discount = 1.0` for same-asset oracle frontrun; `0.85-0.90` for cross-asset leadlag
 - Lock immediately on signal emission (one position at a time)
 - Cooldown = 10-15s between trades

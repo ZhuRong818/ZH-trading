@@ -54,6 +54,10 @@ class ExperimentResult:
     log_loss: Optional[float] = None
     calibration_ece: Optional[float] = None
     high_conf_precision: Optional[float] = None
+    high_edge_win_rate_pct: float = 0.0
+    low_edge_win_rate_pct: float = 0.0
+    high_edge_trades: int = 0
+    low_edge_trades: int = 0
     gate_status: str = "fail"
     failed_gates: list[str] = field(default_factory=list)
     rank: Optional[int] = None
@@ -405,6 +409,10 @@ def normalize_artifact(mode: str, strategy: str, artifact: str) -> dict[str, Any
             "win_rate": float(summary.get("win_rate", 0) or 0),
             "profit_factor": float(summary.get("profit_factor", 0) or 0),
             "max_drawdown": float(summary.get("max_drawdown", 0) or 0),
+            "high_edge_win_rate_pct": float(summary.get("high_edge_win_rate_pct", 0) or 0),
+            "low_edge_win_rate_pct": float(summary.get("low_edge_win_rate_pct", 0) or 0),
+            "high_edge_trades": int(summary.get("high_edge_trades", 0) or 0),
+            "low_edge_trades": int(summary.get("low_edge_trades", 0) or 0),
         }
 
     rows = payload if isinstance(payload, list) else []

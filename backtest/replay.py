@@ -1745,6 +1745,12 @@ def replay_summary(results: dict[str, ReplayResult]) -> dict:
     wins = sum(result.wins for result in results.values())
     losses = sum(result.losses for result in results.values())
     total = wins + losses
+    # Edge-bucket stats: does |edge| > 0.05 predict better outcomes?
+    high_edge_trades = [t for t in trades if abs(t.edge) > 0.05]
+    low_edge_trades = [t for t in trades if abs(t.edge) <= 0.05]
+    high_edge_wins = sum(1 for t in high_edge_trades if t.outcome == "WIN")
+    low_edge_wins = sum(1 for t in low_edge_trades if t.outcome == "WIN")
+
     return {
         "trades": len(trades),
         "wins": wins,
@@ -1755,6 +1761,10 @@ def replay_summary(results: dict[str, ReplayResult]) -> dict:
         "profit_factor": _profit_factor(trades),
         "max_drawdown": max((result.max_drawdown for result in results.values()), default=0.0),
         "assets": sorted(results),
+        "high_edge_win_rate_pct": round(high_edge_wins / len(high_edge_trades) * 100, 1) if high_edge_trades else 0.0,
+        "low_edge_win_rate_pct": round(low_edge_wins / len(low_edge_trades) * 100, 1) if low_edge_trades else 0.0,
+        "high_edge_trades": len(high_edge_trades),
+        "low_edge_trades": len(low_edge_trades),
     }
 
 
