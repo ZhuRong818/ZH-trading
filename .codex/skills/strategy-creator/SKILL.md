@@ -317,6 +317,56 @@ Key differences from the minimal pattern:
 - **Kelly sizing with hard caps** — quarter Kelly, max 2.5% of bankroll, max notional cap, $5 minimum.
 - **snapshot() returns rejection breakdown** — use `dict(self.rejected)` to see which gate fires most often.
 
+## Asymmetric DOWN Gates
+
+In rolling 5-minute crypto markets, DOWN trades are empirically harder to predict than UP trades. Markets trend up over time, and downward moves are often sharp reversals that are harder to catch. Every strategy that trades both directions must apply stricter gates to DOWN:
+
+| Gate | UP threshold | DOWN threshold | Why |
+|------|-------------|----------------|-----|
+| Edge required | `min_edge` (e.g. 0.04-0.16) | `min_edge + down_boost` (e.g. 0.10-0.26) | DOWN moves are sharper; need more edge to cover gap risk |
+| Z-score / stat-sig | baseline (e.g. 0.15) | 2-3x baseline (e.g. 0.45) | DOWN signals are noisier; require stronger statistical evidence |
+| Price band | 0.20-0.55 | 0.20-0.50 (tighter upper bound) | DOWN near 0.50+ means the market already priced it in |
+
+Implementation in `_compute_edge` and `_gate_edge`:
+
+```python
+def _required_edge(self, direction: str) -> float:
+    base = self.min_edge
+    if direction == "DOWN":
+        return max(base + self.down_edge_boost, base * 2.5)
+    return base
+
+def _gate_edge(self, fair: float, executable_price: float, direction: str) -> Optional[str]:
+    edge = fair - executable_price
+    fee_drag = self._fee_drag(executable_price, fair)
+    net_edge = edge - fee_drag
+    required = self._required_edge(direction)
+    if net_edge < required:
+        return "insufficient_edge"
+    return None
+```
+
+If a strategy only trades UP, this asymmetry is unnecessary. But any bidirectional strategy that skips this will leak PnL on the DOWN side.
+
+## Time-Dependent Edge
+
+Edge requirements should scale with remaining window time. Early in a 5-minute window, there is plenty of time for the edge to materialize — a lower bar is acceptable. Late in the window, there is less time for the trade to play out — a higher bar is required.
+
+```python
+def _required_edge_for_time(self, seconds_remaining: float) -> float:
+    """Linearly interpolate edge from min (early) to far (late)."""
+    t = max(0.0, min(seconds_remaining, self.max_window_sec))
+    frac = 1.0 - (t / self.max_window_sec)  # 0 at start, 1 at end
+    return self.min_edge + frac * (self.far_edge - self.min_edge)
+
+# Example: min_edge=0.04, far_edge=0.15, max_window_sec=120
+# t=120s -> edge=0.04  (early, plenty of time)
+# t= 60s -> edge=0.095 (mid-window)
+# t= 20s -> edge=0.138 (late, tight window)
+```
+
+This pattern applies to any strategy where edge depends on time-to-resolution: convexity arbitrage, last-seconds snipe, resolution fade. It does not apply to propagation-delay strategies (leadlag/oracle) where the edge comes from latency, not time decay.
+
 ## Strategy Archetypes
 
 When building a new strategy, match the closest archetype and follow its patterns.
