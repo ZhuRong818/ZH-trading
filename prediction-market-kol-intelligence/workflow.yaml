@@ -5,7 +5,7 @@ steps:
     skill: x-kol-discovery
     description: Convert user request into query templates, thresholds, and staged fetch budget.
   - id: fetch-kol-tweets
-    description: Read fetched KOL tweet JSONL files or call kv.run /kols/tweets/search in production.
+    description: Read fetched KOL tweet JSONL files or call `GET /kols/tweets/search` on kv.run:5000 in production.
     local_inputs:
       - path/to/tweets.jsonl
   - id: spam-bot-filtering
@@ -17,11 +17,10 @@ steps:
   - id: kol-quality-scoring
     skill: kol-quality-scoring
   - id: market-matching
-    description: Match extracted event records to Polymarket-style market titles and slugs.
-    status: deferred_until_market_data_available
+    description: Match extracted event records to live Polymarket markets via `GET /prediction-markets/markets/search?q=...` on kv.run:5000.
   - id: backtest-scoring
     skill: backtest-scoring
     cadence: weekly
-    status: deferred_until_resolved_market_data_available
+    description: Score KOL predictions against resolved market outcomes via `GET /prediction-markets/trades/polymarket/{condition_id}` on kv.run:5000.
   - id: publish-ranked-signals
     description: Write signals JSONL, KOL leaderboard CSV, latest signal feed CSV, and manual-labeling JSONL.

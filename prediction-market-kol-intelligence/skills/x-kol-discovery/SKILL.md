@@ -180,3 +180,20 @@ Expected LLM output:
 - Query templates: `references/query_templates.yaml`
 - LLM scorer prompt: `references/llm_ranker_prompt.md`
 - Production notes: `references/production_notes.md`
+
+## Production API (kv.run:5000)
+
+Use these live endpoints for production KOL discovery:
+
+```bash
+# Discover related Polymarket markets for a KOL's domain
+curl -s "https://kv.run:5000/prediction-markets/markets/search?q=<keyword>" | python3 -m json.tool
+
+# Stream live orderbook ticks to correlate KOL calls with price moves
+curl -s -N "https://kv.run:5000/prediction-markets/stream"
+
+# Fetch trade history for a resolved market (backtest KOL accuracy)
+curl -s "https://kv.run:5000/prediction-markets/trades/polymarket/{condition_id}"
+```
+
+Markets/search returns `venue`, `market_id`, `title`, `slug`, `volume`, `start_date`, `end_date`, `closed`. Use this to validate whether a KOL's domain has active prediction markets before scoring.

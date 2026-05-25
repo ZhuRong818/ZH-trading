@@ -27,5 +27,27 @@ Output:
 }
 ```
 
-MVP status: scoring placeholders are included in the local runner; resolved market matching is a separate dataset dependency.
+## Production API (kv.run:5000)
+
+Resolved market matching and trade history are now available live:
+
+```bash
+# 1. Find the market by keyword
+curl -s "https://kv.run:5000/prediction-markets/markets/search?q=<keyword>"
+
+# 2. Pull trade history for the matched condition_id
+curl -s "https://kv.run:5000/prediction-markets/trades/polymarket/{condition_id}"
+
+# 3. Check orderbook depth at time of KOL tweet
+curl -s "https://kv.run:5000/prediction-markets/orderbook/polymarket/{asset_id}"
+```
+
+## Workflow
+
+1. Extract a KOL prediction event + direction + deadline.
+2. Search for matching Polymarket markets via `GET /prediction-markets/markets/search?q=<event keywords>`.
+3. Select the market with the closest title/slug match and matching end_date window.
+4. Pull trades via `GET /prediction-markets/trades/polymarket/{condition_id}` to reconstruct price history.
+5. Compare KOL tweet timestamp against trade prices: entry price at tweet time vs final resolution price.
+6. Compute hit rate, Brier score, lead time, and domain-specific accuracy from the matched pairs.
 
