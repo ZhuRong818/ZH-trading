@@ -1,6 +1,6 @@
 # ZH Trading
 
-Updated: 2026-05-21
+Updated: 2026-05-25
 
 ZH Trading is a lightweight Python trading pipeline for Polymarket. It discovers markets, polls CLOB order books, runs strategy modules, sends all strategy output through a shared risk/capital/execution pipeline, and records fills, positions, logs, reports, and replay data.
 
@@ -12,9 +12,11 @@ ZH Trading is a lightweight Python trading pipeline for Polymarket. It discovers
 - Order book polling through the Polymarket CLOB API.
 - Static long-dated market trading by token ID or interactive search.
 - Rolling 5-minute crypto markets for `btc`, `eth`, `sol`, and `xrp`.
+- Volatility convexity arbitrage strategy for rolling 5-minute markets near strike.
 - Shared `MarketContext -> BaseStrategy.step() -> TradingSignal` strategy interface.
 - Book-aware dry-run execution with VWAP fills, FOK/FAK/GTC handling, and pending GTC simulation.
 - Live CLOB order signing/submission with explicit live-risk acknowledgement.
+- Live preflight checks for balance/allowance and optional open-order cleanup.
 - Shared OMS for fills, positions, realized PnL, unrealized PnL, and live reconciliation.
 - Capital allocation by system reserve, strategy budget, market concentration, and locked collateral.
 - Risk gates for exposure, drawdown, per-position stops, volatility pauses, and kill switch shutdown.
@@ -96,6 +98,7 @@ Strategies never place orders directly. They only return `TradingSignal` objects
 |   |   |-- oracle_frontrun.py      # Binance/Polymarket lag strategy
 |   |   |-- leadlag.py              # Cross-asset lead-lag
 |   |   |-- last_seconds_snipe.py   # Final-window high-odds snipe
+|   |   |-- vol_convexity.py        # Volatility convexity arb
 |   |   |-- portfolio.py            # Regime portfolio wrapper
 |   |   |-- rl_shadow.py            # Observational RL policy logger
 |   |   |-- skills.py               # Shared strategy helpers
@@ -139,6 +142,8 @@ $env:POLYMARKET_SIG_TYPE="3"
 $env:POLYMARKET_LIVE_MAX_ORDER_USDC="25"
 $env:POLYMARKET_LIVE_MIN_BALANCE_USDC="1"
 $env:POLYMARKET_LIVE_FORCE_ORDER_TYPE="FAK"
+$env:POLYMARKET_CANCEL_OPEN_ON_START="1"
+$env:POLYMARKET_LIVE_POLL_INTERVAL="2"
 ```
 
 `POLYMARKET_SIG_TYPE` defaults to `1`.
@@ -146,6 +151,8 @@ $env:POLYMARKET_LIVE_FORCE_ORDER_TYPE="FAK"
 - `0`: direct EOA wallet
 - `1`: Polymarket proxy wallet account
 - `3`: Polymarket deposit wallet / `POLY_1271`
+- `POLYMARKET_CANCEL_OPEN_ON_START=0` keeps existing open orders at live startup.
+- `POLYMARKET_LIVE_POLL_INTERVAL` controls how often live fill polling runs (seconds).
 
 `.env.example` is only a reference. The code does not auto-load `.env`.
 
@@ -184,6 +191,7 @@ python main.py --strategy rolling --rolling-asset btc --dry-run --no-learn
 python main.py --strategy rolling,momentum --rolling-asset eth --dry-run --no-learn --verbose
 python main.py --strategy rolling,oracle --rolling-asset btc --dry-run --no-learn
 python main.py --strategy rolling,snipe --rolling-asset sol --dry-run --no-learn
+python main.py --strategy rolling,volconv --rolling-asset btc --dry-run --no-learn
 python main.py --strategy rolling,portfolio --rolling-assets btc,eth,sol,xrp --dry-run --no-learn
 python main.py --strategy rolling,rl_shadow --rolling-asset btc --dry-run --no-learn
 
@@ -195,7 +203,7 @@ Important flags:
 
 | Flag | Purpose |
 | --- | --- |
-| `--strategy` | `mm`, `whale`, `meanrev`, `btc5m`, `rolling`, `oracle`, `snipe`, `portfolio`, `rl_shadow`, `all`, or comma-separated |
+| `--strategy` | `mm`, `whale`, `meanrev`, `btc5m`, `rolling`, `oracle`, `snipe`, `volconv`, `portfolio`, `rl_shadow`, `all`, or comma-separated |
 | `--search` | Search markets interactively by keyword |
 | `--token` | Comma-separated CLOB token IDs; skips market search |
 | `--dry-run` | Paper mode; no real orders |
@@ -207,10 +215,14 @@ Important flags:
 | `--max-position` | Max position per market in USDC |
 | `--max-drawdown` | Drawdown percentage before kill switch |
 | `--live-max-order-usdc` | Hard cap per live order |
+| `--live-min-balance-usdc` | Minimum live collateral balance required at startup |
 | `--live-order-type` | Force live order type; default is `FAK` |
 | `--allow-live-gtc` | Allow strategy order types in live mode |
+| `--keep-open-orders` | Keep existing open orders at live startup |
 | `--live-check-only` | Authenticate and run live preflight, then exit |
+| `--reconcile-interval` | Seconds between live position reconciliation |
 | `--rl-*` | Configure `rl_shadow` model path and gates |
+| `--volconv-*` | Tune volatility convexity entry gates |
 
 ## Strategies
 
@@ -246,6 +258,7 @@ Active v2 strategies:
 | Oracle Front-Run | `strategies/v2/oracle_frontrun.py` | `rolling,oracle` | Trades stale Polymarket odds after external price moves |
 | Lead-Lag | `strategies/v2/leadlag.py` | via `portfolio` live, direct in replay | BTC-led follower asset signals |
 | Last Seconds Snipe | `strategies/v2/last_seconds_snipe.py` | `rolling,snipe` | Late-window high-odds UP/DOWN entries |
+| Volatility Convexity | `strategies/v2/vol_convexity.py` | `rolling,volconv` | Short-window convexity arb near strike |
 | Portfolio | `strategies/v2/portfolio.py` | `rolling,portfolio` | Regime wrapper over momentum/oracle/leadlag/snipe |
 | RL Shadow | `strategies/v2/rl_shadow.py` | `rolling,rl_shadow` | Logs tabular RL intended actions; emits no orders |
 
@@ -260,6 +273,7 @@ Examples:
 ```powershell
 python main.py --strategy rolling --rolling-asset btc --dry-run --no-learn
 python main.py --strategy rolling,snipe --rolling-asset xrp --dry-run --no-learn --verbose
+python main.py --strategy rolling,volconv --rolling-asset btc --dry-run --no-learn
 python main.py --strategy rolling,portfolio --rolling-assets btc,eth,sol,xrp --dry-run --no-learn
 ```
 
@@ -278,6 +292,7 @@ Live mode:
 - Requires `--live --i-understand-live-risk`.
 - Requires `POLYMARKET_PRIVATE_KEY`; proxy/deposit wallets also require `POLYMARKET_FUNDER`.
 - Runs startup preflight for signer, funder, balance/allowance, order size, and open orders.
+- Cancels existing open orders on startup by default (use `--keep-open-orders` or `POLYMARKET_CANCEL_OPEN_ON_START=0` to skip).
 - Forces `FAK` by default to avoid stale GTC exposure.
 - Polls accepted live orders for real fills before recording them.
 - Cancels known open orders on shutdown and attempts real close orders for tracked positions.
@@ -420,6 +435,6 @@ Live mode submits real Polymarket CLOB orders. Validate in dry-run first, use a 
 
 ```powershell
 python -m py_compile main.py config/settings.py data_pipeline/market_provider.py pipeline/signal.py strategies/base.py strategies/v2/runner.py
-python -m py_compile strategies/v2/mm.py strategies/v2/meanrev.py strategies/v2/whale.py strategies/v2/momentum.py strategies/v2/oracle_frontrun.py strategies/v2/leadlag.py strategies/v2/last_seconds_snipe.py strategies/v2/portfolio.py strategies/v2/rl_shadow.py
+python -m py_compile strategies/v2/mm.py strategies/v2/meanrev.py strategies/v2/whale.py strategies/v2/momentum.py strategies/v2/oracle_frontrun.py strategies/v2/leadlag.py strategies/v2/last_seconds_snipe.py strategies/v2/vol_convexity.py strategies/v2/portfolio.py strategies/v2/rl_shadow.py
 python -m py_compile backtest/replay.py backtest/recorder.py backtest/rl_env.py backtest/rl_train.py
 ```
