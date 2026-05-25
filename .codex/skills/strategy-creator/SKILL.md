@@ -161,7 +161,7 @@ For rolling strategies:
 
 For static strategies:
 
-1. Import the class inside `setup_static_strategies()`.
+1. Import the class inside `setup_v2_strategies()`.
 2. Add a branch using `self.static_runner.add(strategy)`.
 3. Register with `post_analyzer`.
 4. Add the CLI name to static strategy selection and market-selection logic if it needs `--token` or `--search`.

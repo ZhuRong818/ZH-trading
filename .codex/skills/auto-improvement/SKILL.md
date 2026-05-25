@@ -13,7 +13,7 @@ It is not an auto-deployment skill. Do not directly modify `config/settings.py`,
 
 ## Safe Workflow
 
-1. Read the experiment spec, usually `research/experiments.yaml`, and the newest `reports/research_runs/*/summary.json`.
+1. Read the experiment spec, usually `research/experiments.yaml`. If previous runs exist, also read the newest `reports/research_runs/*/summary.json`. On first run, skip the summary and proceed directly to variant generation.
 2. Identify the best, worst, and inconclusive experiments from `gate_status`, `failed_gates`, `rank`, `recommendation`, and per-mode metrics.
 3. Generate a small next batch of experiment variants by editing or creating a research spec only.
 4. Run:
