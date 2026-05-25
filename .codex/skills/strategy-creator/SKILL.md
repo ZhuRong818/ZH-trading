@@ -22,7 +22,14 @@ Use this map first:
 
 ## Workflow
 
-1. Inspect the closest existing v2 strategy before editing. Prefer copying the local shape of `momentum.py`, `last_seconds_snipe.py`, `leadlag.py`, `portfolio.py`, `meanrev.py`, or `mm.py` over inventing a new interface.
+1. Inspect the closest existing v2 strategy before editing. Prefer copying the local shape of an existing strategy over inventing a new interface. Available reference strategies:
+   - **Directional**: `momentum.py` (multi-gate rolling), `momentum_v2.py`
+   - **Speed/latency**: `leadlag.py` (cross-asset propagation), `oracle_frontrun.py` (same-asset oracle), `last_seconds_snipe.py`
+   - **Volatility**: `vol_convexity.py` (time-dependent edge, convexity arbitrage)
+   - **Portfolio/RL**: `portfolio.py` (multi-asset), `rl_shadow.py` (shadow learning)
+   - **Market making**: `mm.py` (Stoikov-style)
+   - **Mean reversion**: `meanrev.py`
+   - **Whale tracking**: `whale.py`
 2. Implement the live strategy as one class inheriting `BaseStrategy` in `strategies/v2/<name>.py`.
 3. Emit only `TradingSignal` objects from `step()`. Never call EMS, OMS, capital allocator, risk engine, or CLOB APIs directly from a strategy.
 4. Use executable prices from `MarketContext.best_ask`, `best_bid`, or `book.vwap_price()` for entries and exits. Avoid mid-price order assumptions unless the strategy is explicitly passive.
@@ -410,7 +417,7 @@ Use `backtest/replay.py` patterns:
 - Consume recorded JSONL records rather than live `MarketContext`.
 - Recompute the same gates as live where practical.
 - Add parser flags for tunable thresholds.
-- Add a branch in the strategy dispatch near existing `momentum`, `leadlag`, `convergence`, `snipe`, `portfolio`, and `rl`.
+- Add a branch in the strategy dispatch near existing `momentum`, `momentum_v2`, `leadlag`, `convergence`, `snipe`, `portfolio`, `volconv`, `oracle`, `rl`, and `whale`.
 - Print concise totals and write reports consistently with existing replay output.
 
 Do not claim live/replay parity unless the same price source, fees, slippage, timing, and confirmation logic are represented.
@@ -437,6 +444,26 @@ python main.py --strategy rolling,<name> --rolling-asset btc --dry-run --no-lear
 ```
 
 Only run live mode when the user explicitly asks for real trading and has configured credentials, live caps, and risk acknowledgement.
+
+## Hand-Off To Auto Improvement
+
+After a strategy is created, wired, and passes compile + dry-run validation, use `auto-improvement` to evaluate it through the research orchestrator. This closes the loop:
+
+```
+strategy-creator creates strategy
+  -> auto-improvement runs experiment variants
+    -> promote_candidate / keep_testing / reject
+      -> if code change needed, hand back to strategy-creator
+```
+
+Use `auto-improvement` when:
+
+- a new strategy needs controlled experiment comparison against baselines;
+- gate results (accuracy, profit factor, Brier, drawdown) should decide next steps;
+- parameter tuning is needed via experiment variants in `research/experiments.yaml`;
+- the question is "is this strategy ready to promote?" and not "does it compile?".
+
+Do not claim a strategy is live-ready from compile + dry-run alone. Always run at least one research loop before promotion.
 
 ## Common Mistakes
 
