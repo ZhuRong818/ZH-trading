@@ -20,8 +20,22 @@ from backtest.resample import build_bars
 from research.grader import grade_run
 
 
-def run_family(bars: list[dict[str, Any]], family: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+def run_family(bars: list[dict[str, Any]], family: str, params: dict[str, Any] | None = None,
+               position_rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     params = dict(params or {})
+
+    if family == "whale_quality_copy":
+        signals = _whale_copy(bars, position_rows or [], params)
+        summary = _forecast_summary(signals)
+        execution = _execution_summary(signals, params)
+        payload = {
+            "schema_version": 1,
+            "strategy": {"family": family, "params": params},
+            "summary": {**summary, **execution, "mode": "forecast+exec" if execution["trades"] else "forecast"},
+            "signals": signals[:1000],
+        }
+        return grade_run(payload)
+
     grouped = _group_bars(bars)
     signals: list[dict[str, Any]] = []
     for key, rows in grouped.items():
@@ -116,6 +130,87 @@ def _volume_shock(rows: list[dict[str, Any]], params: dict[str, Any]) -> list[di
         future_abs = abs(closes[idx + horizon] - closes[idx])
         out.append({**_base_signal(rows[idx], "volume_shock"), "score": z, "label_abs_return": future_abs, "hit": future_abs > 0.02})
     return out
+
+
+def _whale_copy(bars: list[dict[str, Any]], positions: list[dict[str, Any]],
+                params: dict[str, Any]) -> list[dict[str, Any]]:
+    """Copy whale positions: for each position, check if current market price
+    is near or below the whale's entry. Signal BUY if the whale is sitting on
+    unrealized profit and the position hasn't been closed.
+
+    Quality filters already applied during whale discovery (ROI, trades, WR).
+    """
+    max_entry_premium = float(params.get("max_entry_premium", 0.05))
+    horizon = int(params.get("horizon", 3))
+
+    if not positions:
+        return []
+
+    # Build condition_id -> latest candle lookup
+    bar_by_cid: dict[str, dict[str, Any]] = {}
+    for bar in bars:
+        cid = bar.get("condition_id", "")
+        if cid not in bar_by_cid or (bar.get("bar_ts") or "") > (bar_by_cid[cid].get("bar_ts") or ""):
+            bar_by_cid[cid] = bar
+
+    signals = []
+    for pos in positions:
+        cid = pos.get("condition_id") or pos.get("market_id") or ""
+        if not cid or cid not in bar_by_cid:
+            continue
+
+        bar = bar_by_cid[cid]
+        entry_price = float(pos.get("avg_entry_price") or 0)
+        current_price = float(bar.get("close") or bar.get("price") or 0)
+        if entry_price <= 0 or current_price <= 0:
+            continue
+
+        unrealized = float(pos.get("unrealized_pnl") or 0)
+        # Only copy positions with positive unrealized PnL (whale is still in)
+        if unrealized <= 0:
+            continue
+
+        premium = (current_price - entry_price) / entry_price
+        # Skip if current price is much higher than whale's entry
+        if premium > max_entry_premium:
+            continue
+
+        # Signal: copy the whale if price is still near or below entry
+        direction = "UP"
+        score = unrealized / max(abs(unrealized), 1.0)
+
+        # Evaluate against future movement for this condition_id
+        bars_for_cid = [b for b in bars if b.get("condition_id") == cid]
+        bars_for_cid.sort(key=lambda x: x.get("bar_ts", ""))
+        bar_idx = next((i for i, b in enumerate(bars_for_cid) if b is bar), -1)
+        if bar_idx >= 0 and bar_idx + horizon < len(bars_for_cid):
+            closes = [float(b["close"]) for b in bars_for_cid]
+            future = closes[bar_idx + horizon] - closes[bar_idx]
+            hit = future > 0
+        else:
+            future = 0.0
+            hit = False
+
+        signals.append({
+            "family": "whale_quality_copy",
+            "condition_id": cid,
+            "outcome": bar.get("outcome", "YES"),
+            "bar_ts": bar.get("bar_ts", ""),
+            "price": current_price,
+            "category": bar.get("category", "unknown"),
+            "direction": direction,
+            "score": score,
+            "label_return": future,
+            "hit": hit,
+            "wallet": pos.get("wallet", ""),
+            "whale_entry": entry_price,
+            "whale_roi": pos.get("whale_roi", 0),
+            "whale_trades": pos.get("whale_trades", 0),
+            "whale_win_rate": pos.get("whale_win_rate", 0),
+            "position_size": pos.get("position_size", 0),
+            "unrealized_pnl": unrealized,
+        })
+    return signals
 
 
 def _oi_growth(rows: list[dict[str, Any]], params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -255,6 +350,7 @@ def main() -> None:
     parser.add_argument("--input", required=True, help="Raw or canonical JSON/JSONL input")
     parser.add_argument("--family", required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--positions-input", default="", help="Optional whale positions JSONL for whale_quality_copy family")
     parser.add_argument("--interval-seconds", type=int, default=60)
     parser.add_argument("--execution-track", action="store_true")
     parser.add_argument("--params-json", default="")
@@ -263,7 +359,8 @@ def main() -> None:
     if args.execution_track:
         params["execution_track"] = True
     bars = load_bars_from_raw(args.input, interval_seconds=args.interval_seconds)
-    result = run_family(bars, args.family, params)
+    position_rows = parse_payload_text(Path(args.positions_input).read_text(encoding="utf-8")) if args.positions_input else []
+    result = run_family(bars, args.family, params, position_rows=position_rows)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(result["summary"], sort_keys=True))

@@ -23,7 +23,7 @@ ALIASES: dict[str, list[str]] = {
     "slug": ["slug"],
     "category": ["category", "topic", "market_type", "asset"],
     "outcome": ["outcome", "side", "token_side", "outcome_name"],
-    "ts": ["ts", "timestamp", "time", "bucket_ts", "bar_ts", "updated_at", "created_at", "createdAt"],
+    "ts": ["ts", "timestamp", "time", "bucket_ts", "bar_ts", "snapshot_ts", "updated_at", "created_at", "createdAt"],
     "market_created_at": ["market_created_at", "createdAt", "created_at", "startDate", "start_date"],
     "market_close_at": ["market_close_at", "endDate", "end_date", "close_time", "resolution_time", "window_end_ts"],
     "market_resolved_at": ["market_resolved_at", "resolvedAt", "resolved_at"],
@@ -53,6 +53,7 @@ REQUIRED_BY_ROW_TYPE = {
     "market": ("market_id", "condition_id"),
     "event": ("market_id",),
     "holder": ("market_id",),
+    "whale_position": ("condition_id", "token_id"),
     "open_interest": ("market_id", "condition_id", "ts", "open_interest"),
     "trade": ("market_id", "condition_id", "ts", "price", "size"),
     "bar": ("market_id", "condition_id", "outcome", "ts", "price"),
@@ -250,7 +251,7 @@ def _normalize_one(record: dict[str, Any], source_granularity: str) -> tuple[dic
 
 def _infer_row_type(record: dict[str, Any], row: dict[str, Any], source_granularity: str) -> str:
     explicit = str(row.get("row_type") or source_granularity or "").lower()
-    if explicit in {"market", "trade", "bar", "candle", "open_interest", "holder", "event", "sse_tick"}:
+    if explicit in {"market", "trade", "bar", "candle", "open_interest", "holder", "event", "sse_tick", "whale_position"}:
         return "bar" if explicit == "candle" else explicit
     keys = {key.lower() for key in record}
     if {"open", "high", "low", "close"} & keys and "volume" in keys:

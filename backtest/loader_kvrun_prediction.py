@@ -120,6 +120,21 @@ class KvRunPredictionClient:
     def matched_pairs(self, venue: str, venue_id: str, limit: int = 20) -> Any:
         return self.get_json(f"/prediction-markets/matched-pairs/{venue}/{venue_id}", {"limit": limit})
 
+    def leaderboard(self, limit: int = 100) -> Any:
+        return self.get_json("/prediction-markets/leaderboard", {"limit": limit})
+
+    def wallet_profile(self, address: str) -> Any:
+        return self.get_json(f"/prediction-markets/wallet/{address}")
+
+    def wallet_positions(self, address: str) -> Any:
+        return self.get_json(f"/prediction-markets/wallet/{address}/positions")
+
+    def wallet_activity(self, address: str, limit: int = 50) -> Any:
+        return self.get_json(f"/prediction-markets/wallet/{address}/activity", {"limit": limit})
+
+    def wallet_pnl(self, address: str) -> Any:
+        return self.get_json(f"/prediction-markets/wallet/{address}/pnl")
+
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
         if self.api_key:
@@ -243,6 +258,68 @@ def _market_identifier(row: dict[str, Any]) -> str:
     return str(row.get("market_id") or row.get("condition_id") or row.get("ticker") or row.get("slug") or "")
 
 
+def discover_quality_whales(
+    client: KvRunPredictionClient,
+    leaderboard_limit: int = 100,
+    min_roi: float = 0.0,
+    min_trades: int = 10,
+    min_win_rate: float = 0.50,
+    max_whales: int = 5,
+) -> list[dict[str, Any]]:
+    """Fetch leaderboard, filter for quality, fetch positions for top whales."""
+    rows: list[dict[str, Any]] = []
+
+    # 1. Fetch leaderboard
+    try:
+        board = client.leaderboard(limit=leaderboard_limit)
+    except Exception:
+        return rows
+    if not isinstance(board, list):
+        return rows
+
+    # 2. Filter for quality
+    qualified = []
+    for entry in board:
+        if not isinstance(entry, dict):
+            continue
+        addr = entry.get("address") or entry.get("wallet") or ""
+        if not addr:
+            continue
+        roi_val = float(entry.get("roi") or entry.get("total_roi") or entry.get("profit") or 0)
+        trades_val = int(entry.get("trades") or entry.get("total_trades") or entry.get("trade_count") or 0)
+        wr_val = float(entry.get("win_rate") or entry.get("winRate") or entry.get("accuracy") or 0)
+        volume = float(entry.get("volume") or entry.get("total_volume") or 0)
+
+        if trades_val >= min_trades and wr_val >= min_win_rate and roi_val >= min_roi:
+            qualified.append((addr, roi_val, trades_val, wr_val, volume))
+
+    qualified.sort(key=lambda x: -x[1])  # sort by ROI desc
+    selected = qualified[:max_whales]
+
+    # 3. Fetch positions for selected whales
+    for addr, roi_val, trades_val, wr_val, volume in selected:
+        client._throttle()
+        try:
+            positions = client.wallet_positions(addr)
+        except Exception:
+            continue
+        if not isinstance(positions, list):
+            continue
+        for pos in positions:
+            if not isinstance(pos, dict):
+                continue
+            rows.append(_with_context(pos, "whale_position", {
+                "venue": "polymarket",
+                "wallet": addr,
+                "whale_roi": roi_val,
+                "whale_trades": trades_val,
+                "whale_win_rate": wr_val,
+                "whale_volume": volume,
+            }))
+
+    return rows
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fetch concrete kv.run prediction-market endpoints")
     parser.add_argument("--base-url", default=os.environ.get("KVRUN_BASE_URL", DEFAULT_BASE_URL))
@@ -312,6 +389,14 @@ def main() -> None:
     bundle.add_argument("--trade-end", default="")
     bundle.add_argument("--trade-limit", type=int, default=5000)
 
+    whale = subparsers.add_parser("whale-discovery", help="Fetch leaderboard, filter quality whales, fetch positions")
+    whale.add_argument("--leaderboard-limit", type=int, default=100)
+    whale.add_argument("--min-roi", type=float, default=0.0)
+    whale.add_argument("--min-trades", type=int, default=10)
+    whale.add_argument("--min-win-rate", type=float, default=0.50)
+    whale.add_argument("--max-whales", type=int, default=5)
+    whale.add_argument("--venue", default="polymarket")
+
     args = parser.parse_args()
     client = KvRunPredictionClient(
         base_url=args.base_url,
@@ -320,6 +405,18 @@ def main() -> None:
         rpm=args.rpm,
         timeout=args.timeout,
     )
+    if args.command == "whale-discovery":
+        rows = discover_quality_whales(
+            client,
+            leaderboard_limit=args.leaderboard_limit,
+            min_roi=args.min_roi,
+            min_trades=args.min_trades,
+            min_win_rate=args.min_win_rate,
+            max_whales=args.max_whales,
+        )
+        write_jsonl(Path(args.out), rows)
+        print(json.dumps(schema_summary(rows), sort_keys=True))
+        return
     if args.command == "bundle":
         bundle_rows = fetch_research_bundle(
             client,
