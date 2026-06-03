@@ -5,7 +5,7 @@ Exploits the lag between BTC price moves and alt-asset Polymarket markets.
 When BTC moves sharply, ETH/SOL/XRP Polymarket odds lag by 1-5 seconds.
 
 How it works:
-  1. Polls LEADER (BTC) price from Binance every 0.5 seconds
+  1. Polls LEADER (BTC) price from findata every 0.5 seconds
   2. Detects sharp moves (> threshold) in the last few ticks
   3. Checks if FOLLOWER (ETH/SOL/XRP) Polymarket odds haven't adjusted yet
   4. If BTC drops but follower DOWN token is still cheap → BUY DOWN
@@ -30,17 +30,13 @@ import time
 from collections import deque
 from typing import List, Optional
 
-import requests
-
 from strategies.base import BaseStrategy
 from strategies.kelly import kelly_size
 from data_pipeline.market_provider import MarketContext
+from data_pipeline.price_feeds import get_asset_price_cached
 from pipeline.signal import TradingSignal
 
 log = logging.getLogger(__name__)
-
-BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/price"
-
 
 class LeadLag(BaseStrategy):
     name = "leadlag"
@@ -78,7 +74,6 @@ class LeadLag(BaseStrategy):
         self.correlation_discount = correlation_discount
 
         self._leader_prices: deque = deque(maxlen=200)
-        self._session = requests.Session()
         self._has_position = False
         self._last_trade_time = 0.0
 
@@ -137,12 +132,9 @@ class LeadLag(BaseStrategy):
         return []
 
     def _poll_leader(self):
-        """Poll the LEADER asset's price from Binance."""
+        """Poll the LEADER asset's price from findata."""
         try:
-            symbol = f"{self.leader.upper()}USDT"
-            resp = self._session.get(BINANCE_TICKER, params={"symbol": symbol}, timeout=3)
-            price = float(resp.json()["price"])
-            self._leader_prices.append((time.time(), price))
+            self._leader_prices.append((time.time(), get_asset_price_cached(self.leader)))
         except Exception:
             pass
 

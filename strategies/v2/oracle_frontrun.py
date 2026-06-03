@@ -1,18 +1,18 @@
 """
-Oracle Front-Run Strategy — unified interface (v2).
+Oracle Front-Run Strategy - unified interface (v2).
 
-Exploits the lag between Binance BTC price (real-time) and Polymarket
+Exploits the lag between real-time BTC spot price and Polymarket
 5m market odds (delayed 1-3 seconds).
 
 How it works:
-  1. Polls BTC price from Binance every 0.5 seconds
+  1. Polls BTC price from findata every 0.5 seconds
   2. Detects sharp moves (> threshold) in the last few seconds
   3. Checks if Polymarket odds haven't adjusted yet (stale)
-  4. If Binance says UP but Polymarket still prices UP cheaply → BUY UP
+  4. If spot says UP but Polymarket still prices UP cheaply -> BUY UP
   5. Holds to settlement
 
 The edge: you're not predicting direction. You're trading on something
-that already happened on Binance but hasn't been priced in on Polymarket.
+that already happened in spot but hasn't been priced in on Polymarket.
 
 Key parameters:
   - move_threshold_bps: minimum BTC move to trigger (default 3 bps = 0.03%)
@@ -26,16 +26,13 @@ import time
 from collections import deque
 from typing import List, Optional
 
-import requests
-
 from strategies.base import BaseStrategy
 from strategies.kelly import kelly_size
 from data_pipeline.market_provider import MarketContext
+from data_pipeline.price_feeds import get_asset_price_cached
 from pipeline.signal import TradingSignal
 
 log = logging.getLogger(__name__)
-
-BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/price"
 
 
 class OracleFrontrun(BaseStrategy):
@@ -44,17 +41,17 @@ class OracleFrontrun(BaseStrategy):
     def __init__(
         self,
         asset: str = "btc",
-        move_threshold_bps: float = 6.0,    # min BTC move to act (0.06%) — backtested optimal
-        staleness_threshold: float = 0.15,   # min gap between fair and market (15%) — backtested optimal
-        lookback_ticks: int = 5,             # compare price over last N ticks
-        max_price: float = 0.55,             # don't buy above this (contested zone only)
-        min_price: float = 0.20,             # don't buy below this (avoid tail zone)
-        min_remaining_seconds: float = 60,   # need at least 1 min left
+        move_threshold_bps: float = 6.0,    # min BTC move to act (0.06%), backtested optimal
+        staleness_threshold: float = 0.15,  # min gap between fair and market (15%), backtested optimal
+        lookback_ticks: int = 5,            # compare price over last N ticks
+        max_price: float = 0.55,            # don't buy above this (contested zone only)
+        min_price: float = 0.20,            # don't buy below this (avoid tail zone)
+        min_remaining_seconds: float = 60,  # need at least 1 min left
         kelly_frac: float = 0.25,
         max_bet_pct: float = 0.05,
         bankroll: float = 10_000,
-        cooldown_seconds: float = 10.0,      # wait between trades
-        max_notional_usdc: float = 500.0,    # hard cap on trade size regardless of Kelly
+        cooldown_seconds: float = 10.0,     # wait between trades
+        max_notional_usdc: float = 500.0,   # hard cap on trade size regardless of Kelly
     ):
         self.asset = asset
         self.move_threshold_bps = move_threshold_bps
@@ -70,15 +67,14 @@ class OracleFrontrun(BaseStrategy):
         self.max_notional_usdc = max_notional_usdc
 
         self._prices: deque = deque(maxlen=200)
-        self._session = requests.Session()
         self._has_position = False
         self._last_trade_time = 0.0
 
         # Stats
         self.total_trades = 0
         self.signals_detected = 0
-        self.signals_stale = 0      # market was stale (good)
-        self.signals_already_priced = 0  # market already adjusted (missed)
+        self.signals_stale = 0
+        self.signals_already_priced = 0
 
     def on_fill(self, fill):
         if fill.side == "BUY":
@@ -112,13 +108,13 @@ class OracleFrontrun(BaseStrategy):
 
         direction, move_bps, fair_prob_up = move
 
-        # Check each context for staleness — emit at most ONE signal
+        # Check each context for staleness; emit at most one signal.
         for ctx in ctx_map.values():
             if ctx.seconds_remaining < self.min_remaining:
                 continue
             s = self._check_staleness(ctx, ctx_map, direction, fair_prob_up, move_bps)
             if s:
-                # Lock immediately — don't wait for fill callback
+                # Lock immediately; don't wait for fill callback.
                 self._has_position = True
                 self._last_trade_time = time.time()
                 return [s]
@@ -127,10 +123,7 @@ class OracleFrontrun(BaseStrategy):
 
     def _poll_price(self):
         try:
-            symbol = f"{self.asset.upper()}USDT"
-            resp = self._session.get(BINANCE_TICKER, params={"symbol": symbol}, timeout=3)
-            price = float(resp.json()["price"])
-            self._prices.append((time.time(), price))
+            self._prices.append((time.time(), get_asset_price_cached(self.asset)))
         except Exception:
             pass
 
@@ -156,11 +149,7 @@ class OracleFrontrun(BaseStrategy):
 
         self.signals_detected += 1
 
-        # Estimate fair probability based on the move
-        # Sharp move up → higher prob of finishing above strike
-        # Use distance from strike to estimate
-        # For simplicity: convert bps move to probability shift
-        # 3 bps = ~0.55 fair, 10 bps = ~0.70 fair, 30 bps = ~0.85 fair
+        # Estimate fair probability based on the move.
         prob_shift = min(move_bps / 50, 0.35)  # cap at 35% shift
 
         if move_pct > 0:
@@ -194,18 +183,14 @@ class OracleFrontrun(BaseStrategy):
             return None
 
         if direction == "UP":
-            # BTC went up → fair UP probability is high → is UP token still cheap?
             fair = fair_prob_up
             market_price = market_up
             token_id = up_ctx.token_id
-
             staleness = fair - market_price
         else:
-            # BTC went down → fair DOWN probability is high → is DOWN token still cheap?
             fair = 1.0 - fair_prob_up
             market_price = market_down
             token_id = down_ctx.token_id
-
             staleness = fair - market_price
 
         # Is the market stale enough?
@@ -221,7 +206,7 @@ class OracleFrontrun(BaseStrategy):
 
         # Risk/reward gate
         if market_price > self.max_price:
-            log.debug("ORACLE: skip — market_price %.3f > max %.3f", market_price, self.max_price)
+            log.debug("ORACLE: skip market_price %.3f > max %.3f", market_price, self.max_price)
             return None
         if market_price < self.min_price:
             return None

@@ -28,32 +28,26 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
-import requests
 
 from strategies.kelly import kelly_size
+from data_pipeline.price_feeds import get_asset_price_cached
 
 log = logging.getLogger(__name__)
-
-BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/price"
-
 
 # ---------------------------------------------------------------------------
 # Skill 1: BTC Price Feed
 # ---------------------------------------------------------------------------
 
 class BTCPriceFeed:
-    """Polls BTC/ETH price from Binance. Computes momentum, volatility, trend."""
+    """Polls BTC/ETH price from findata. Computes momentum, volatility, trend."""
 
     def __init__(self, asset: str = "btc", max_history: int = 200):
         self.asset = asset
         self.prices: deque = deque(maxlen=max_history)
-        self._session = requests.Session()
 
     def poll(self) -> Optional[float]:
         try:
-            symbol = f"{self.asset.upper()}USDT"
-            resp = self._session.get(BINANCE_TICKER, params={"symbol": symbol}, timeout=3)
-            price = float(resp.json()["price"])
+            price = get_asset_price_cached(self.asset)
             self.prices.append(price)
             return price
         except Exception:
