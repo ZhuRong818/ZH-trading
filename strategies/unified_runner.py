@@ -12,7 +12,7 @@ Instead of modifying every strategy, this runner:
   4. Handles cleanup when windows roll
 
 Usage:
-    provider = RollingProvider(data_feed, "btc", "5m", binance_price)
+    provider = RollingProvider(data_feed, "btc", "5m", spot_price)
     runner = UnifiedRunner(provider, ems, oms, config)
     runner.add_strategy("mm")
     runner.add_strategy("meanrev")
@@ -24,11 +24,10 @@ import math
 import time
 from typing import Dict, List, Optional
 
-import requests
-
 from config import SystemConfig, MarketMakingConfig
 from data_pipeline.market_data import MarketDataFeed
 from data_pipeline.market_provider import MarketProvider, MarketContext, RollingProvider, StaticProvider
+from data_pipeline.price_feeds import get_btc_price, get_eth_price
 from ems.execution import ExecutionEngine
 from oms.position_manager import PositionManager
 from strategies.market_making.stoikov_model import StoikovMarketMaker
@@ -39,19 +38,6 @@ from pipeline.signal import TradingSignal
 from pipeline.engine import PipelineEngine
 
 log = logging.getLogger(__name__)
-
-BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/price"
-
-
-def get_btc_price() -> float:
-    resp = requests.get(BINANCE_TICKER, params={"symbol": "BTCUSDT"}, timeout=5)
-    return float(resp.json()["price"])
-
-
-def get_eth_price() -> float:
-    resp = requests.get(BINANCE_TICKER, params={"symbol": "ETHUSDT"}, timeout=5)
-    return float(resp.json()["price"])
-
 
 class UnifiedRunner:
     """

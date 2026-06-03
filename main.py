@@ -897,7 +897,7 @@ Strategies (comma-separated or 'all'):
   meanrev  Mean reversion — buy dips, sell rips in contested markets
   btc5m    BTC 5-minute rolling markets — momentum (auto)
   rolling  Run strategies on 5-minute rolling markets (momentum + oracle by default)
-    oracle   Oracle front-run — exploit Binance-Polymarket price lag
+    oracle   Oracle front-run — exploit spot-Polymarket price lag
         snipe    Last-seconds snipe on rolling 5m markets (high-odds endgame)
         volconv  Volatility convexity arbitrage near strike
         portfolio Regime portfolio wrapper for momentum/oracle/leadlag/snipe

@@ -44,8 +44,8 @@ class MarketContext:
     question: str = ""
     is_valid: bool = False         # True if data is fresh and usable
 
-    # For external price feed (BTC 5m uses Binance price, not book mid)
-    external_price: float = 0.0    # e.g., BTC price from Binance
+    # For external price feed (BTC 5m uses findata spot price, not book mid)
+    external_price: float = 0.0    # e.g., BTC price from findata
     strike_price: float = 0.0      # e.g., starting BTC price for 5m window
 
 
@@ -153,7 +153,7 @@ class RollingProvider(MarketProvider):
         data_feed: MarketDataFeed,
         asset: str = "btc",
         interval: str = "5m",
-        price_feed=None,  # callable that returns current price (e.g., Binance)
+        price_feed=None,  # callable that returns current spot price
         oracle=None,      # SettlementOracle instance (lazy-created if None)
     ):
         super().__init__(data_feed)

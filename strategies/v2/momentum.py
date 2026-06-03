@@ -14,17 +14,13 @@ import time
 from typing import List, Optional
 from collections import Counter, deque
 
-import requests
-
 from strategies.base import BaseStrategy
 from strategies.kelly import kelly_size
 from data_pipeline.market_provider import MarketContext
+from data_pipeline.price_feeds import get_asset_price_cached
 from pipeline.signal import TradingSignal
 
 log = logging.getLogger(__name__)
-
-BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/price"
-
 
 class Momentum(BaseStrategy):
     name = "btc5m_momentum"
@@ -71,7 +67,6 @@ class Momentum(BaseStrategy):
 
         self._prices: deque = deque(maxlen=200)
         self._price_times: deque = deque(maxlen=200)
-        self._session = requests.Session()
         self._has_position = False
         self._last_condition_id = ""
         self._pending_signal_key: tuple[str, str] | None = None
@@ -205,9 +200,7 @@ class Momentum(BaseStrategy):
 
     def _poll_price(self):
         try:
-            symbol = f"{self.asset.upper()}USDT"
-            resp = self._session.get(BINANCE_TICKER, params={"symbol": symbol}, timeout=5)
-            self._prices.append(float(resp.json()["price"]))
+            self._prices.append(get_asset_price_cached(self.asset))
             self._price_times.append(time.time())
         except Exception:
             pass

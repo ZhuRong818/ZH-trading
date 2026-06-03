@@ -7,14 +7,14 @@ at the end of this 5-minute window?"
 
 How it works:
     1. Auto-discovers the current 5m market via timestamp-based slug
-    2. Fetches real-time BTC price from Binance (proxy for Chainlink oracle)
+    2. Fetches real-time BTC price from findata
     3. Computes momentum signal from recent BTC price action
     4. Compares signal vs Polymarket odds to find edge
     5. Trades via Kelly sizing if edge > threshold
     6. Rolls to the next market when the current one resolves
 
 Resolution source: Chainlink BTC/USD data stream
-We use Binance as a proxy (Chainlink tracks major exchange prices).
+We use findata spot quotes as the live proxy.
 
 Integrated into the main trading system. Run via:
     python main.py --strategy btc5m --dry-run
@@ -42,15 +42,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from config import SystemConfig, CLOB_BASE, GAMMA_BASE
 from data_pipeline.market_data import MarketDataFeed, OrderBookSnapshot
+from data_pipeline.price_feeds import get_asset_price_cached
 from ems.execution import ExecutionEngine, ClobAuth
 from oms.position_manager import PositionManager, Fill
 from strategies.kelly import kelly_size
 
 log = logging.getLogger(__name__)
-
-BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/price"
-BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
-
 
 @dataclass
 class BTC5mConfig:
@@ -100,23 +97,17 @@ class MarketWindow:
 
 
 class BTCPriceFeed:
-    """Real-time BTC price from Binance."""
+    """Real-time BTC price from findata."""
 
     def __init__(self):
-        self.session = requests.Session()
         self.prices: deque = deque(maxlen=200)
         self._last_fetch = 0.0
 
     def fetch(self) -> float:
         max_attempts = 3
-        timeout = 5.0
         for attempt in range(1, max_attempts + 1):
             try:
-                resp = self.session.get(BINANCE_TICKER, params={"symbol": "BTCUSDT"}, timeout=timeout)
-                resp.raise_for_status()
-                price = float(resp.json().get("price", 0.0))
-                if price <= 0:
-                    raise ValueError("invalid price")
+                price = get_asset_price_cached("btc")
                 self.prices.append(price)
                 self._last_fetch = time.time()
                 return price
